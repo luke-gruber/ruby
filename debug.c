@@ -17,6 +17,7 @@
 #include "encindex.h"
 #include "id.h"
 #include "internal/signal.h"
+#include "internal/cont.h"
 #include "ruby/encoding.h"
 #include "ruby/io.h"
 #include "ruby/ruby.h"
@@ -646,6 +647,12 @@ ruby_debug_log(const char *file, int line, const char *func_name, const char *fm
                 r = snprintf(buff + len, MAX_DEBUG_LOG_MESSAGE_LEN - len, "\tth:%u", rb_th_serial(th));
             }
             if (r < 0) rb_bug("ruby_debug_log returns %d", r);
+            len += r;
+        }
+
+        // fiber information
+        if (th->ec->fiber_ptr && th->ec->fiber_ptr != th->root_fiber) {
+            r = snprintf(buff + len, MAX_DEBUG_LOG_MESSAGE_LEN - len, "\tf:%u", rb_fiber_id(th->ec->fiber_ptr));
             len += r;
         }
     }

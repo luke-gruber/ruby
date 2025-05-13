@@ -1177,6 +1177,7 @@ typedef struct rb_thread_struct {
     struct ccan_list_head interrupt_exec_tasks;
 
     struct rb_waiting_list *join_list;
+    struct rb_waiting_list *ractor_action_list;
 
     union {
         struct {
@@ -2094,6 +2095,8 @@ enum {
     TRAP_INTERRUPT_MASK	         = 0x08,
     TERMINATE_INTERRUPT_MASK     = 0x10,
     VM_BARRIER_INTERRUPT_MASK    = 0x20,
+    // for ractor actions like Ractor.yield that can unblock (switch) fibers
+    FIBER_SWITCH_INTERRUPT_MASK  = 0x40,
 };
 
 #define RUBY_VM_SET_TIMER_INTERRUPT(ec)		ATOMIC_OR((ec)->interrupt_flag, TIMER_INTERRUPT_MASK)
@@ -2102,6 +2105,7 @@ enum {
 #define RUBY_VM_SET_TRAP_INTERRUPT(ec)		ATOMIC_OR((ec)->interrupt_flag, TRAP_INTERRUPT_MASK)
 #define RUBY_VM_SET_TERMINATE_INTERRUPT(ec)     ATOMIC_OR((ec)->interrupt_flag, TERMINATE_INTERRUPT_MASK)
 #define RUBY_VM_SET_VM_BARRIER_INTERRUPT(ec)    ATOMIC_OR((ec)->interrupt_flag, VM_BARRIER_INTERRUPT_MASK)
+#define RUBY_VM_SET_FIBER_SWITCH_INTERRUPT(ec) ATOMIC_OR((ec)->interrupt_flag, FIBER_SWITCH_INTERRUPT_MASK)
 #define RUBY_VM_INTERRUPTED(ec)			((ec)->interrupt_flag & ~(ec)->interrupt_mask & \
                                                  (PENDING_INTERRUPT_MASK|TRAP_INTERRUPT_MASK))
 

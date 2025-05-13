@@ -1863,6 +1863,7 @@ rb_thread_io_blocking_call(struct rb_io* io, rb_blocking_function_t *func, void 
             if (events &&
                 blocking_call_retryable_p((int)val, saved_errno) &&
                 thread_io_wait_events(th, fd, events, NULL)) {
+                fprintf(stderr, "retrying blocking IO call\n");
                 RUBY_VM_CHECK_INTS_BLOCKING(ec);
                 goto retry;
             }
@@ -2496,12 +2497,21 @@ rb_threadptr_execute_interrupts(rb_thread_t *th, int blocking_timing)
         int pending_interrupt;
         int trap_interrupt;
         int terminate_interrupt;
+        int fiber_switch_interrupt;
 
         timer_interrupt = interrupt & TIMER_INTERRUPT_MASK;
         pending_interrupt = interrupt & PENDING_INTERRUPT_MASK;
         postponed_job_interrupt = interrupt & POSTPONED_JOB_INTERRUPT_MASK;
         trap_interrupt = interrupt & TRAP_INTERRUPT_MASK;
         terminate_interrupt = interrupt & TERMINATE_INTERRUPT_MASK; // request from other ractors
+        fiber_switch_interrupt = interrupt & FIBER_SWITCH_INTERRUPT_MASK;
+
+        if (fiber_switch_interrupt && th->ractor_action_list && th->scheduler) {
+            struct rb_fiber_struct *fiber = th->ractor_action_list->fiber;
+            fprintf(stderr, "calling fiber_scheduler_unblock from interrupt handler\n");
+            /*th->ractor_action_list = th->ractor_action_list->next;*/
+            rb_fiber_scheduler_unblock(th->scheduler, th->self, rb_fiberptr_self(fiber)); // switches to other fiber
+        }
 
         if (interrupt & VM_BARRIER_INTERRUPT_MASK) {
             RB_VM_LOCK_ENTER();

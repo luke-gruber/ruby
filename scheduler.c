@@ -9,6 +9,7 @@
 **********************************************************************/
 
 #include "vm_core.h"
+#include "vm_debug.h"
 #include "ruby/fiber/scheduler.h"
 #include "ruby/io.h"
 #include "ruby/io/buffer.h"
@@ -371,6 +372,7 @@ rb_fiber_scheduler_process_wait(VALUE scheduler, rb_pid_t pid, int flags)
         PIDT2NUM(pid), RB_INT2NUM(flags)
     };
 
+    RUBY_DEBUG_LOG("calling fiber_scheduler#process_wait");
     return rb_check_funcall(scheduler, id_process_wait, 2, arguments);
 }
 
@@ -391,6 +393,7 @@ rb_fiber_scheduler_process_wait(VALUE scheduler, rb_pid_t pid, int flags)
 VALUE
 rb_fiber_scheduler_block(VALUE scheduler, VALUE blocker, VALUE timeout)
 {
+    RUBY_DEBUG_LOG("calling fiber_scheduler#block");
     return rb_funcall(scheduler, id_block, 2, blocker, timeout);
 }
 
@@ -411,6 +414,7 @@ VALUE
 rb_fiber_scheduler_unblock(VALUE scheduler, VALUE blocker, VALUE fiber)
 {
     RUBY_ASSERT(rb_obj_is_fiber(fiber));
+    RUBY_DEBUG_LOG("calling fiber_scheduler#unblock");
 
     // `rb_fiber_scheduler_unblock` can be called from points where `errno` is expected to be preserved. Therefore, we should save and restore it. For example `io_binwrite` calls `rb_fiber_scheduler_unblock` and if `errno` is reset to 0 by user code, it will break the error handling in `io_write`.
     // If we explicitly preserve `errno` in `io_binwrite` and other similar functions (e.g. by returning it), this code is no longer needed. I hope in the future we will be able to remove it.
@@ -445,18 +449,21 @@ rb_fiber_scheduler_unblock(VALUE scheduler, VALUE blocker, VALUE fiber)
 VALUE
 rb_fiber_scheduler_io_wait(VALUE scheduler, VALUE io, VALUE events, VALUE timeout)
 {
+    RUBY_DEBUG_LOG("calling fiber_scheduler#io_wait");
     return rb_funcall(scheduler, id_io_wait, 3, io, events, timeout);
 }
 
 VALUE
 rb_fiber_scheduler_io_wait_readable(VALUE scheduler, VALUE io)
 {
+    RUBY_DEBUG_LOG("calling fiber_scheduler#io_wait_readable");
     return rb_fiber_scheduler_io_wait(scheduler, io, RB_UINT2NUM(RUBY_IO_READABLE), rb_io_timeout(io));
 }
 
 VALUE
 rb_fiber_scheduler_io_wait_writable(VALUE scheduler, VALUE io)
 {
+    RUBY_DEBUG_LOG("calling fiber_scheduler#io_wait_writable");
     return rb_fiber_scheduler_io_wait(scheduler, io, RB_UINT2NUM(RUBY_IO_WRITABLE), rb_io_timeout(io));
 }
 
@@ -476,6 +483,7 @@ VALUE rb_fiber_scheduler_io_select(VALUE scheduler, VALUE readables, VALUE writa
         readables, writables, exceptables, timeout
     };
 
+    RUBY_DEBUG_LOG("calling fiber_scheduler#io_select");
     return rb_fiber_scheduler_io_selectv(scheduler, 4, arguments);
 }
 
@@ -522,6 +530,7 @@ rb_fiber_scheduler_io_read(VALUE scheduler, VALUE io, VALUE buffer, size_t lengt
         io, buffer, SIZET2NUM(length), SIZET2NUM(offset)
     };
 
+    RUBY_DEBUG_LOG("calling fiber_scheduler#io_read");
     return rb_check_funcall(scheduler, id_io_read, 4, arguments);
 }
 
@@ -546,6 +555,7 @@ rb_fiber_scheduler_io_pread(VALUE scheduler, VALUE io, rb_off_t from, VALUE buff
         io, buffer, OFFT2NUM(from), SIZET2NUM(length), SIZET2NUM(offset)
     };
 
+    RUBY_DEBUG_LOG("calling fiber_scheduler#io_pread");
     return rb_check_funcall(scheduler, id_io_pread, 5, arguments);
 }
 
@@ -584,6 +594,7 @@ rb_fiber_scheduler_io_write(VALUE scheduler, VALUE io, VALUE buffer, size_t leng
         io, buffer, SIZET2NUM(length), SIZET2NUM(offset)
     };
 
+    RUBY_DEBUG_LOG("calling fiber_scheduler#io_write");
     return rb_check_funcall(scheduler, id_io_write, 4, arguments);
 }
 
@@ -609,6 +620,7 @@ rb_fiber_scheduler_io_pwrite(VALUE scheduler, VALUE io, rb_off_t from, VALUE buf
         io, buffer, OFFT2NUM(from), SIZET2NUM(length), SIZET2NUM(offset)
     };
 
+    RUBY_DEBUG_LOG("calling fiber_scheduler#io_pwrite");
     return rb_check_funcall(scheduler, id_io_pwrite, 5, arguments);
 }
 
@@ -665,6 +677,7 @@ rb_fiber_scheduler_io_close(VALUE scheduler, VALUE io)
 {
     VALUE arguments[] = {io};
 
+    RUBY_DEBUG_LOG("calling fiber_scheduler#io_close");
     return rb_check_funcall(scheduler, id_io_close, 1, arguments);
 }
 
@@ -707,6 +720,7 @@ rb_fiber_scheduler_address_resolve(VALUE scheduler, VALUE hostname)
         hostname
     };
 
+    RUBY_DEBUG_LOG("calling fiber_scheduler#address_resolve");
     return rb_check_funcall(scheduler, id_address_resolve, 1, arguments);
 }
 
@@ -763,6 +777,7 @@ VALUE rb_fiber_scheduler_blocking_operation_wait(VALUE scheduler, void* (*functi
 
     VALUE proc = rb_proc_new(rb_fiber_scheduler_blocking_operation_wait_proc, (VALUE)&arguments);
 
+    RUBY_DEBUG_LOG("calling fiber_scheduler#blocking_operation_wait");
     return rb_check_funcall(scheduler, id_blocking_operation_wait, 1, &proc);
 }
 
@@ -784,5 +799,6 @@ VALUE rb_fiber_scheduler_blocking_operation_wait(VALUE scheduler, void* (*functi
 VALUE
 rb_fiber_scheduler_fiber(VALUE scheduler, int argc, VALUE *argv, int kw_splat)
 {
+    RUBY_DEBUG_LOG("calling fiber_scheduler#fiber (Fiber.schedule)");
     return rb_funcall_passing_block_kw(scheduler, id_fiber_schedule, argc, argv, kw_splat);
 }

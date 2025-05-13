@@ -40,6 +40,7 @@ extern int madvise(caddr_t, size_t, int);
 #include "vm_sync.h"
 #include "id_table.h"
 #include "ractor_core.h"
+#include "vm_debug.h"
 
 static const int DEBUG = 0;
 
@@ -266,10 +267,33 @@ struct rb_fiber_struct {
     unsigned int blocking : 1;
 
     unsigned int killed : 1;
+    // Added by luke for debugging
+    rb_thread_t *th; // fibers are associated with a thread, and should not run outside the thread
+    rb_atomic_t id; // only for RUBY_DEBUG_LOG()
+
 
     struct coroutine_context context;
     struct fiber_pool_stack stack;
 };
+
+unsigned int
+rb_fiber_id(const struct rb_fiber_struct *fiber)
+{
+#if USE_RUBY_DEBUG_LOG
+    return fiber ? (unsigned int)fiber->id : 0;
+#else
+    return 0;
+#endif
+}
+
+static inline void
+fiber_set_id(struct rb_fiber_struct *fiber)
+{
+#if USE_RUBY_DEBUG_LOG
+    static rb_atomic_t fiber_serial = 1;
+    fiber->id = RUBY_ATOMIC_FETCH_ADD(fiber_serial, 1);
+#endif
+}
 
 static struct fiber_pool shared_fiber_pool = {NULL, NULL, 0, 0, 0, 0};
 
@@ -803,6 +827,8 @@ fiber_pool_stack_release(struct fiber_pool_stack * stack)
 static inline void
 ec_switch(rb_thread_t *th, rb_fiber_t *fiber)
 {
+    RUBY_ASSERT(fiber->th);
+    RUBY_ASSERT(fiber->th == th);
     rb_execution_context_t *ec = &fiber->cont.saved_ec;
 #ifdef RUBY_ASAN_ENABLED
     ec->machine.asan_fake_stack_handle = asan_get_thread_fake_stack_handle();
@@ -1590,6 +1616,9 @@ static void
 fiber_setcontext(rb_fiber_t *new_fiber, rb_fiber_t *old_fiber)
 {
     rb_thread_t *th = GET_THREAD();
+    RUBY_ASSERT(new_fiber->th);
+    RUBY_ASSERT(old_fiber->th);
+    RUBY_ASSERT(old_fiber->th == new_fiber->th);
 
     /* save old_fiber's machine stack - to ensure efficient garbage collection */
     if (!FIBER_TERMINATED_P(old_fiber)) {
@@ -1990,6 +2019,9 @@ fiber_t_alloc(VALUE fiber_value, unsigned int blocking)
     fiber->cont.type = FIBER_CONTEXT;
     fiber->blocking = blocking;
     fiber->killed = 0;
+    fiber->th = th;
+    fiber_set_id(fiber);
+    RUBY_DEBUG_LOG("Allocated fiber f:%u", rb_fiber_id(fiber));
     cont_init(&fiber->cont, th);
 
     fiber->cont.saved_ec.fiber_ptr = fiber;
@@ -2009,17 +2041,22 @@ fiber_t_alloc(VALUE fiber_value, unsigned int blocking)
 static rb_fiber_t *
 root_fiber_alloc(rb_thread_t *th)
 {
+    RUBY_ASSERT(th);
     VALUE fiber_value = fiber_alloc(rb_cFiber);
     rb_fiber_t *fiber = th->ec->fiber_ptr;
+    RUBY_ASSERT(fiber);
 
     VM_ASSERT(DATA_PTR(fiber_value) == NULL);
     VM_ASSERT(fiber->cont.type == FIBER_CONTEXT);
     VM_ASSERT(FIBER_RESUMED_P(fiber));
 
     th->root_fiber = fiber;
+    fiber->th = th;
     DATA_PTR(fiber_value) = fiber;
     fiber->cont.self = fiber_value;
+    fiber_set_id(fiber);
 
+    RUBY_DEBUG_LOG("Allocate root fiber: f:%u", rb_fiber_id(fiber));
     coroutine_initialize_main(&fiber->context);
 
     return fiber;
@@ -2346,7 +2383,11 @@ rb_fiber_initialize(int argc, VALUE* argv, VALUE self)
 VALUE
 rb_fiber_new_storage(rb_block_call_func_t func, VALUE obj, VALUE storage)
 {
-    return fiber_initialize(fiber_alloc(rb_cFiber), rb_proc_new(func, obj), rb_fiber_pool_default(Qnil), 0, storage);
+    VALUE fiber_val = fiber_alloc(rb_cFiber);
+    struct rb_fiber_struct *f = DATA_PTR(fiber_val);
+    f->th = GET_THREAD();
+    fiber_set_id(f);
+    return fiber_initialize(fiber_val, rb_proc_new(func, obj), rb_fiber_pool_default(Qnil), 0, storage);
 }
 
 VALUE
@@ -2613,7 +2654,7 @@ rb_fiber_current(void)
     return fiber_current()->cont.self;
 }
 
-// Prepare to execute next_fiber on the given thread.
+// Prepare to execute next_fiber on the given ruby thread.
 static inline void
 fiber_store(rb_fiber_t *next_fiber, rb_thread_t *th)
 {
@@ -2670,6 +2711,7 @@ fiber_switch(rb_fiber_t *fiber, int argc, const VALUE *argv, int kw_splat, rb_fi
         return make_passing_arg(argc, argv);
     }
 
+    // NOTE: artificial limitation for historical reasons only. Could be removed in future.
     if (cont_thread_value(cont) != th->self) {
         rb_raise(rb_eFiberError, "fiber called across threads");
     }
@@ -2704,6 +2746,7 @@ fiber_switch(rb_fiber_t *fiber, int argc, const VALUE *argv, int kw_splat, rb_fi
     VM_ASSERT(!current_fiber->resuming_fiber);
 
     if (resuming_fiber) {
+        RUBY_DEBUG_LOG("Resuming fiber: f:%u->%u", rb_fiber_id(fiber_current()), rb_fiber_id(fiber));
         current_fiber->resuming_fiber = resuming_fiber;
         fiber->prev = fiber_current();
         fiber->yielding = 0;
@@ -2711,8 +2754,16 @@ fiber_switch(rb_fiber_t *fiber, int argc, const VALUE *argv, int kw_splat, rb_fi
 
     VM_ASSERT(!current_fiber->yielding);
     if (yielding) {
+        RUBY_DEBUG_LOG("Yielding from fiber: f:%u->%u", rb_fiber_id(current_fiber), rb_fiber_id(fiber));
         current_fiber->yielding = 1;
     }
+
+#if USE_RUBY_DEBUG_LOG
+    // TODO: look into this condition, does this always mean transfer?
+    if (!yielding && !resuming_fiber) {
+        RUBY_DEBUG_LOG("Transfer from fiber: f:%u->%u", rb_fiber_id(current_fiber), rb_fiber_id(fiber));
+    }
+#endif
 
     if (current_fiber->blocking) {
         th->blocking -= 1;
