@@ -42,6 +42,16 @@ class SpecEvaluate
     desc = @desc
     evaluator = self
 
+    block_lines = RubyVM::InstructionSequence.of(block).script_lines
+    if block_lines
+      block_lines.unshift "Ractor.new do\n"
+      block_lines << "end.take\n"
+      block = eval "proc do\n#{block_lines.join}\nend"
+    end
+    if !ruby.strip.empty?
+      ruby = "Ractor.new do\n#{ruby}\nend.take"
+    end
+
     specify "#{desc} #{format ruby}" do
       evaluator.instance_eval(ruby)
       evaluator.instance_eval(&block)

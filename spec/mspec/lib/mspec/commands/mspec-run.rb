@@ -1,7 +1,7 @@
+RubyVM.keep_script_lines = true # must be run with --parser=parse.y
 require 'mspec/version'
 require 'mspec/utils/options'
 require 'mspec/utils/script'
-
 
 class MSpecRun < MSpecScript
   def initialize
