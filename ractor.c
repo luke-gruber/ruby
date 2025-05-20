@@ -4128,6 +4128,7 @@ struct cross_ractor_require {
     ID name;
 };
 
+// called in main ractor
 static VALUE
 require_body(VALUE data)
 {
@@ -4215,6 +4216,9 @@ rb_ractor_require(VALUE feature)
     rb_ractor_channel_close(ec, crr.ch);
 
     if (crr.exception != Qundef) {
+#if RACTOR_CHECK_MODE > 0
+        ractor_reset_belonging(crr.exception);
+#endif
         rb_exc_raise(crr.exception);
     }
     else {
