@@ -1702,7 +1702,7 @@ module Test
                 r = Ractor.new do
                   instance = Ractor.receive
                   runner = Ractor.receive
-                  instance.run runner
+                  res = instance.run runner
                   movable_ivars = {:@_assertions => true, :@__passed__ => true, :@__name__ => true}
                   instance.instance_variables.each do |ivar|
                     unless movable_ivars[ivar]
@@ -1710,13 +1710,16 @@ module Test
                     end
                   end
                   Ractor.yield(instance, move: true)
-                  runner
+                  Ractor.yield(runner, move: false)
+                  res
                 end
                 r.send(inst, move: true)
                 r.send(self, move: false)
                 inst = r.take
-                runner = r.take # done
+                runner = r.take
+                result = r.take # done
                 _merge_results_from_ractor(runner)
+                result
               else
                 inst.run self
               end
@@ -1732,7 +1735,6 @@ module Test
           print "%.2f s = " % (Time.now - start_time) if @verbose
           print result
           puts if @verbose
-          $stdout.flush
 
           leakchecker.check("#{inst.class}\##{inst.__name__}")
 
