@@ -2508,7 +2508,7 @@ rb_threadptr_execute_interrupts(rb_thread_t *th, int blocking_timing)
 
         if (fiber_switch_interrupt && th->ractor_action_list && th->scheduler) {
             struct rb_fiber_struct *fiber = th->ractor_action_list->fiber;
-            fprintf(stderr, "calling fiber_scheduler_unblock from interrupt handler\n");
+            /*fprintf(stderr, "calling fiber_scheduler_unblock from interrupt handler\n");*/
             /*th->ractor_action_list = th->ractor_action_list->next;*/
             rb_fiber_scheduler_unblock(th->scheduler, th->self, rb_fiberptr_self(fiber)); // switches to other fiber
         }

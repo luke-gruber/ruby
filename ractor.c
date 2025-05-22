@@ -591,22 +591,20 @@ ractor_wakeup(rb_ractor_t *r, rb_thread_t *th /* can be NULL */, enum rb_ractor_
             struct rb_waiting_list *action_list = th->ractor_action_list;
             while (action_list) {
                 struct rb_fiber_struct *fiber = action_list->fiber;
-                if (fiber) {
+                if (fiber && !rb_fiberptr_blocking(fiber)) {
                     RUBY_VM_SET_FIBER_SWITCH_INTERRUPT(th->ec);
                     // TODO: what if no pthread lib? Need to send signal cross-platform way.
                     // Wake it up if it's stuck in IO.select or similar syscall. This signal is reserved for internal VM use
                     // anyway because timer thread uses it. Ideally we could check if a thread is in a blocking syscall and only
                     // signal it then. Some syscalls restart without checking signals, like read(2) and some don't (like select(2)).
                     pthread_kill(th->nt->thread_id, SIGVTALRM);
-                    break;
+                    return true;
                 }
                 action_list = action_list->next;
             }
-            return true;
-        } else {
-            rb_ractor_sched_wakeup(r, th);
-            return true;
         }
+        rb_ractor_sched_wakeup(r, th);
+        return true;
     }
     else {
         return false;
@@ -754,9 +752,10 @@ ractor_sleep_with_cleanup(rb_execution_context_t *ec, rb_ractor_t *cr, rb_thread
 
     RUBY_DEBUG_LOG("sleep by %s", wait_status_str(wait_status));
 
-    VALUE scheduler = rb_fiber_scheduler_current();
+    VALUE scheduler;
+    rb_fiber_t *cur_fib = cur_th->ec->fiber_ptr;
     // ex: calling `r.take`
-    if (scheduler != Qnil) {
+    if (wait_status == wait_taking && (scheduler = rb_fiber_scheduler_current()) != Qnil && cur_fib && !rb_fiberptr_blocking(cur_fib)) { // if we're in fiber scheduler context (Fiber.schedule(&block))
       while (cur_th->ractor_waiting.wakeup_status == wakeup_none) {
         struct rb_waiting_list waiter;
         waiter.next = cur_th->ractor_action_list;
@@ -1315,7 +1314,7 @@ ractor_wait_take(rb_execution_context_t *ec, rb_ractor_t *cr, rb_thread_t *cur_t
         .tb = take_basket,
     };
 
-    fprintf(stderr, "ractor_wait_take\n");
+    /*fprintf(stderr, "ractor_wait_take\n");*/
     RACTOR_LOCK_SELF(cr);
     {
         if (basket_none_p(take_basket) || basket_type_p(take_basket, basket_type_yielding)) {
@@ -1339,7 +1338,7 @@ ractor_take(rb_execution_context_t *ec, rb_ractor_t *recv_r)
     };
 
     ractor_register_take(cr, cur_th, recv_r, &take_basket, true, NULL, false);
-    fprintf(stderr, "Take called from r:%d\n", rb_ractor_id(GET_RACTOR()));
+    /*fprintf(stderr, "take called from r:%d\n", rb_ractor_id(GET_RACTOR()));*/
 
     while (UNDEF_P(v = ractor_try_take(cr, cur_th, recv_r, &take_basket))) {
         ractor_wait_take(ec, cr, cur_th, recv_r, &take_basket);
@@ -1422,7 +1421,7 @@ ractor_try_yield(rb_execution_context_t *ec, rb_ractor_t *cr, struct rb_ractor_q
 
     struct rb_ractor_basket b;
 
-    fprintf(stderr, "ractor_try_yield\n");
+    /*fprintf(stderr, "ractor_try_yield\n");*/
     if (ractor_deq_take_basket(cr, ts, &b)) { // deq a take basket from takers queue of `cr` into `b`
         VM_ASSERT(basket_type_p(&b, basket_type_take_basket));
         VM_ASSERT(basket_type_p(b.p.take.basket, basket_type_yielding));
