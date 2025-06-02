@@ -2113,10 +2113,10 @@ vm_search_cc(const VALUE klass, const struct rb_callinfo * const ci)
         cme = ccs->cme;
         cme = UNDEFINED_METHOD_ENTRY_P(cme) ? NULL : cme;
 
-        VM_ASSERT(cme == rb_callable_method_entry(klass, mid));
+        VM_ASSERT(cme == rb_callable_method_entry_locked(klass, mid));
     }
     else {
-        cme = rb_callable_method_entry(klass, mid);
+        cme = rb_callable_method_entry_locked(klass, mid);
     }
 
     VM_ASSERT(cme == NULL || IMEMO_TYPE_P(cme, imemo_ment));
@@ -2127,7 +2127,7 @@ vm_search_cc(const VALUE klass, const struct rb_callinfo * const ci)
         return &vm_empty_cc;
     }
 
-    VM_ASSERT(cme == rb_callable_method_entry(klass, mid));
+    VM_ASSERT(cme == rb_callable_method_entry_locked(klass, mid));
 
     METHOD_ENTRY_CACHED_SET((struct rb_callable_method_entry_struct *)cme);
 
@@ -2144,6 +2144,8 @@ vm_search_cc(const VALUE klass, const struct rb_callinfo * const ci)
         }
     }
 
+    // TODO: This takes VM lock sometimes. It's maybe deadlockable with klass lock? Should unlock and
+    // re-lock klass before calling this.
     cme = rb_check_overloaded_cme(cme, ci);
 
     const struct rb_callcache *cc = vm_cc_new(klass, cme, vm_call_general, cc_type_normal);
@@ -2163,7 +2165,8 @@ rb_vm_search_method_slowpath(const struct rb_callinfo *ci, VALUE klass)
 
     VM_ASSERT_TYPE2(klass, T_CLASS, T_ICLASS);
 
-    RB_VM_LOCKING() {
+    RCLASS_EXT_LOCK_ENTER(klass);
+    {
         cc = vm_search_cc(klass, ci);
 
         VM_ASSERT(cc);
@@ -2173,6 +2176,7 @@ rb_vm_search_method_slowpath(const struct rb_callinfo *ci, VALUE klass)
         VM_ASSERT(cc == vm_cc_empty() || !METHOD_ENTRY_INVALIDATED(vm_cc_cme(cc)));
         VM_ASSERT(cc == vm_cc_empty() || vm_cc_cme(cc)->called_id == vm_ci_mid(ci));
     }
+    RCLASS_EXT_LOCK_LEAVE(klass);
 
     return cc;
 }

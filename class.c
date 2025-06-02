@@ -30,6 +30,7 @@
 #include "internal/variable.h"
 #include "ruby/st.h"
 #include "vm_core.h"
+#include "ractor_core.h"
 #include "yjit.h"
 
 /* Flags of T_CLASS
@@ -369,6 +370,8 @@ rb_class_duplicate_classext(rb_classext_t *orig, VALUE klass, const rb_namespace
         }
     }
 
+    rb_nativethread_lock_initialize(&ext->lock);
+
     return ext;
 }
 
@@ -404,6 +407,36 @@ rb_class_classext_foreach(VALUE klass, rb_class_classext_foreach_callback_func *
         rb_st_foreach(tbl, class_classext_foreach_i, (st_data_t)&foreach_arg);
     }
     func(RCLASS_EXT_PRIME(klass), true, (VALUE)NULL, arg);
+}
+
+static void
+classext_reinit_mutex_cb(rb_classext_t *classext, bool is_prime, VALUE namespace, void *arg /* NULL */)
+{
+    (void)arg;
+#if VM_CHECK_MODE > 0
+    RUBY_ASSERT(classext->lock_owner != GET_RACTOR());
+    classext->lock_owner = NULL;
+#endif
+    rb_nativethread_lock_initialize(&classext->lock);
+}
+
+static int
+os_each_class_reinit_mutex_i(void *vstart, void *vend, size_t stride, void *data /* NULL */)
+{
+    (void)data;
+    VALUE v = (VALUE)vstart;
+    for (; v != (VALUE)vend; v += stride) {
+        if (RB_TYPE_P(v, T_CLASS) || RB_TYPE_P(v, T_ICLASS) || RB_TYPE_P(v, T_MODULE)) {
+            rb_class_classext_foreach(v, classext_reinit_mutex_cb, NULL);
+        }
+    }
+    return 0;
+}
+
+void
+rb_clear_class_mutexes_atfork(void)
+{
+    rb_objspace_each_objects(os_each_class_reinit_mutex_i, NULL);
 }
 
 VALUE
@@ -673,6 +706,7 @@ class_alloc(enum ruby_value_type type, VALUE klass)
     NEWOBJ_OF(obj, struct RClass, klass, flags, alloc_size, 0);
 
     memset(RCLASS_EXT_PRIME(obj), 0, sizeof(rb_classext_t));
+    rb_nativethread_lock_initialize(&RCLASS_EXT_PRIME(obj)->lock);
 
     /* ZALLOC
       RCLASS_CONST_TBL(obj) = 0;
