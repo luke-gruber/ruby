@@ -2065,27 +2065,13 @@ vm_search_cc(const VALUE klass, const struct rb_callinfo * const ci)
     bool rwlock_unlocked = false;
     RCLASS_EXT_RWLOCK_LOCKRD_LOCK(klass, &rwlock_taken);
     cc_tbl = RCLASS_WRITABLE_CC_TBL(klass);
-    if (cc_tbl) {
+    if (LIKELY(cc_tbl)) {
         // CCS data is keyed on method id, so we don't need the method id
         // for doing comparisons in the `for` loop below.
         if (rb_id_table_lookup(cc_tbl, mid, &ccs_data)) {
             ccs = (struct rb_class_cc_entries *)ccs_data;
-            const int ccs_len = ccs->len;
 
-            if (UNLIKELY(METHOD_ENTRY_INVALIDATED(ccs->cme))) {
-                if (rwlock_taken) {
-                    RCLASS_EXT_RWLOCK_LOCKRD_UNLOCK(klass);
-                    rwlock_unlocked = true;
-                }
-                RCLASS_EXT_RWLOCK_LOCKWR_LOCK(klass, &rwlock_taken);
-                rb_vm_ccs_free(ccs);
-                rb_id_table_delete(cc_tbl, mid);
-                if (rwlock_taken) {
-                    RCLASS_EXT_RWLOCK_LOCKWR_UNLOCK(klass);
-                }
-                ccs = NULL;
-            }
-            else {
+            if (LIKELY(!METHOD_ENTRY_INVALIDATED(ccs->cme))) {
                 VM_ASSERT(vm_ccs_verify(ccs, mid, klass));
 
                 // We already know the method id is correct because we had
@@ -2093,6 +2079,7 @@ vm_search_cc(const VALUE klass, const struct rb_callinfo * const ci)
                 // compare is argc and flag
                 unsigned int argc = vm_ci_argc(ci);
                 unsigned int flag = vm_ci_flag(ci);
+                const int ccs_len = ccs->len;
 
                 for (int i=0; i<ccs_len; i++) {
                     unsigned int ccs_ci_argc = ccs->entries[i].argc;
@@ -2115,14 +2102,27 @@ vm_search_cc(const VALUE klass, const struct rb_callinfo * const ci)
                     }
                 }
             }
+            else {
+                if (rwlock_taken) {
+                    RCLASS_EXT_RWLOCK_LOCKRD_UNLOCK(klass);
+                    rwlock_unlocked = true;
+                }
+                RCLASS_EXT_RWLOCK_LOCKWR_LOCK(klass, &rwlock_taken);
+                rb_vm_ccs_free(ccs);
+                rb_id_table_delete(cc_tbl, mid);
+                if (rwlock_taken) {
+                    RCLASS_EXT_RWLOCK_LOCKWR_UNLOCK(klass);
+                }
+                ccs = NULL;
+            }
         }
         if (rwlock_taken && !rwlock_unlocked) {
             RCLASS_EXT_RWLOCK_LOCKRD_UNLOCK(klass);
         }
     }
     else {
-        RCLASS_EXT_RWLOCK_LOCKRD_UNLOCK(klass);
         cc_tbl = rb_id_table_create(2);
+        RCLASS_EXT_RWLOCK_LOCKRD_UNLOCK(klass);
         RCLASS_EXT_RWLOCK_LOCKWR_LOCK(klass, &rwlock_taken);
         RCLASS_WRITE_CC_TBL(klass, cc_tbl);
         if (rwlock_taken) {
@@ -2171,7 +2171,6 @@ vm_search_cc(const VALUE klass, const struct rb_callinfo * const ci)
             if (rwlock_taken) {
                 RCLASS_EXT_RWLOCK_LOCKRD_UNLOCK(klass);
             }
-            // TODO: required?
             RCLASS_EXT_RWLOCK_LOCKWR_LOCK(klass, &rwlock_taken);
             ccs = vm_ccs_create(klass, cc_tbl, mid, cme);
             if (rwlock_taken) {
