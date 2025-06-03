@@ -76,6 +76,8 @@ struct rb_cvar_class_tbl_entry {
     VALUE class_value;
 };
 
+struct rb_ractor_struct;
+
 struct rb_classext_struct {
     const rb_namespace_t *ns;
     VALUE super;
@@ -129,6 +131,10 @@ struct rb_classext_struct {
     bool iclass_origin_shared_mtbl : 1;
     bool superclasses_with_self : 1;
     VALUE classpath;
+    pthread_rwlock_t lock;
+#if VM_CHECK_MODE > 0
+    struct rb_ractor_struct *lock_owner;
+#endif
 };
 typedef struct rb_classext_struct rb_classext_t;
 
@@ -467,6 +473,73 @@ RCLASSEXT_SET_INCLUDER(rb_classext_t *ext, VALUE klass, VALUE includer)
     RB_OBJ_WRITE(klass, &(RCLASSEXT_INCLUDER(ext)), includer);
 }
 
+static inline void
+rclass_ext_rwlock_lockrd_lock(VALUE klass, bool *lock_taken)
+{
+    *lock_taken = false;
+    bool needs_lock = rb_multi_ractor_p();
+    // NOTE: for now we use the prime classext, but this could change in the future if we want even more
+    // fine-grained locking per namespace
+    rb_classext_t *classext = RCLASS_EXT_PRIME(klass);
+    if (needs_lock) {
+        pthread_rwlock_rdlock(&classext->lock);
+        *lock_taken = true;
+    }
+#if VM_CHECK_MODE > 0
+    RUBY_ASSERT(!classext->lock_owner);
+#endif
+}
+
+static inline void
+rclass_ext_rwlock_unlock(VALUE klass)
+{
+    rb_classext_t *classext = RCLASS_EXT_PRIME(klass);
+
+//#if VM_CHECK_MODE > 0
+    //RUBY_ASSERT(classext->lock_owner);
+    //classext->lock_owner = NULL;
+//#endif
+    pthread_rwlock_unlock(&classext->lock);
+}
+
+static inline void
+rclass_ext_rwlock_lockwr_lock(VALUE klass, bool *lock_taken)
+{
+    *lock_taken = false;
+    rb_classext_t *classext = RCLASS_EXT_PRIME(klass);
+    bool needs_lock = rb_multi_ractor_p();
+
+//#if VM_CHECK_MODE > 0
+    //RUBY_ASSERT(classext->lock_owner);
+    //classext->lock_owner = NULL;
+//#endif
+    if (needs_lock) {
+        pthread_rwlock_wrlock(&classext->lock);
+        *lock_taken = true;
+    }
+}
+
+//static inline void
+//ASSERT_class_locked(VALUE klass)
+//{
+//#if VM_CHECK_MODE > 0
+    //RUBY_ASSERT(RCLASS_EXT_PRIME(klass)->lock_owner == GET_RACTOR());
+//#endif
+//}
+
+//static inline void
+//ASSERT_class_unlocked(VALUE klass)
+//{
+//#if VM_CHECK_MODE > 0
+    //RUBY_ASSERT(RCLASS_EXT_PRIME(klass)->lock_owner != GET_RACTOR());
+//#endif
+//}
+
+#define RCLASS_EXT_RWLOCK_LOCKRD_LOCK(klass, lock_taken_ptr) rclass_ext_rwlock_lockrd_lock(klass, lock_taken_ptr)
+#define RCLASS_EXT_RWLOCK_LOCKRD_UNLOCK(klass) rclass_ext_rwlock_unlock(klass)
+#define RCLASS_EXT_RWLOCK_LOCKWR_LOCK(klass, lock_taken_ptr) rclass_ext_rwlock_lockwr_lock(klass, lock_taken_ptr)
+#define RCLASS_EXT_RWLOCK_LOCKWR_UNLOCK(klass) rclass_ext_rwlock_unlock(klass)
+
 /* class.c */
 typedef void rb_class_classext_foreach_callback_func(rb_classext_t *classext, bool is_prime, VALUE namespace, void *arg);
 void rb_class_classext_foreach(VALUE klass, rb_class_classext_foreach_callback_func *func, void *arg);
@@ -501,6 +574,7 @@ VALUE rb_singleton_class_get(VALUE obj);
 void rb_undef_methods_from(VALUE klass, VALUE super);
 VALUE rb_class_inherited(VALUE, VALUE);
 VALUE rb_keyword_error_new(const char *, VALUE);
+void rb_reinit_class_rwlock_atfork(void);
 
 RUBY_SYMBOL_EXPORT_BEGIN
 

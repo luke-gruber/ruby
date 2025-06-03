@@ -2041,7 +2041,9 @@ vm_ccs_verify(struct rb_class_cc_entries *ccs, ID mid, VALUE klass)
 
         VM_ASSERT(IMEMO_TYPE_P(cc, imemo_callcache));
         VM_ASSERT(vm_cc_class_check(cc, klass));
-        VM_ASSERT(vm_cc_check_cme(cc, ccs->cme));
+        RB_VM_LOCKING() {
+            VM_ASSERT(vm_cc_check_cme(cc, ccs->cme));
+        }
         VM_ASSERT(!vm_cc_super_p(cc));
         VM_ASSERT(!vm_cc_refinement_p(cc));
     }
@@ -2055,10 +2057,14 @@ static const struct rb_callcache *
 vm_search_cc(const VALUE klass, const struct rb_callinfo * const ci)
 {
     const ID mid = vm_ci_mid(ci);
-    struct rb_id_table *cc_tbl = RCLASS_WRITABLE_CC_TBL(klass);
     struct rb_class_cc_entries *ccs = NULL;
     VALUE ccs_data;
+    struct rb_id_table *cc_tbl;
 
+    bool rwlock_taken = false;
+    bool rwlock_unlocked = false;
+    RCLASS_EXT_RWLOCK_LOCKRD_LOCK(klass, &rwlock_taken);
+    cc_tbl = RCLASS_WRITABLE_CC_TBL(klass);
     if (cc_tbl) {
         // CCS data is keyed on method id, so we don't need the method id
         // for doing comparisons in the `for` loop below.
@@ -2067,8 +2073,16 @@ vm_search_cc(const VALUE klass, const struct rb_callinfo * const ci)
             const int ccs_len = ccs->len;
 
             if (UNLIKELY(METHOD_ENTRY_INVALIDATED(ccs->cme))) {
+                if (rwlock_taken) {
+                    RCLASS_EXT_RWLOCK_LOCKRD_UNLOCK(klass);
+                    rwlock_unlocked = true;
+                }
+                RCLASS_EXT_RWLOCK_LOCKWR_LOCK(klass, &rwlock_taken);
                 rb_vm_ccs_free(ccs);
                 rb_id_table_delete(cc_tbl, mid);
+                if (rwlock_taken) {
+                    RCLASS_EXT_RWLOCK_LOCKWR_UNLOCK(klass);
+                }
                 ccs = NULL;
             }
             else {
@@ -2094,15 +2108,26 @@ vm_search_cc(const VALUE klass, const struct rb_callinfo * const ci)
                         VM_ASSERT(ccs_cc->klass == klass);
                         VM_ASSERT(!METHOD_ENTRY_INVALIDATED(vm_cc_cme(ccs_cc)));
 
+                        if (rwlock_taken) {
+                            RCLASS_EXT_RWLOCK_LOCKRD_UNLOCK(klass);
+                        }
                         return ccs_cc;
                     }
                 }
             }
         }
+        if (rwlock_taken && !rwlock_unlocked) {
+            RCLASS_EXT_RWLOCK_LOCKRD_UNLOCK(klass);
+        }
     }
     else {
+        RCLASS_EXT_RWLOCK_LOCKRD_UNLOCK(klass);
         cc_tbl = rb_id_table_create(2);
+        RCLASS_EXT_RWLOCK_LOCKWR_LOCK(klass, &rwlock_taken);
         RCLASS_WRITE_CC_TBL(klass, cc_tbl);
+        if (rwlock_taken) {
+            RCLASS_EXT_RWLOCK_LOCKWR_UNLOCK(klass);
+        }
     }
 
     RB_DEBUG_COUNTER_INC(cc_not_found_in_ccs);
@@ -2134,20 +2159,35 @@ vm_search_cc(const VALUE klass, const struct rb_callinfo * const ci)
     if (ccs == NULL) {
         VM_ASSERT(cc_tbl != NULL);
 
+        RCLASS_EXT_RWLOCK_LOCKRD_LOCK(klass, &rwlock_taken);
         if (LIKELY(rb_id_table_lookup(cc_tbl, mid, &ccs_data))) {
+            if (rwlock_taken) {
+                RCLASS_EXT_RWLOCK_LOCKRD_UNLOCK(klass);
+            }
             // rb_callable_method_entry() prepares ccs.
             ccs = (struct rb_class_cc_entries *)ccs_data;
         }
         else {
+            if (rwlock_taken) {
+                RCLASS_EXT_RWLOCK_LOCKRD_UNLOCK(klass);
+            }
             // TODO: required?
+            RCLASS_EXT_RWLOCK_LOCKWR_LOCK(klass, &rwlock_taken);
             ccs = vm_ccs_create(klass, cc_tbl, mid, cme);
+            if (rwlock_taken) {
+                RCLASS_EXT_RWLOCK_LOCKWR_UNLOCK(klass);
+            }
         }
     }
 
     cme = rb_check_overloaded_cme(cme, ci);
 
     const struct rb_callcache *cc = vm_cc_new(klass, cme, vm_call_general, cc_type_normal);
+    RCLASS_EXT_RWLOCK_LOCKWR_LOCK(klass, &rwlock_taken);
     vm_ccs_push(klass, ccs, ci, cc);
+    if (rwlock_taken) {
+        RCLASS_EXT_RWLOCK_LOCKWR_UNLOCK(klass);
+    }
 
     VM_ASSERT(vm_cc_cme(cc) != NULL);
     VM_ASSERT(cme->called_id == mid);
@@ -2163,16 +2203,14 @@ rb_vm_search_method_slowpath(const struct rb_callinfo *ci, VALUE klass)
 
     VM_ASSERT_TYPE2(klass, T_CLASS, T_ICLASS);
 
-    RB_VM_LOCKING() {
-        cc = vm_search_cc(klass, ci);
+    cc = vm_search_cc(klass, ci);
 
-        VM_ASSERT(cc);
-        VM_ASSERT(IMEMO_TYPE_P(cc, imemo_callcache));
-        VM_ASSERT(cc == vm_cc_empty() || cc->klass == klass);
-        VM_ASSERT(cc == vm_cc_empty() || callable_method_entry_p(vm_cc_cme(cc)));
-        VM_ASSERT(cc == vm_cc_empty() || !METHOD_ENTRY_INVALIDATED(vm_cc_cme(cc)));
-        VM_ASSERT(cc == vm_cc_empty() || vm_cc_cme(cc)->called_id == vm_ci_mid(ci));
-    }
+    VM_ASSERT(cc);
+    VM_ASSERT(IMEMO_TYPE_P(cc, imemo_callcache));
+    VM_ASSERT(cc == vm_cc_empty() || cc->klass == klass);
+    VM_ASSERT(cc == vm_cc_empty() || callable_method_entry_p(vm_cc_cme(cc)));
+    VM_ASSERT(cc == vm_cc_empty() || !METHOD_ENTRY_INVALIDATED(vm_cc_cme(cc)));
+    VM_ASSERT(cc == vm_cc_empty() || vm_cc_cme(cc)->called_id == vm_ci_mid(ci));
 
     return cc;
 }

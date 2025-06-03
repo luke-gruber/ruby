@@ -1242,6 +1242,7 @@ classext_free(rb_classext_t *ext, bool is_prime, VALUE namespace, void *arg)
         RUBY_ASSERT(is_prime); // superclasses should only be used on prime
         xfree(RCLASSEXT_SUPERCLASSES(ext));
     }
+    pthread_rwlock_destroy(&ext->lock);
     if (!is_prime) { // the prime classext will be freed with RClass
         xfree(ext);
     }

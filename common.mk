@@ -3203,6 +3203,8 @@ class.$(OBJEXT): {$(VPATH)}missing.h
 class.$(OBJEXT): {$(VPATH)}node.h
 class.$(OBJEXT): {$(VPATH)}onigmo.h
 class.$(OBJEXT): {$(VPATH)}oniguruma.h
+class.$(OBJEXT): {$(VPATH)}ractor.h
+class.$(OBJEXT): {$(VPATH)}ractor_core.h
 class.$(OBJEXT): {$(VPATH)}ruby_assert.h
 class.$(OBJEXT): {$(VPATH)}ruby_atomic.h
 class.$(OBJEXT): {$(VPATH)}rubyparser.h
