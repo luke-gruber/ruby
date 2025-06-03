@@ -2060,10 +2060,10 @@ vm_search_cc(const VALUE klass, const struct rb_callinfo * const ci)
     struct rb_class_cc_entries *ccs = NULL;
     VALUE ccs_data;
     struct rb_id_table *cc_tbl;
-
     bool rwlock_unlocked = false;
+
     RCLASS_EXT_RWLOCK_LOCKRD_LOCK(klass);
-    cc_tbl = RCLASS_WRITABLE_CC_TBL(klass);
+    cc_tbl = RCLASS_WRITABLE_CC_TBL(klass); // NOTE: can load namespace, might take VM lock in future?
     if (LIKELY(cc_tbl)) {
         // CCS data is keyed on method id, so we don't need the method id
         // for doing comparisons in the `for` loop below.

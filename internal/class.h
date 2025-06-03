@@ -479,56 +479,43 @@ rclass_ext_rwlock_lockrd_lock(VALUE klass)
     // NOTE: for now we use the prime classext, but this could change in the future if we want even more
     // fine-grained locking per namespace
     rb_classext_t *classext = RCLASS_EXT_PRIME(klass);
-    pthread_rwlock_rdlock(&classext->lock);
-#if VM_CHECK_MODE > 0
+    int res = pthread_rwlock_rdlock(&classext->lock);
+    RUBY_ASSERT(res == 0);
+    (void)res;
     RUBY_ASSERT(!classext->lock_owner);
-#endif
 }
 
 static inline void
-rclass_ext_rwlock_unlock(VALUE klass)
+rclass_ext_rwlock_unlock(VALUE klass, bool write_lock)
 {
     rb_classext_t *classext = RCLASS_EXT_PRIME(klass);
-
-//#if VM_CHECK_MODE > 0
-    //RUBY_ASSERT(classext->lock_owner);
-    //classext->lock_owner = NULL;
-//#endif
-    pthread_rwlock_unlock(&classext->lock);
+#if VM_CHECK_MODE > 0
+    if (write_lock) {
+        RUBY_ASSERT(classext->lock_owner == GET_RACTOR());
+        classext->lock_owner = 0;
+    }
+#endif
+    int res = pthread_rwlock_unlock(&classext->lock);
+    (void)res;
+    RUBY_ASSERT(res == 0);
 }
 
 static inline void
 rclass_ext_rwlock_lockwr_lock(VALUE klass)
 {
     rb_classext_t *classext = RCLASS_EXT_PRIME(klass);
-
-//#if VM_CHECK_MODE > 0
-    //RUBY_ASSERT(classext->lock_owner);
-    //classext->lock_owner = NULL;
-//#endif
-    pthread_rwlock_wrlock(&classext->lock);
+    int res = pthread_rwlock_wrlock(&classext->lock);
+    (void)res;
+    RUBY_ASSERT(res == 0);
+#if VM_CHECK_MODE > 0
+    classext->lock_owner = GET_RACTOR();
+#endif
 }
 
-//static inline void
-//ASSERT_class_locked(VALUE klass)
-//{
-//#if VM_CHECK_MODE > 0
-    //RUBY_ASSERT(RCLASS_EXT_PRIME(klass)->lock_owner == GET_RACTOR());
-//#endif
-//}
-
-//static inline void
-//ASSERT_class_unlocked(VALUE klass)
-//{
-//#if VM_CHECK_MODE > 0
-    //RUBY_ASSERT(RCLASS_EXT_PRIME(klass)->lock_owner != GET_RACTOR());
-//#endif
-//}
-
 #define RCLASS_EXT_RWLOCK_LOCKRD_LOCK(klass) rclass_ext_rwlock_lockrd_lock(klass)
-#define RCLASS_EXT_RWLOCK_LOCKRD_UNLOCK(klass) rclass_ext_rwlock_unlock(klass)
+#define RCLASS_EXT_RWLOCK_LOCKRD_UNLOCK(klass) rclass_ext_rwlock_unlock(klass, false)
 #define RCLASS_EXT_RWLOCK_LOCKWR_LOCK(klass) rclass_ext_rwlock_lockwr_lock(klass)
-#define RCLASS_EXT_RWLOCK_LOCKWR_UNLOCK(klass) rclass_ext_rwlock_unlock(klass)
+#define RCLASS_EXT_RWLOCK_LOCKWR_UNLOCK(klass) rclass_ext_rwlock_unlock(klass, true)
 
 /* class.c */
 typedef void rb_class_classext_foreach_callback_func(rb_classext_t *classext, bool is_prime, VALUE namespace, void *arg);
