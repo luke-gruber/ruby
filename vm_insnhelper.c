@@ -2061,9 +2061,8 @@ vm_search_cc(const VALUE klass, const struct rb_callinfo * const ci)
     VALUE ccs_data;
     struct rb_id_table *cc_tbl;
 
-    bool rwlock_taken = false;
     bool rwlock_unlocked = false;
-    RCLASS_EXT_RWLOCK_LOCKRD_LOCK(klass, &rwlock_taken);
+    RCLASS_EXT_RWLOCK_LOCKRD_LOCK(klass);
     cc_tbl = RCLASS_WRITABLE_CC_TBL(klass);
     if (LIKELY(cc_tbl)) {
         // CCS data is keyed on method id, so we don't need the method id
@@ -2095,39 +2094,31 @@ vm_search_cc(const VALUE klass, const struct rb_callinfo * const ci)
                         VM_ASSERT(ccs_cc->klass == klass);
                         VM_ASSERT(!METHOD_ENTRY_INVALIDATED(vm_cc_cme(ccs_cc)));
 
-                        if (rwlock_taken) {
-                            RCLASS_EXT_RWLOCK_LOCKRD_UNLOCK(klass);
-                        }
+                        RCLASS_EXT_RWLOCK_LOCKRD_UNLOCK(klass);
                         return ccs_cc;
                     }
                 }
             }
             else {
-                if (rwlock_taken) {
-                    RCLASS_EXT_RWLOCK_LOCKRD_UNLOCK(klass);
-                    rwlock_unlocked = true;
-                }
-                RCLASS_EXT_RWLOCK_LOCKWR_LOCK(klass, &rwlock_taken);
+                RCLASS_EXT_RWLOCK_LOCKRD_UNLOCK(klass);
+                rwlock_unlocked = true;
+                RCLASS_EXT_RWLOCK_LOCKWR_LOCK(klass);
                 rb_vm_ccs_free(ccs);
                 rb_id_table_delete(cc_tbl, mid);
-                if (rwlock_taken) {
-                    RCLASS_EXT_RWLOCK_LOCKWR_UNLOCK(klass);
-                }
+                RCLASS_EXT_RWLOCK_LOCKWR_UNLOCK(klass);
                 ccs = NULL;
             }
         }
-        if (rwlock_taken && !rwlock_unlocked) {
+        if (!rwlock_unlocked) {
             RCLASS_EXT_RWLOCK_LOCKRD_UNLOCK(klass);
         }
     }
     else {
         cc_tbl = rb_id_table_create(2);
         RCLASS_EXT_RWLOCK_LOCKRD_UNLOCK(klass);
-        RCLASS_EXT_RWLOCK_LOCKWR_LOCK(klass, &rwlock_taken);
+        RCLASS_EXT_RWLOCK_LOCKWR_LOCK(klass);
         RCLASS_WRITE_CC_TBL(klass, cc_tbl);
-        if (rwlock_taken) {
-            RCLASS_EXT_RWLOCK_LOCKWR_UNLOCK(klass);
-        }
+        RCLASS_EXT_RWLOCK_LOCKWR_UNLOCK(klass);
     }
 
     RB_DEBUG_COUNTER_INC(cc_not_found_in_ccs);
@@ -2159,34 +2150,26 @@ vm_search_cc(const VALUE klass, const struct rb_callinfo * const ci)
     if (ccs == NULL) {
         VM_ASSERT(cc_tbl != NULL);
 
-        RCLASS_EXT_RWLOCK_LOCKRD_LOCK(klass, &rwlock_taken);
+        RCLASS_EXT_RWLOCK_LOCKRD_LOCK(klass);
         if (LIKELY(rb_id_table_lookup(cc_tbl, mid, &ccs_data))) {
-            if (rwlock_taken) {
-                RCLASS_EXT_RWLOCK_LOCKRD_UNLOCK(klass);
-            }
+            RCLASS_EXT_RWLOCK_LOCKRD_UNLOCK(klass);
             // rb_callable_method_entry() prepares ccs.
             ccs = (struct rb_class_cc_entries *)ccs_data;
         }
         else {
-            if (rwlock_taken) {
-                RCLASS_EXT_RWLOCK_LOCKRD_UNLOCK(klass);
-            }
-            RCLASS_EXT_RWLOCK_LOCKWR_LOCK(klass, &rwlock_taken);
+            RCLASS_EXT_RWLOCK_LOCKRD_UNLOCK(klass);
+            RCLASS_EXT_RWLOCK_LOCKWR_LOCK(klass);
             ccs = vm_ccs_create(klass, cc_tbl, mid, cme);
-            if (rwlock_taken) {
-                RCLASS_EXT_RWLOCK_LOCKWR_UNLOCK(klass);
-            }
+            RCLASS_EXT_RWLOCK_LOCKWR_UNLOCK(klass);
         }
     }
 
     cme = rb_check_overloaded_cme(cme, ci);
 
     const struct rb_callcache *cc = vm_cc_new(klass, cme, vm_call_general, cc_type_normal);
-    RCLASS_EXT_RWLOCK_LOCKWR_LOCK(klass, &rwlock_taken);
+    RCLASS_EXT_RWLOCK_LOCKWR_LOCK(klass);
     vm_ccs_push(klass, ccs, ci, cc);
-    if (rwlock_taken) {
-        RCLASS_EXT_RWLOCK_LOCKWR_UNLOCK(klass);
-    }
+    RCLASS_EXT_RWLOCK_LOCKWR_UNLOCK(klass);
 
     VM_ASSERT(vm_cc_cme(cc) != NULL);
     VM_ASSERT(cme->called_id == mid);

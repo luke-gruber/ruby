@@ -474,17 +474,12 @@ RCLASSEXT_SET_INCLUDER(rb_classext_t *ext, VALUE klass, VALUE includer)
 }
 
 static inline void
-rclass_ext_rwlock_lockrd_lock(VALUE klass, bool *lock_taken)
+rclass_ext_rwlock_lockrd_lock(VALUE klass)
 {
-    *lock_taken = false;
-    bool needs_lock = rb_multi_ractor_p();
     // NOTE: for now we use the prime classext, but this could change in the future if we want even more
     // fine-grained locking per namespace
     rb_classext_t *classext = RCLASS_EXT_PRIME(klass);
-    if (needs_lock) {
-        pthread_rwlock_rdlock(&classext->lock);
-        *lock_taken = true;
-    }
+    pthread_rwlock_rdlock(&classext->lock);
 #if VM_CHECK_MODE > 0
     RUBY_ASSERT(!classext->lock_owner);
 #endif
@@ -503,20 +498,15 @@ rclass_ext_rwlock_unlock(VALUE klass)
 }
 
 static inline void
-rclass_ext_rwlock_lockwr_lock(VALUE klass, bool *lock_taken)
+rclass_ext_rwlock_lockwr_lock(VALUE klass)
 {
-    *lock_taken = false;
     rb_classext_t *classext = RCLASS_EXT_PRIME(klass);
-    bool needs_lock = rb_multi_ractor_p();
 
 //#if VM_CHECK_MODE > 0
     //RUBY_ASSERT(classext->lock_owner);
     //classext->lock_owner = NULL;
 //#endif
-    if (needs_lock) {
-        pthread_rwlock_wrlock(&classext->lock);
-        *lock_taken = true;
-    }
+    pthread_rwlock_wrlock(&classext->lock);
 }
 
 //static inline void
@@ -535,9 +525,9 @@ rclass_ext_rwlock_lockwr_lock(VALUE klass, bool *lock_taken)
 //#endif
 //}
 
-#define RCLASS_EXT_RWLOCK_LOCKRD_LOCK(klass, lock_taken_ptr) rclass_ext_rwlock_lockrd_lock(klass, lock_taken_ptr)
+#define RCLASS_EXT_RWLOCK_LOCKRD_LOCK(klass) rclass_ext_rwlock_lockrd_lock(klass)
 #define RCLASS_EXT_RWLOCK_LOCKRD_UNLOCK(klass) rclass_ext_rwlock_unlock(klass)
-#define RCLASS_EXT_RWLOCK_LOCKWR_LOCK(klass, lock_taken_ptr) rclass_ext_rwlock_lockwr_lock(klass, lock_taken_ptr)
+#define RCLASS_EXT_RWLOCK_LOCKWR_LOCK(klass) rclass_ext_rwlock_lockwr_lock(klass)
 #define RCLASS_EXT_RWLOCK_LOCKWR_UNLOCK(klass) rclass_ext_rwlock_unlock(klass)
 
 /* class.c */
