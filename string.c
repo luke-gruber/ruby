@@ -11262,8 +11262,8 @@ rb_str_crypt(VALUE str, VALUE salt)
         CRYPT_END();
         rb_syserr_fail(err, "crypt");
     }
-    result = rb_str_new_cstr(res);
     CRYPT_END();
+    result = rb_str_new_cstr(res);
     return result;
 }
 

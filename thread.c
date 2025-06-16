@@ -292,6 +292,7 @@ rb_nativethread_lock_destroy(rb_nativethread_lock_t *lock)
     rb_native_mutex_destroy(lock);
 }
 
+#if !NATIVE_MUTEX_DEADLOCK_ALLOCATION_DETECTOR
 void
 rb_nativethread_lock_lock(rb_nativethread_lock_t *lock)
 {
@@ -303,6 +304,7 @@ rb_nativethread_lock_unlock(rb_nativethread_lock_t *lock)
 {
     rb_native_mutex_unlock(lock);
 }
+#endif
 
 static int
 unblock_function_set(rb_thread_t *th, rb_unblock_function_t *func, void *arg, int fail_if_interrupted)

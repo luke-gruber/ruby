@@ -3722,6 +3722,7 @@ th_init(rb_thread_t *th, VALUE self, rb_vm_t *vm)
     th->ext_config.ractor_safe = true;
 
     ccan_list_head_init(&th->interrupt_exec_tasks);
+    th->native_mutex_deadlock_detector_tbl = rb_st_init_numtable_with_size(1024);
 
 #if USE_RUBY_DEBUG_LOG
     static rb_atomic_t thread_serial = 1;

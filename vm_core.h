@@ -1120,6 +1120,11 @@ typedef struct rb_thread_struct {
     struct rb_native_thread *nt;
     rb_execution_context_t *ec;
 
+#if NATIVE_MUTEX_DEADLOCK_ALLOCATION_DETECTOR
+    // mutex pointer (void*) -> mutex name (char*)
+    st_table *native_mutex_deadlock_detector_tbl;
+#endif
+
     struct rb_thread_sched_item sched;
     bool mn_schedulable;
     rb_atomic_t serial; // only for RUBY_DEBUG_LOG()
