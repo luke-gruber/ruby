@@ -991,6 +991,10 @@ gc_validate_pc(void)
 static inline VALUE
 newobj_of(rb_ractor_t *cr, VALUE klass, VALUE flags, VALUE v1, VALUE v2, VALUE v3, bool wb_protected, size_t size)
 {
+
+#if NATIVE_MUTEX_DEADLOCK_ALLOCATION_DETECTOR
+    rb_native_mutex_deadlock_allocation_prevent();
+#endif
     VALUE obj = rb_gc_impl_new_obj(rb_gc_get_objspace(), cr->newobj_cache, klass, flags, v1, v2, v3, wb_protected, size);
 
     gc_validate_pc();
@@ -5221,15 +5225,6 @@ ruby_xmalloc(size_t size)
     return handle_malloc_failure(ruby_xmalloc_body(size));
 }
 
-static int
-native_mutex_deadlock_detector_tbl_foreach_cb(st_data_t key, st_data_t val, st_data_t arg)
-{
-    (void)arg;
-    (void)key;
-    fprintf(stderr, "Allocating object or managed memory while holding lock: %s\n", (char*)val);
-    return ST_CONTINUE;
-}
-
 static void *
 ruby_xmalloc_body(size_t size)
 {
@@ -5237,18 +5232,7 @@ ruby_xmalloc_body(size_t size)
         negative_size_allocation_error("too large allocation size");
     }
 #if NATIVE_MUTEX_DEADLOCK_ALLOCATION_DETECTOR
-    rb_execution_context_t *ec = rb_current_execution_context(false);
-    if (ec) {
-        rb_thread_t *th = rb_ec_thread_ptr(ec);
-        /*fprintf(stderr, "ruby_xmalloc_body: th:%d\n", rb_th_serial(th));*/
-        VM_ASSERT(th);
-        if (th->native_mutex_deadlock_detector_tbl && rb_st_table_size(th->native_mutex_deadlock_detector_tbl) > 0) {
-            rb_st_foreach(th->native_mutex_deadlock_detector_tbl, native_mutex_deadlock_detector_tbl_foreach_cb, 0);
-            VM_ASSERT(0);
-        }
-    } else if (!ec) {
-        /*fprintf(stderr, "ruby_xmalloc_body: no ec\n");*/
-    }
+    rb_native_mutex_deadlock_allocation_prevent();
 #endif
 
     return rb_gc_impl_malloc(rb_gc_get_objspace(), size);
@@ -5282,18 +5266,7 @@ static void *
 ruby_xmalloc2_body(size_t n, size_t size)
 {
 #if NATIVE_MUTEX_DEADLOCK_ALLOCATION_DETECTOR
-    /*fprintf(stderr, "ruby_xmalloc2_body\n");*/
-    rb_execution_context_t *ec = rb_current_execution_context(false);
-    if (ec) {
-        rb_thread_t *th = rb_ec_thread_ptr(ec);
-        VM_ASSERT(th);
-        if (th->native_mutex_deadlock_detector_tbl && rb_st_table_size(th->native_mutex_deadlock_detector_tbl) > 0) {
-            rb_st_foreach(th->native_mutex_deadlock_detector_tbl, native_mutex_deadlock_detector_tbl_foreach_cb, 0);
-            VM_ASSERT(0);
-        }
-    } else if (!ec) {
-        /*fprintf(stderr, "ruby_xmalloc2_body: no ec\n");*/
-    }
+    rb_native_mutex_deadlock_allocation_prevent();
 #endif
     return rb_gc_impl_malloc(rb_gc_get_objspace(), xmalloc2_size(n, size));
 }
@@ -5310,18 +5283,7 @@ static void *
 ruby_xcalloc_body(size_t n, size_t size)
 {
 #if NATIVE_MUTEX_DEADLOCK_ALLOCATION_DETECTOR
-    /*fprintf(stderr, "ruby_xcalloc_body\n");*/
-    rb_execution_context_t *ec = rb_current_execution_context(false);
-    if (ec) {
-        rb_thread_t *th = rb_ec_thread_ptr(ec);
-        VM_ASSERT(th);
-        if (th->native_mutex_deadlock_detector_tbl && rb_st_table_size(th->native_mutex_deadlock_detector_tbl) > 0) {
-            rb_st_foreach(th->native_mutex_deadlock_detector_tbl, native_mutex_deadlock_detector_tbl_foreach_cb, 0);
-            VM_ASSERT(0);
-        }
-    } else if (!ec) {
-        /*fprintf(stderr, "ruby_xmalloc2_body: no ec\n");*/
-    }
+    rb_native_mutex_deadlock_allocation_prevent();
 #endif
     return rb_gc_impl_calloc(rb_gc_get_objspace(), xmalloc2_size(n, size));
 }
@@ -5344,18 +5306,7 @@ ruby_sized_xrealloc_body(void *ptr, size_t new_size, size_t old_size)
         negative_size_allocation_error("too large allocation size");
     }
 #if NATIVE_MUTEX_DEADLOCK_ALLOCATION_DETECTOR
-    /*fprintf(stderr, "ruby_sized_realloc_body\n");*/
-    rb_execution_context_t *ec = rb_current_execution_context(false);
-    if (ec) {
-        rb_thread_t *th = rb_ec_thread_ptr(ec);
-        VM_ASSERT(th);
-        if (th->native_mutex_deadlock_detector_tbl && rb_st_table_size(th->native_mutex_deadlock_detector_tbl) > 0) {
-            rb_st_foreach(th->native_mutex_deadlock_detector_tbl, native_mutex_deadlock_detector_tbl_foreach_cb, 0);
-            VM_ASSERT(0);
-        }
-    } else if (!ec) {
-        /*fprintf(stderr, "ruby_xmalloc2_body: no ec\n");*/
-    }
+    rb_native_mutex_deadlock_allocation_prevent();
 #endif
 
     return rb_gc_impl_realloc(rb_gc_get_objspace(), ptr, new_size, old_size);
@@ -5383,18 +5334,7 @@ ruby_sized_xrealloc2_body(void *ptr, size_t n, size_t size, size_t old_n)
 {
     size_t len = xmalloc2_size(n, size);
 #if NATIVE_MUTEX_DEADLOCK_ALLOCATION_DETECTOR
-    /*fprintf(stderr, "ruby_sized_xrealloc2_body\n");*/
-    rb_execution_context_t *ec = rb_current_execution_context(false);
-    if (ec) {
-        rb_thread_t *th = rb_ec_thread_ptr(ec);
-        VM_ASSERT(th);
-        if (th->native_mutex_deadlock_detector_tbl && rb_st_table_size(th->native_mutex_deadlock_detector_tbl) > 0) {
-            rb_st_foreach(th->native_mutex_deadlock_detector_tbl, native_mutex_deadlock_detector_tbl_foreach_cb, 0);
-            VM_ASSERT(0);
-        }
-    } else if (!ec) {
-        /*fprintf(stderr, "ruby_sized_xrealloc2_body: no ec\n");*/
-    }
+    rb_native_mutex_deadlock_allocation_prevent();
 #endif
     return rb_gc_impl_realloc(rb_gc_get_objspace(), ptr, len, old_n * size);
 }

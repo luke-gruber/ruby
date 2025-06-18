@@ -708,7 +708,10 @@ ractor_sync_init(rb_ractor_t *r)
 
     // ports
     r->sync.ports = st_init_numtable();
+
+NATIVE_MUTEX_DEADLOCK_DETECTOR_ALLOW_ALLOC() {
     r->sync.default_port_value = ractor_port_new(r);
+}
     FL_SET_RAW(r->sync.default_port_value, RUBY_FL_SHAREABLE); // only default ports are shareable
 
     // legacy

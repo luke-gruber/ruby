@@ -145,26 +145,22 @@ do_native_mutex_trylock(pthread_mutex_t *lock)
 }
 
 #if NATIVE_MUTEX_DEADLOCK_ALLOCATION_DETECTOR
-void rb_native_mutex_detector_lock(pthread_mutex_t *lock, const char *lock_name, const char *func)
+void
+rb_native_mutex_deadlock_detector_lock(pthread_mutex_t *lock, const char *lock_name, const char *func)
 {
     rb_execution_context_t *ec = rb_current_execution_context(false);
     if (ec) {
         rb_thread_t *th = rb_ec_thread_ptr(ec);
         st_data_t key = (st_data_t)lock;
-        if (th->native_mutex_deadlock_detector_tbl && lock != &th->vm->ractor.sync.lock) {
-            /*fprintf(stderr, "adding entry: th:%d, e:%p, %s, %s\n", rb_th_serial(th), lock, lock_name, func);*/
+        if (th->native_mutex_deadlock_detector_tbl && lock != &th->vm->ractor.sync.lock && lock != &th->ractor->sync.lock) {
             st_insert(th->native_mutex_deadlock_detector_tbl, key, (st_data_t)lock_name);
-            /*fprintf(stderr, "entry added\n");*/
-        } else if (!th->native_mutex_deadlock_detector_tbl) {
-            /*fprintf(stderr, "!th->native_mutex_deadlock_detector_tbl\n");*/
         }
-    } else {
-        /*fprintf(stderr, "no ec\n");*/
     }
     do_native_mutex_lock(lock);
 }
 
-void rb_native_mutex_detector_unlock(pthread_mutex_t *lock, const char *lock_name, const char *func)
+void
+rb_native_mutex_deadlock_detector_unlock(pthread_mutex_t *lock, const char *lock_name, const char *func)
 {
     (void)lock_name;
     rb_execution_context_t *ec = rb_current_execution_context(false);
@@ -173,15 +169,15 @@ void rb_native_mutex_detector_unlock(pthread_mutex_t *lock, const char *lock_nam
         VM_ASSERT(th);
         st_data_t arg;
         st_data_t *key = (st_data_t*)&lock;
-        if (th->native_mutex_deadlock_detector_tbl && lock != &th->vm->ractor.sync.lock) {
-            /*fprintf(stderr, "deleting entry: th:%d, e:%p, %s, %s\n", rb_th_serial(th), lock, lock_name, func);*/
+        if (th->native_mutex_deadlock_detector_tbl && lock != &th->vm->ractor.sync.lock && lock != &th->ractor->sync.lock) {
             st_delete(th->native_mutex_deadlock_detector_tbl, key, &arg);
         }
     }
     do_native_mutex_unlock(lock);
 }
 
-int rb_native_mutex_detector_trylock(pthread_mutex_t *lock, const char *lock_name, const char *func)
+int
+rb_native_mutex_deadlock_detector_trylock(pthread_mutex_t *lock, const char *lock_name, const char *func)
 {
     int r = do_native_mutex_trylock(lock);
     if (r == 0) {
@@ -191,14 +187,62 @@ int rb_native_mutex_detector_trylock(pthread_mutex_t *lock, const char *lock_nam
         if (ec) {
             th = rb_ec_thread_ptr(ec);
             VM_ASSERT(th);
-            if (th->native_mutex_deadlock_detector_tbl && lock != &th->vm->ractor.sync.lock) {
+            if (th->native_mutex_deadlock_detector_tbl && lock != &th->vm->ractor.sync.lock && lock != &th->ractor->sync.lock) {
                 st_data_t key = (st_data_t)lock;
-                /*fprintf(stderr, "adding entry: th:%d, e:%p, %s, %s\n", rb_th_serial(th), lock, lock_name, func);*/
                 st_insert(th->native_mutex_deadlock_detector_tbl, key, (st_data_t)lock_name);
             }
         }
     }
     return r;
+}
+
+static int
+native_mutex_deadlock_detector_tbl_foreach_cb(st_data_t key, st_data_t val, st_data_t arg)
+{
+    (void)arg;
+    (void)key;
+    fprintf(stderr, "Allocating object or managed memory while holding native lock: %s\n", (char*)val);
+    return ST_CONTINUE;
+}
+
+void
+rb_native_mutex_deadlock_allocation_prevent_st_table(st_table *tab)
+{
+    rb_execution_context_t *ec = rb_current_execution_context(false);
+    if (ec) {
+        rb_thread_t *th = rb_ec_thread_ptr(ec);
+        VM_ASSERT(th);
+        if (tab != th->native_mutex_deadlock_detector_tbl && !th->allow_alloc_with_mutex &&
+            rb_st_table_size(th->native_mutex_deadlock_detector_tbl) > 0) {
+            rb_st_foreach(th->native_mutex_deadlock_detector_tbl, native_mutex_deadlock_detector_tbl_foreach_cb, 0);
+            VM_ASSERT(0);
+        }
+    }
+}
+
+void
+rb_native_mutex_deadlock_allocation_prevent(void)
+{
+    rb_execution_context_t *ec = rb_current_execution_context(false);
+    if (ec) {
+        rb_thread_t *th = rb_ec_thread_ptr(ec);
+        VM_ASSERT(th);
+        if (th->native_mutex_deadlock_detector_tbl && !th->allow_alloc_with_mutex &&
+            rb_st_table_size(th->native_mutex_deadlock_detector_tbl) > 0) {
+            rb_st_foreach(th->native_mutex_deadlock_detector_tbl, native_mutex_deadlock_detector_tbl_foreach_cb, 0);
+            VM_ASSERT(0);
+        }
+    }
+}
+void
+rb_native_mutex_deadlock_allocation_allow(bool allow)
+{
+    rb_execution_context_t *ec = rb_current_execution_context(false);
+    if (ec) {
+        rb_thread_t *th = rb_ec_thread_ptr(ec);
+        VM_ASSERT(th);
+        th->allow_alloc_with_mutex = allow;
+    }
 }
 #else
 void

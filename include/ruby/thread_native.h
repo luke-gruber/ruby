@@ -63,11 +63,13 @@ struct rb_nativethread_cond_t;
 #error "unsupported thread type"
 
 #endif
-
+#if RUBY_DEBUG && defined(HAVE_PTHREAD_H)
 #define NATIVE_MUTEX_DEADLOCK_ALLOCATION_DETECTOR 1
+#else
+#define NATIVE_MUTEX_DEADLOCK_ALLOCATION_DETECTOR 0
+#endif
 
 RBIMPL_SYMBOL_EXPORT_BEGIN()
-
 /**
  * Queries the ID of the native thread that is calling this function.
  *
@@ -108,18 +110,26 @@ void rb_nativethread_lock_initialize(rb_nativethread_lock_t *lock);
  */
 void rb_nativethread_lock_destroy(rb_nativethread_lock_t *lock);
 
-
 #if NATIVE_MUTEX_DEADLOCK_ALLOCATION_DETECTOR
-void rb_native_mutex_detector_lock(rb_nativethread_lock_t *lock, const char *lock_name, const char *func);
-void rb_native_mutex_detector_unlock(rb_nativethread_lock_t *lock, const char *lock_name, const char *func);
-int  rb_native_mutex_detector_trylock(rb_nativethread_lock_t *lock, const char *lock_name, const char *func);
-#define rb_native_mutex_lock(lock) rb_native_mutex_detector_lock(lock, #lock, __func__)
-#define rb_native_mutex_unlock(lock) rb_native_mutex_detector_unlock(lock, #lock, __func__)
-#define rb_native_mutex_trylock(lock) rb_native_mutex_detector_trylock(lock, #lock, __func__)
+void rb_native_mutex_deadlock_detector_lock(rb_nativethread_lock_t *lock, const char *lock_name, const char *func);
+void rb_native_mutex_deadlock_detector_unlock(rb_nativethread_lock_t *lock, const char *lock_name, const char *func);
+int  rb_native_mutex_deadlock_detector_trylock(rb_nativethread_lock_t *lock, const char *lock_name, const char *func);
+#define rb_native_mutex_lock(lock) rb_native_mutex_deadlock_detector_lock(lock, #lock, __func__)
+#define rb_native_mutex_unlock(lock) rb_native_mutex_deadlock_detector_unlock(lock, #lock, __func__)
+#define rb_native_mutex_trylock(lock) rb_native_mutex_deadlock_detector_trylock(lock, #lock, __func__)
 #define rb_nativethread_lock_lock(lock) rb_native_mutex_lock(lock)
 #define rb_nativethread_lock_unlock(lock) rb_native_mutex_unlock(lock)
+void rb_native_mutex_deadlock_allocation_prevent(void);
+struct st_table;
+void rb_native_mutex_deadlock_allocation_prevent_st_table(struct st_table *tab);
+void rb_native_mutex_deadlock_allocation_allow(bool);
+#define NATIVE_MUTEX_DEADLOCK_DETECTOR_ALLOW_ALLOC() \
+    for (int allow = (rb_native_mutex_deadlock_allocation_allow(true), 1); \
+        allow; rb_native_mutex_deadlock_allocation_allow(false), allow = false)
+
 #else
-#error "uh oh"
+#define NATIVE_MUTEX_DEADLOCK_DETECTOR_ALLOW_ALLOC()
+
 /**
  * Blocks until the current thread obtains a lock.
  *
@@ -136,17 +146,18 @@ void rb_nativethread_lock_lock(rb_nativethread_lock_t *lock);
  * @post        `lock` is not owned by the current native thread.
  */
 void rb_nativethread_lock_unlock(rb_nativethread_lock_t *lock);
+
 /** @alias{rb_nativethread_lock_lock} */
 void rb_native_mutex_lock(rb_nativethread_lock_t *lock);
 
 /**
-* Identical  to  rb_native_mutex_lock(),  except  it  doesn't  block  in  case
-* rb_native_mutex_lock() would.
-*
-* @param[out]  lock   A mutex to lock.
-* @retval      0      `lock` is successfully owned by the current thread.
-* @retval      EBUSY  `lock` is owned by someone else.
-*/
+ * Identical  to  rb_native_mutex_lock(),  except  it  doesn't  block  in  case
+ * rb_native_mutex_lock() would.
+ *
+ * @param[out]  lock   A mutex to lock.
+ * @retval      0      `lock` is successfully owned by the current thread.
+ * @retval      EBUSY  `lock` is owned by someone else.
+ */
 int  rb_native_mutex_trylock(rb_nativethread_lock_t *lock);
 
 /** @alias{rb_nativethread_lock_unlock} */

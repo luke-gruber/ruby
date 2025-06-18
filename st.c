@@ -112,6 +112,7 @@
 #include "internal/set_table.h"
 #include "internal/st.h"
 #include "ruby_assert.h"
+#include "ruby/thread_native.h"
 #endif
 
 #include <stdio.h>
@@ -128,6 +129,10 @@
 #define PREFETCH(addr, write_p)
 #define EXPECT(expr, val) (expr)
 #define ATTRIBUTE_UNUSED
+#endif
+
+#ifndef NATIVE_MUTEX_DEADLOCK_ALLOCATION_DETECTOR
+#define NATIVE_MUTEX_DEADLOCK_ALLOCATION_DETECTOR 0
 #endif
 
 /* The type of hashes.  */
@@ -1138,6 +1143,10 @@ st_insert(st_table *tab, st_data_t key, st_data_t value)
     st_index_t bin_ind;
     int new_p;
 
+#if NATIVE_MUTEX_DEADLOCK_ALLOCATION_DETECTOR
+    rb_native_mutex_deadlock_allocation_prevent_st_table(tab);
+#endif
+
     hash_value = do_hash(key, tab);
  retry:
     rebuild_table_if_necessary(tab);
@@ -1181,6 +1190,9 @@ st_add_direct_with_hash(st_table *tab,
     st_table_entry *entry;
     st_index_t ind;
     st_index_t bin_ind;
+#if NATIVE_MUTEX_DEADLOCK_ALLOCATION_DETECTOR
+    rb_native_mutex_deadlock_allocation_prevent_st_table(tab);
+#endif
 
     assert(hash != RESERVED_HASH_VAL);
 
@@ -1228,6 +1240,10 @@ st_insert2(st_table *tab, st_data_t key, st_data_t value,
     st_hash_t hash_value;
     st_index_t bin_ind;
     int new_p;
+
+#if NATIVE_MUTEX_DEADLOCK_ALLOCATION_DETECTOR
+    rb_native_mutex_deadlock_allocation_prevent_st_table(tab);
+#endif
 
     hash_value = do_hash(key, tab);
  retry:

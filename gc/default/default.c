@@ -2460,8 +2460,6 @@ newobj_slowpath_wb_unprotected(VALUE klass, VALUE flags, rb_objspace_t *objspace
     return newobj_slowpath(klass, flags, objspace, cache, FALSE, heap_idx);
 }
 
-static int native_mutex_deadlock_detector_tbl_foreach_cb(st_data_t key, st_data_t val, st_data_t arg);
-
 VALUE
 rb_gc_impl_new_obj(void *objspace_ptr, void *cache_ptr, VALUE klass, VALUE flags, VALUE v1, VALUE v2, VALUE v3, bool wb_protected, size_t alloc_size)
 {
@@ -2476,21 +2474,6 @@ rb_gc_impl_new_obj(void *objspace_ptr, void *cache_ptr, VALUE klass, VALUE flags
             rb_memerror();
         }
     }
-
-#if NATIVE_MUTEX_DEADLOCK_ALLOCATION_DETECTOR
-    rb_execution_context_t *ec = rb_current_execution_context(false);
-    if (ec) {
-        rb_thread_t *th = rb_ec_thread_ptr(ec);
-        /*fprintf(stderr, "impl_new_obj: th:%d\n", rb_th_serial(th));*/
-        VM_ASSERT(th);
-        if (th->native_mutex_deadlock_detector_tbl && rb_st_table_size(th->native_mutex_deadlock_detector_tbl) > 0) {
-            rb_st_foreach(th->native_mutex_deadlock_detector_tbl, native_mutex_deadlock_detector_tbl_foreach_cb, 0);
-            VM_ASSERT(0);
-        }
-    } else if (!ec) {
-        /*fprintf(stderr, "ruby_xmalloc_body: no ec\n");*/
-    }
-#endif
 
     size_t heap_idx = heap_idx_for_size(alloc_size);
 

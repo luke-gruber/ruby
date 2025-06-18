@@ -1123,6 +1123,7 @@ typedef struct rb_thread_struct {
 #if NATIVE_MUTEX_DEADLOCK_ALLOCATION_DETECTOR
     // mutex pointer (void*) -> mutex name (char*)
     st_table *native_mutex_deadlock_detector_tbl;
+    bool allow_alloc_with_mutex;
 #endif
 
     struct rb_thread_sched_item sched;
