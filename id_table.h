@@ -43,6 +43,7 @@ int rb_managed_id_table_lookup(VALUE table, ID id, VALUE *valp);
 size_t rb_managed_id_table_size(VALUE table);
 void rb_managed_id_table_foreach(VALUE table, rb_id_table_foreach_func_t *func, void *data);
 void rb_managed_id_table_foreach_values(VALUE table, rb_id_table_foreach_values_func_t *func, void *data);
+void rb_managed_id_table_foreach_values_if_alive(VALUE table, rb_id_table_foreach_values_func_t *func, void *data);
 int rb_managed_id_table_delete(VALUE table, ID id);
 
 void rb_managed_id_table_free(void *data);

@@ -1211,7 +1211,10 @@ classext_free(rb_classext_t *ext, bool is_prime, VALUE namespace, void *arg)
     struct classext_foreach_args *args = (struct classext_foreach_args *)arg;
 
     rb_id_table_free(RCLASSEXT_M_TBL(ext));
-    rb_vm_cc_table_invalidate_ccs(RCLASSEXT_CC_TBL(ext), args->klass);
+    VALUE cc_table = RCLASSEXT_CC_TBL(ext);
+    if (cc_table) {
+        rb_vm_cc_table_invalidate_ccs(cc_table, args->klass);
+    }
     if (!RCLASSEXT_SHARED_CONST_TBL(ext) && (tbl = RCLASSEXT_CONST_TBL(ext)) != NULL) {
         rb_free_const_table(tbl);
     }
@@ -1241,7 +1244,10 @@ classext_iclass_free(rb_classext_t *ext, bool is_prime, VALUE namespace, void *a
     if (RCLASSEXT_CALLABLE_M_TBL(ext) != NULL) {
         rb_id_table_free(RCLASSEXT_CALLABLE_M_TBL(ext));
     }
-    rb_vm_cc_table_invalidate_ccs(RCLASSEXT_CC_TBL(ext), args->klass);
+    VALUE cc_table = RCLASSEXT_CC_TBL(ext);
+    if (cc_table) {
+        rb_vm_cc_table_invalidate_ccs(cc_table, args->klass);
+    }
 
     rb_class_classext_free_subclasses(ext, args->klass);
 
@@ -1291,6 +1297,7 @@ rb_gc_obj_free(void *objspace, VALUE obj)
         }
         (void)RB_DEBUG_COUNTER_INC_IF(obj_module_ptr, BUILTIN_TYPE(obj) == T_MODULE);
         (void)RB_DEBUG_COUNTER_INC_IF(obj_class_ptr, BUILTIN_TYPE(obj) == T_CLASS);
+        rb_gccct_clear_table(Qnil); // FIXME: not granular enough of invalidation
         break;
       case T_STRING:
         rb_str_free(obj);

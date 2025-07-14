@@ -384,8 +384,9 @@ static inline bool
 vm_cc_class_check(const struct rb_callcache *cc, VALUE klass)
 {
     VM_ASSERT(IMEMO_TYPE_P(cc, imemo_callcache));
-    VM_ASSERT(cc->klass == 0 ||
-              RB_TYPE_P(cc->klass, T_CLASS) || RB_TYPE_P(cc->klass, T_ICLASS));
+    // could be pointing to garbage because class could be freed before cc_table is freed and does its invalidations
+    VALUE cc_klass = cc->klass; (void)cc_klass;
+    VM_ASSERT(cc_klass == 0  || rb_objspace_garbage_object_p(cc_klass) || RB_TYPE_P(cc_klass, T_CLASS) || RB_TYPE_P(cc_klass, T_ICLASS), "type:%d", BUILTIN_TYPE(cc_klass));
     return cc->klass == klass;
 }
 
@@ -399,6 +400,9 @@ vm_cc_markable(const struct rb_callcache *cc)
 static inline const struct rb_callable_method_entry_struct *
 vm_cc_cme(const struct rb_callcache *cc)
 {
+    if (BUILTIN_TYPE((VALUE)cc) == T_NONE) {
+        return NULL;
+    }
     VM_ASSERT(IMEMO_TYPE_P(cc, imemo_callcache));
     VM_ASSERT(cc->call_ == NULL   || // not initialized yet
               !vm_cc_markable(cc) ||
@@ -557,9 +561,6 @@ struct rb_call_data {
 };
 
 struct rb_class_cc_entries {
-#if VM_CHECK_MODE > 0
-    VALUE debug_sig;
-#endif
     int capa;
     int len;
     const struct rb_callable_method_entry_struct *cme;
@@ -578,7 +579,7 @@ void rb_vm_dump_overloaded_cme_table(void);
 static inline bool
 vm_ccs_p(const struct rb_class_cc_entries *ccs)
 {
-    return ccs->debug_sig == ~(VALUE)ccs;
+    return true;
 }
 
 static inline bool

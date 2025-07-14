@@ -443,6 +443,15 @@ rb_managed_id_table_foreach_values(VALUE table, rb_id_table_foreach_values_func_
     rb_id_table_foreach_values(RTYPEDDATA_GET_DATA(table), func, data);
 }
 
+void
+rb_managed_id_table_foreach_values_if_alive(VALUE table, rb_id_table_foreach_values_func_t *func, void *data)
+{
+    if (!rb_objspace_garbage_object_p(table) && RB_TYPE_P(table, T_DATA) &&
+        rb_typeddata_inherited_p(RTYPEDDATA_TYPE(table), &rb_managed_id_table_type)) {
+        rb_id_table_foreach_values(RTYPEDDATA_GET_DATA(table), func, data);
+    }
+}
+
 int
 rb_managed_id_table_delete(VALUE table, ID id)
 {

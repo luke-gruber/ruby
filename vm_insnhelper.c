@@ -1985,9 +1985,6 @@ static struct rb_class_cc_entries *
 vm_ccs_create(VALUE klass, VALUE cc_tbl, ID mid, const rb_callable_method_entry_t *cme)
 {
     struct rb_class_cc_entries *ccs = ALLOC(struct rb_class_cc_entries);
-#if VM_CHECK_MODE > 0
-    ccs->debug_sig = ~(VALUE)ccs;
-#endif
     ccs->capa = 0;
     ccs->len = 0;
     ccs->cme = cme;

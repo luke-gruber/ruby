@@ -39,6 +39,7 @@ vm_ccs_free(struct rb_class_cc_entries *ccs)
 {
     if (ccs->entries) {
         ruby_xfree(ccs->entries);
+        ccs->entries = NULL;
     }
     ruby_xfree(ccs);
 }
@@ -174,11 +175,12 @@ vm_cc_table_invalidate_ccs_i(VALUE ccs_ptr, void *data)
     return ID_TABLE_CONTINUE;
 }
 
+// from GC free of class/module
 void
 rb_vm_cc_table_invalidate_ccs(VALUE cc_table, VALUE klass)
 {
     if (!cc_table) return;
-    rb_managed_id_table_foreach_values(cc_table, vm_cc_table_invalidate_ccs_i, (void *)klass);
+    rb_managed_id_table_foreach_values_if_alive(cc_table, vm_cc_table_invalidate_ccs_i, (void *)klass);
 }
 
 static enum rb_id_table_iterator_result
@@ -404,7 +406,8 @@ clear_method_cache_by_id_in_class(VALUE klass, ID mid)
     VM_ASSERT_TYPE2(klass, T_CLASS, T_ICLASS);
     if (rb_objspace_garbage_object_p(klass)) return;
 
-    RB_VM_LOCKING() {    if (LIKELY(RCLASS_SUBCLASSES_FIRST(klass) == NULL)) {
+    RB_VM_LOCKING() {
+        if (LIKELY(RCLASS_SUBCLASSES_FIRST(klass) == NULL)) {
             // no subclasses
             // check only current class
 
@@ -537,6 +540,7 @@ invalidate_ccs_in_iclass_cc_tbl(VALUE value, void *data)
 {
     struct rb_class_cc_entries *ccs = (struct rb_class_cc_entries *)value;
     vm_cme_invalidate((rb_callable_method_entry_t *)ccs->cme);
+    ruby_xfree(ccs);
     return ID_TABLE_DELETE;
 }
 
