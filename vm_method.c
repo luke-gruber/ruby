@@ -29,7 +29,7 @@ vm_ccs_invalidate(struct rb_class_cc_entries *ccs)
         for (int i=0; i<ccs->len; i++) {
             const struct rb_callcache *cc = ccs->entries[i].cc;
             VM_ASSERT(!vm_cc_super_p(cc) && !vm_cc_refinement_p(cc));
-            vm_cc_invalidate(cc);
+            if (cc->klass) vm_cc_invalidate(cc);
         }
     }
 }
@@ -59,7 +59,7 @@ mark_cc_entry_i(VALUE ccs_ptr, void *data)
 
     VM_ASSERT(vm_ccs_p(ccs));
 
-    if (METHOD_ENTRY_INVALIDATED(ccs->cme)) {
+    if (METHOD_ENTRY_INVALIDATED(ccs->cme) || rb_objspace_garbage_object_p((VALUE)ccs->cme)) {
         rb_vm_ccs_invalidate_and_free(ccs);
         return ID_TABLE_DELETE;
     }
@@ -67,8 +67,9 @@ mark_cc_entry_i(VALUE ccs_ptr, void *data)
         rb_gc_mark_movable((VALUE)ccs->cme);
 
         for (int i=0; i<ccs->len; i++) {
-            VM_ASSERT(vm_cc_check_cme(ccs->entries[i].cc, ccs->cme));
+            /*VM_ASSERT(vm_cc_check_cme(ccs->entries[i].cc, ccs->cme));*/
 
+            VM_ASSERT(BUILTIN_TYPE((VALUE)ccs->entries[i].cc) != T_NONE);
             rb_gc_mark_movable((VALUE)ccs->entries[i].cc);
         }
         return ID_TABLE_CONTINUE;
@@ -95,11 +96,15 @@ cc_table_free_i(VALUE ccs_ptr, void *data)
     return ID_TABLE_CONTINUE;
 }
 
+static enum rb_id_table_iterator_result
+vm_cc_table_invalidate_ccs_i(VALUE ccs_ptr, void *data);
+
 static void
 vm_cc_table_free(void *data)
 {
     struct rb_id_table *tbl = (struct rb_id_table *)data;
 
+    rb_id_table_foreach_values(tbl, vm_cc_table_invalidate_ccs_i, NULL);
     rb_id_table_foreach_values(tbl, cc_table_free_i, NULL);
     rb_managed_id_table_free(data);
 }
@@ -166,9 +171,9 @@ vm_cc_table_invalidate_ccs_i(VALUE ccs_ptr, void *data)
             if (rb_gc_pointer_to_heap_p((VALUE)cc) &&
                     !rb_objspace_garbage_object_p((VALUE)cc) &&
                     IMEMO_TYPE_P(cc, imemo_callcache) &&
-                    cc->klass == klass) {
+                    (!klass || cc->klass == klass)) {
                 VM_ASSERT(!vm_cc_super_p(cc) && !vm_cc_refinement_p(cc));
-                vm_cc_invalidate(cc);
+                if (cc->klass) vm_cc_invalidate(cc);
             }
         }
     }

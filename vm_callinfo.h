@@ -545,7 +545,7 @@ vm_cc_bf_p(const struct rb_callcache *cc)
 static inline void
 vm_cc_invalidate(const struct rb_callcache *cc)
 {
-    VM_ASSERT(IMEMO_TYPE_P(cc, imemo_callcache));
+    VM_ASSERT(IMEMO_TYPE_P(cc, imemo_callcache), "type:%d", BUILTIN_TYPE((VALUE)cc));
     VM_ASSERT(cc != vm_cc_empty());
     VM_ASSERT(cc->klass != 0); // should be enable
 

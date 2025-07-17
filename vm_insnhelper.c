@@ -2049,8 +2049,8 @@ vm_ccs_verify(struct rb_class_cc_entries *ccs, ID mid, VALUE klass)
     for (int i=0; i<ccs->len; i++) {
         const struct rb_callcache *cc = ccs->entries[i].cc;
 
-        VM_ASSERT(IMEMO_TYPE_P(cc, imemo_callcache));
-        VM_ASSERT(vm_cc_class_check(cc, klass));
+        VM_ASSERT(IMEMO_TYPE_P(cc, imemo_callcache), "type:%d", BUILTIN_TYPE((VALUE)cc));
+        VM_ASSERT(vm_cc_class_check(cc, klass), "cc->klass:%d, klass:%d", cc->klass ? BUILTIN_TYPE(cc->klass) : 0, BUILTIN_TYPE(klass));
         VM_ASSERT(vm_cc_check_cme(cc, ccs->cme));
         VM_ASSERT(!vm_cc_super_p(cc));
         VM_ASSERT(!vm_cc_refinement_p(cc));
