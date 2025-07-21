@@ -172,8 +172,9 @@ vm_cc_table_invalidate_ccs_i(VALUE ccs_ptr, void *data)
                     !rb_objspace_garbage_object_p((VALUE)cc) &&
                     IMEMO_TYPE_P(cc, imemo_callcache) &&
                     (!klass || cc->klass == klass)) {
-                VM_ASSERT(!vm_cc_super_p(cc) && !vm_cc_refinement_p(cc));
-                if (cc->klass) vm_cc_invalidate(cc);
+                if (cc->klass) {
+                    vm_cc_invalidate(cc);
+                }
             }
         }
     }

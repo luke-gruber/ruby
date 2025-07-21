@@ -384,9 +384,9 @@ static inline bool
 vm_cc_class_check(const struct rb_callcache *cc, VALUE klass)
 {
     VM_ASSERT(IMEMO_TYPE_P(cc, imemo_callcache));
-    // could be pointing to garbage because class could be freed before cc_table is freed and does its invalidations
+    // cc->klass could be pointing to garbage because class could be freed before cc_table is freed and does its invalidations. Could also point to another object
+    // if the new object took the same address of the previously freed class.
     VALUE cc_klass = cc->klass; (void)cc_klass;
-    VM_ASSERT(cc_klass == 0  || rb_objspace_garbage_object_p(cc_klass) || RB_TYPE_P(cc_klass, T_CLASS) || RB_TYPE_P(cc_klass, T_ICLASS), "type:%d", BUILTIN_TYPE(cc_klass));
     return cc->klass == klass;
 }
 

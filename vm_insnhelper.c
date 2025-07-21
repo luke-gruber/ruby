@@ -2050,10 +2050,12 @@ vm_ccs_verify(struct rb_class_cc_entries *ccs, ID mid, VALUE klass)
         const struct rb_callcache *cc = ccs->entries[i].cc;
 
         VM_ASSERT(IMEMO_TYPE_P(cc, imemo_callcache), "type:%d", BUILTIN_TYPE((VALUE)cc));
-        VM_ASSERT(vm_cc_class_check(cc, klass), "cc->klass:%d, klass:%d", cc->klass ? BUILTIN_TYPE(cc->klass) : 0, BUILTIN_TYPE(klass));
-        VM_ASSERT(vm_cc_check_cme(cc, ccs->cme));
-        VM_ASSERT(!vm_cc_super_p(cc));
-        VM_ASSERT(!vm_cc_refinement_p(cc));
+        if (cc->klass) {
+            VM_ASSERT(vm_cc_class_check(cc, klass), "cc->klass:%d, klass:%d. Bad vm_cc_class_check for %s#%s", cc->klass ? BUILTIN_TYPE(cc->klass) : -1, BUILTIN_TYPE(klass), rb_class2name(klass), rb_id2name(mid));
+            VM_ASSERT(vm_cc_check_cme(cc, ccs->cme));
+            VM_ASSERT(!vm_cc_super_p(cc));
+            VM_ASSERT(!vm_cc_refinement_p(cc));
+        }
     }
     return TRUE;
 }
@@ -2097,7 +2099,7 @@ vm_search_cc(const VALUE klass, const struct rb_callinfo * const ci)
 
                     VM_ASSERT(IMEMO_TYPE_P(ccs_cc, imemo_callcache));
 
-                    if (ccs_ci_argc == argc && ccs_ci_flag == flag) {
+                    if (ccs_cc->klass && ccs_ci_argc == argc && ccs_ci_flag == flag) {
                         RB_DEBUG_COUNTER_INC(cc_found_in_ccs);
 
                         VM_ASSERT(vm_cc_cme(ccs_cc)->called_id == mid);
