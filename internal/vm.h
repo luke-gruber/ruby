@@ -101,6 +101,7 @@ const struct rb_callcache *rb_vm_search_method_slowpath(const struct rb_callinfo
 int rb_ec_obj_respond_to(struct rb_execution_context_struct *ec, VALUE obj, ID id, int priv);
 void rb_vm_cc_table_invalidate_ccs(VALUE cc_table, VALUE klass);
 void rb_clear_constant_cache(void);
+VALUE rb_managed_cc_table_dup(VALUE old_table);
 
 /* vm_dump.c */
 void rb_print_backtrace(FILE *);

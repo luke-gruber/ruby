@@ -385,17 +385,23 @@ managed_id_table_dup_i(ID id, VALUE val, void *data)
 }
 
 VALUE
-rb_managed_id_table_dup(VALUE old_table)
+rb_managed_id_table_dup_type(VALUE old_table, const rb_data_type_t *type)
 {
     RUBY_ASSERT(RB_TYPE_P(old_table, T_DATA));
     RUBY_ASSERT(rb_typeddata_inherited_p(RTYPEDDATA_TYPE(old_table), &rb_managed_id_table_type));
 
     struct rb_id_table *new_tbl;
-    VALUE obj = TypedData_Make_Struct(0, struct rb_id_table, &rb_managed_id_table_type, new_tbl);
+    VALUE obj = TypedData_Make_Struct(0, struct rb_id_table, type, new_tbl);
     struct rb_id_table *old_tbl = RTYPEDDATA_GET_DATA(old_table);
     rb_id_table_init(new_tbl, old_tbl->num + 1);
     rb_id_table_foreach(old_tbl, managed_id_table_dup_i, new_tbl);
     return obj;
+}
+
+VALUE
+rb_managed_id_table_dup(VALUE old_table)
+{
+    return rb_managed_id_table_dup_type(old_table, &rb_managed_id_table_type);
 }
 
 int

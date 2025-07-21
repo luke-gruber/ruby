@@ -189,7 +189,9 @@ rbimpl_typeddata_flags {
      * using the dmark/dcompact callback functions or whether we should mark
      * declaratively using a list of references defined inside the data struct we're wrapping
      */
-    RUBY_TYPED_DECL_MARKING     = RUBY_FL_USER2
+    RUBY_TYPED_DECL_MARKING     = RUBY_FL_USER2,
+
+    RUBY_TYPED_FREE_DYNAMIC     = RUBY_FL_USER2 * 2,
 };
 
 /**

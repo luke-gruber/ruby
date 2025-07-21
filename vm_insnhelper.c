@@ -28,6 +28,7 @@
 #include "internal/variable.h"
 #include "internal/set_table.h"
 #include "internal/struct.h"
+#include "ruby/atomic.h"
 #include "variable.h"
 
 /* finish iseq array */
@@ -1982,7 +1983,7 @@ static VALUE vm_call_general(rb_execution_context_t *ec, rb_control_frame_t *reg
 static VALUE vm_mtbl_dump(VALUE klass, ID target_mid);
 
 static struct rb_class_cc_entries *
-vm_ccs_create(VALUE klass, VALUE cc_tbl, ID mid, const rb_callable_method_entry_t *cme)
+vm_ccs_create(VALUE klass, VALUE cc_tbl, ID mid, const rb_callable_method_entry_t *cme, VALUE *new_cc_tbl_out)
 {
     struct rb_class_cc_entries *ccs = ALLOC(struct rb_class_cc_entries);
     ccs->capa = 0;
@@ -1991,9 +1992,14 @@ vm_ccs_create(VALUE klass, VALUE cc_tbl, ID mid, const rb_callable_method_entry_
     METHOD_ENTRY_CACHED_SET((rb_callable_method_entry_t *)cme);
     ccs->entries = NULL;
 
-    rb_managed_id_table_insert(cc_tbl, mid, (VALUE)ccs);
-    RB_OBJ_WRITTEN(cc_tbl, Qundef, cme);
+    RB_OBJ_FREEZE(cc_tbl);
+    VALUE new_cc_tbl = rb_managed_cc_table_dup(cc_tbl);
+    fprintf(stderr, "vm_ccs_create: old cc_tbl:%p new_cc_tbl:%p\n", cc_tbl, new_cc_tbl);
+    rb_managed_id_table_insert(new_cc_tbl, mid, (VALUE)ccs);
+    RB_OBJ_WRITTEN(new_cc_tbl, Qundef, cme);
     RB_OBJ_WRITTEN(klass, Qundef, cme);
+    RCLASS_WRITE_CC_TBL(klass, new_cc_tbl);
+    if (new_cc_tbl_out) *new_cc_tbl_out = new_cc_tbl;
     return ccs;
 }
 
@@ -2079,8 +2085,14 @@ vm_search_cc(const VALUE klass, const struct rb_callinfo * const ci)
             const int ccs_len = ccs->len;
 
             if (UNLIKELY(METHOD_ENTRY_INVALIDATED(ccs->cme))) {
+                VM_ASSERT(!RB_OBJ_FROZEN(cc_tbl)); // FIXME: race
+                RB_OBJ_FREEZE(cc_tbl);
+                VALUE new_cc_tbl = rb_managed_cc_table_dup(cc_tbl);
+                fprintf(stderr, "vm_search_ccs: old cc_tbl:%p new_cc_tbl:%p\n", cc_tbl, new_cc_tbl);
+                rb_managed_id_table_delete(new_cc_tbl, mid);
+                RCLASS_WRITE_CC_TBL(klass, new_cc_tbl);
+                cc_tbl = new_cc_tbl;
                 rb_vm_ccs_invalidate_and_free(ccs);
-                rb_managed_id_table_delete(cc_tbl, mid);
                 ccs = NULL;
             }
             else {
@@ -2152,7 +2164,9 @@ vm_search_cc(const VALUE klass, const struct rb_callinfo * const ci)
         }
         else {
             // TODO: required?
-            ccs = vm_ccs_create(klass, cc_tbl, mid, cme);
+            VALUE new_cc_tbl = Qundef;
+            ccs = vm_ccs_create(klass, cc_tbl, mid, cme, &new_cc_tbl);
+            cc_tbl = new_cc_tbl;
         }
     }
 
@@ -2176,16 +2190,14 @@ rb_vm_search_method_slowpath(const struct rb_callinfo *ci, VALUE klass)
 
     VM_ASSERT_TYPE2(klass, T_CLASS, T_ICLASS);
 
-    RB_VM_LOCKING() {
-        cc = vm_search_cc(klass, ci);
+    cc = vm_search_cc(klass, ci);
 
-        VM_ASSERT(cc);
-        VM_ASSERT(IMEMO_TYPE_P(cc, imemo_callcache));
-        VM_ASSERT(cc == vm_cc_empty() || cc->klass == klass);
-        VM_ASSERT(cc == vm_cc_empty() || callable_method_entry_p(vm_cc_cme(cc)));
-        VM_ASSERT(cc == vm_cc_empty() || !METHOD_ENTRY_INVALIDATED(vm_cc_cme(cc)));
-        VM_ASSERT(cc == vm_cc_empty() || vm_cc_cme(cc)->called_id == vm_ci_mid(ci));
-    }
+    VM_ASSERT(cc);
+    VM_ASSERT(IMEMO_TYPE_P(cc, imemo_callcache));
+    VM_ASSERT(cc == vm_cc_empty() || cc->klass == klass);
+    VM_ASSERT(cc == vm_cc_empty() || callable_method_entry_p(vm_cc_cme(cc)));
+    VM_ASSERT(cc == vm_cc_empty() || !METHOD_ENTRY_INVALIDATED(vm_cc_cme(cc)));
+    VM_ASSERT(cc == vm_cc_empty() || vm_cc_cme(cc)->called_id == vm_ci_mid(ci));
 
     return cc;
 }

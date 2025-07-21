@@ -28,7 +28,6 @@ vm_ccs_invalidate(struct rb_class_cc_entries *ccs)
     if (ccs->entries) {
         for (int i=0; i<ccs->len; i++) {
             const struct rb_callcache *cc = ccs->entries[i].cc;
-            VM_ASSERT(!vm_cc_super_p(cc) && !vm_cc_refinement_p(cc));
             if (cc->klass) vm_cc_invalidate(cc);
         }
     }
@@ -59,7 +58,10 @@ mark_cc_entry_i(VALUE ccs_ptr, void *data)
 
     VM_ASSERT(vm_ccs_p(ccs));
 
-    if (METHOD_ENTRY_INVALIDATED(ccs->cme) || rb_objspace_garbage_object_p((VALUE)ccs->cme)) {
+    // ccs->cme could have been collected while the cc table is still alive
+    if (rb_objspace_garbage_object_p((VALUE)ccs->cme) ||
+        !(RB_TYPE_P((VALUE)ccs->cme, T_IMEMO) && IMEMO_TYPE_P((VALUE)ccs->cme, imemo_ment)) ||
+        METHOD_ENTRY_INVALIDATED(ccs->cme)) {
         rb_vm_ccs_invalidate_and_free(ccs);
         return ID_TABLE_DELETE;
     }
@@ -99,14 +101,38 @@ cc_table_free_i(VALUE ccs_ptr, void *data)
 static enum rb_id_table_iterator_result
 vm_cc_table_invalidate_ccs_i(VALUE ccs_ptr, void *data);
 
+
 static void
-vm_cc_table_free(void *data)
+vm_cc_table_free_all(void *data)
 {
     struct rb_id_table *tbl = (struct rb_id_table *)data;
 
-    rb_id_table_foreach_values(tbl, vm_cc_table_invalidate_ccs_i, NULL);
-    rb_id_table_foreach_values(tbl, cc_table_free_i, NULL);
-    rb_managed_id_table_free(data);
+    if (tbl) {
+        rb_id_table_foreach_values(tbl, vm_cc_table_invalidate_ccs_i, NULL);
+        rb_id_table_foreach_values(tbl, cc_table_free_i, NULL);
+        rb_managed_id_table_free(tbl);
+    }
+}
+
+static void
+vm_cc_table_free_managed_id_table(void* data)
+{
+    struct rb_id_table *tbl = (struct rb_id_table *)data;
+    if (tbl) {
+        rb_managed_id_table_free(tbl);
+    }
+}
+
+static RUBY_DATA_FUNC
+vm_cc_table_free_dynamic(VALUE obj)
+{
+    if (RB_OBJ_FROZEN(obj)) {
+        fprintf(stderr, "frozen, free id table: %p\n", obj);
+        return (RUBY_DATA_FUNC)vm_cc_table_free_managed_id_table;
+    } else {
+        fprintf(stderr, "not frozen, free all %p\n", obj);
+        return (RUBY_DATA_FUNC)vm_cc_table_free_all;
+    }
 }
 
 static size_t
@@ -142,12 +168,12 @@ static const rb_data_type_t cc_table_type = {
     .wrap_struct_name = "VM/cc_table",
     .function = {
         .dmark = vm_cc_table_mark,
-        .dfree = vm_cc_table_free,
+        .dfree = (RUBY_DATA_FUNC)vm_cc_table_free_dynamic,
         .dsize = vm_cc_table_memsize,
         .dcompact = vm_cc_table_compact,
     },
     .parent = &rb_managed_id_table_type,
-    .flags = RUBY_TYPED_FREE_IMMEDIATELY | RUBY_TYPED_WB_PROTECTED | RUBY_TYPED_EMBEDDABLE,
+    .flags = RUBY_TYPED_FREE_IMMEDIATELY | RUBY_TYPED_WB_PROTECTED | RUBY_TYPED_EMBEDDABLE | RUBY_TYPED_FREE_DYNAMIC,
 };
 
 static VALUE
@@ -155,6 +181,13 @@ vm_cc_table_create(size_t capa)
 {
     return rb_managed_id_table_create(&cc_table_type, capa);
 }
+
+VALUE
+rb_managed_cc_table_dup(VALUE old_table)
+{
+    return rb_managed_id_table_dup_type(old_table, &cc_table_type);
+}
+
 
 static enum rb_id_table_iterator_result
 vm_cc_table_invalidate_ccs_i(VALUE ccs_ptr, void *data)
@@ -333,7 +366,7 @@ const rb_method_entry_t * rb_method_entry_clone(const rb_method_entry_t *src_me)
 static const rb_callable_method_entry_t *complemented_callable_method_entry(VALUE klass, ID id);
 static const rb_callable_method_entry_t *lookup_overloaded_cme(const rb_callable_method_entry_t *cme);
 
-static void
+static VALUE
 invalidate_method_cache_in_cc_table(VALUE cc_tbl, ID mid)
 {
     VALUE ccs_data;
@@ -342,9 +375,14 @@ invalidate_method_cache_in_cc_table(VALUE cc_tbl, ID mid)
         rb_yjit_cme_invalidate((rb_callable_method_entry_t *)ccs->cme);
         if (NIL_P(ccs->cme->owner)) invalidate_negative_cache(mid);
         rb_vm_ccs_invalidate_and_free(ccs);
-        rb_managed_id_table_delete(cc_tbl, mid);
+        RB_OBJ_FREEZE(cc_tbl);
+        VALUE new_cc_tbl = rb_managed_cc_table_dup(cc_tbl);
+        fprintf(stderr, "old cc_tbl:%p new_cc_tbl:%p\n", cc_tbl, new_cc_tbl);
+        rb_managed_id_table_delete(new_cc_tbl, mid);
         RB_DEBUG_COUNTER_INC(cc_invalidate_leaf_ccs);
+        return new_cc_tbl;
     }
+    return 0;
 }
 
 static void
@@ -419,9 +457,11 @@ clear_method_cache_by_id_in_class(VALUE klass, ID mid)
 
             // invalidate CCs
             VALUE cc_tbl = RCLASS_WRITABLE_CC_TBL(klass);
-            invalidate_method_cache_in_cc_table(cc_tbl, mid);
+            VALUE new_cc_tbl = invalidate_method_cache_in_cc_table(cc_tbl, mid);
+            RCLASS_WRITE_CC_TBL(klass, new_cc_tbl);
             if (RCLASS_CC_TBL_NOT_PRIME_P(klass, cc_tbl)) {
-                invalidate_method_cache_in_cc_table(RCLASS_PRIME_CC_TBL(klass), mid);
+                VALUE new_cc_tbl = invalidate_method_cache_in_cc_table(RCLASS_PRIME_CC_TBL(klass), mid);
+                RCLASS_WRITE_PRIME_CC_TBL(klass, new_cc_tbl);
             }
 
             // remove from callable_m_tbl, if exists
@@ -1738,8 +1778,12 @@ cached_callable_method_entry(VALUE klass, ID mid)
             return ccs->cme;
         }
         else {
+            RB_OBJ_FREEZE(cc_tbl);
+            VALUE new_cc_tbl = rb_managed_cc_table_dup(cc_tbl);
+            fprintf(stderr, "old cc_tbl:%p new_cc_tbl:%p\n", cc_tbl, new_cc_tbl);
+            rb_managed_id_table_delete(new_cc_tbl, mid);
             rb_vm_ccs_invalidate_and_free(ccs);
-            rb_managed_id_table_delete(cc_tbl, mid);
+            RCLASS_WRITE_CC_TBL(klass, new_cc_tbl);
         }
     }
 
@@ -1768,7 +1812,7 @@ cache_callable_method_entry(VALUE klass, ID mid, const rb_callable_method_entry_
 #endif
     }
     else {
-        vm_ccs_create(klass, cc_tbl, mid, cme);
+        vm_ccs_create(klass, cc_tbl, mid, cme, NULL);
     }
 }
 
@@ -1815,6 +1859,7 @@ callable_method_entry_or_negative(VALUE klass, ID mid, VALUE *defined_class_ptr)
                 cme = negative_cme(mid);
             }
 
+            // TODO: move outside VM Lock
             cache_callable_method_entry(klass, mid, cme);
         }
     }

@@ -38,6 +38,7 @@ void rb_id_table_foreach_values_with_replace(struct rb_id_table *tbl, rb_id_tabl
 VALUE rb_managed_id_table_create(const rb_data_type_t *type, size_t capa);
 VALUE rb_managed_id_table_new(size_t capa);
 VALUE rb_managed_id_table_dup(VALUE table);
+VALUE rb_managed_id_table_dup_type(VALUE table, const rb_data_type_t *type);
 int rb_managed_id_table_insert(VALUE table, ID id, VALUE val);
 int rb_managed_id_table_lookup(VALUE table, ID id, VALUE *valp);
 size_t rb_managed_id_table_size(VALUE table);

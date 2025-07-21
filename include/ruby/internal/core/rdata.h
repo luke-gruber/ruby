@@ -102,6 +102,7 @@
  * `data` field.
  */
 typedef void (*RUBY_DATA_FUNC)(void*);
+typedef void* (*RUBY_DYNAMIC_DATA_FUNC)(void*);
 
 /**
  * @deprecated

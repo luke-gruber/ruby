@@ -16,6 +16,7 @@
 #include "internal/variable.h"  /* for rb_class_ivar_set */
 #include "ruby/internal/stdbool.h"     /* for bool */
 #include "ruby/intern.h"        /* for rb_alloc_func_t */
+#include "ruby/atomic.h"
 #include "ruby/ruby.h"          /* for struct RBasic */
 #include "shape.h"
 #include "ruby_assert.h"
@@ -266,6 +267,7 @@ static inline void RCLASS_SET_CONST_TBL(VALUE klass, struct rb_id_table *table, 
 static inline void RCLASS_WRITE_CONST_TBL(VALUE klass, struct rb_id_table *table, bool shared);
 static inline void RCLASS_WRITE_CALLABLE_M_TBL(VALUE klass, struct rb_id_table *table);
 static inline void RCLASS_WRITE_CC_TBL(VALUE klass, VALUE table);
+static inline void RCLASS_WRITE_PRIME_CC_TBL(VALUE klass, VALUE table);
 static inline void RCLASS_SET_CVC_TBL(VALUE klass, struct rb_id_table *table);
 static inline void RCLASS_WRITE_CVC_TBL(VALUE klass, struct rb_id_table *table);
 
@@ -643,7 +645,15 @@ RCLASS_WRITE_CALLABLE_M_TBL(VALUE klass, struct rb_id_table *table)
 static inline void
 RCLASS_WRITE_CC_TBL(VALUE klass, VALUE table)
 {
-    RB_OBJ_WRITE(klass, &RCLASSEXT_CC_TBL(RCLASS_EXT_WRITABLE(klass)), table);
+    RUBY_ATOMIC_VALUE_SET(RCLASSEXT_CC_TBL(RCLASS_EXT_WRITABLE(klass)), table);
+    RB_OBJ_WRITTEN(klass, Qundef, table);
+}
+
+static inline void
+RCLASS_WRITE_PRIME_CC_TBL(VALUE klass, VALUE table)
+{
+    RUBY_ATOMIC_VALUE_SET(RCLASSEXT_CC_TBL(RCLASS_EXT_PRIME(klass)), table);
+    RB_OBJ_WRITTEN(klass, Qundef, table);
 }
 
 static inline void

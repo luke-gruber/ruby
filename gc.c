@@ -1161,10 +1161,17 @@ rb_data_free(void *objspace, VALUE obj)
     if (data) {
         int free_immediately = false;
         void (*dfree)(void *);
+        void* (*dfree_dynamic)(void *);
 
         if (RTYPEDDATA_P(obj)) {
             free_immediately = (RTYPEDDATA_TYPE(obj)->flags & RUBY_TYPED_FREE_IMMEDIATELY) != 0;
-            dfree = RTYPEDDATA_TYPE(obj)->function.dfree;
+            if ((RTYPEDDATA_TYPE(obj)->flags & RUBY_TYPED_FREE_DYNAMIC) != 0) {
+                dfree_dynamic = (RUBY_DYNAMIC_DATA_FUNC)RTYPEDDATA_TYPE(obj)->function.dfree;
+                dfree = (RUBY_DATA_FUNC)dfree_dynamic((void*)obj);
+            }
+            else {
+                dfree = RTYPEDDATA_TYPE(obj)->function.dfree;
+            }
         }
         else {
             dfree = RDATA(obj)->dfree;
