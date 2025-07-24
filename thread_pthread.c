@@ -432,6 +432,18 @@ ASSERT_thread_sched_locked(struct rb_thread_sched *sched, rb_thread_t *th)
 #endif
 }
 
+void
+rb_thread_sched_lock(rb_thread_t *th)
+{
+    thread_sched_lock(TH_SCHED(th), th);
+}
+
+void
+rb_thread_sched_unlock(rb_thread_t *th)
+{
+    thread_sched_unlock(TH_SCHED(th), th);
+}
+
 #define ractor_sched_lock(a, b) ractor_sched_lock_(a, b, __FILE__, __LINE__)
 #define ractor_sched_unlock(a, b) ractor_sched_unlock_(a, b, __FILE__, __LINE__)
 

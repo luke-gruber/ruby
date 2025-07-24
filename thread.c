@@ -6241,6 +6241,7 @@ threadptr_interrupt_exec_exec(rb_thread_t *th)
     }
 }
 
+
 static void
 threadptr_interrupt_exec_cleanup(rb_thread_t *th)
 {
@@ -6255,6 +6256,11 @@ threadptr_interrupt_exec_cleanup(rb_thread_t *th)
     rb_native_mutex_unlock(&th->interrupt_lock);
 }
 
+void rb_ractor_lock(rb_ractor_t *r);
+void rb_ractor_unlock(rb_ractor_t *r);
+void rb_thread_sched_lock(struct rb_thread_struct *th);
+void rb_thread_sched_unlock(struct rb_thread_struct *th);
+
 // native thread safe
 // func/data should be native thread safe
 void
@@ -6264,6 +6270,8 @@ rb_ractor_interrupt_exec(struct rb_ractor_struct *target_r,
     RUBY_DEBUG_LOG("flags:%d", (int)flags);
 
     rb_thread_t *main_th = target_r->threads.main;
+    rb_thread_sched_lock(main_th);
     rb_threadptr_interrupt_exec(main_th, func, data, flags | rb_interrupt_exec_flag_new_thread);
+    rb_thread_sched_unlock(main_th);
 }
 

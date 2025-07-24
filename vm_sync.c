@@ -195,6 +195,17 @@ rb_vm_unlock_body(LOCATION_ARGS)
     vm_lock_leave(vm, false, &vm->ractor.sync.lock_rec APPEND_LOCATION_PARAMS);
 }
 
+void
+rb_vm_unlock_all(LOCATION_ARGS)
+{
+    if (rb_multi_ractor_p()) {
+        rb_vm_t *vm = GET_VM();
+        while (vm->ractor.sync.lock_rec > 0) {
+            vm_lock_leave(vm, false, &vm->ractor.sync.lock_rec APPEND_LOCATION_PARAMS);
+        }
+    }
+}
+
 static void
 vm_cond_wait(rb_vm_t *vm, rb_nativethread_cond_t *cond, unsigned long msec)
 {

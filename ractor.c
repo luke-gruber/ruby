@@ -130,6 +130,17 @@ rb_ractor_unlock_self(rb_ractor_t *r)
     RACTOR_UNLOCK_SELF(r);
 }
 
+void
+rb_ractor_lock(rb_ractor_t *r)
+{
+    RACTOR_LOCK(r);
+}
+void
+rb_ractor_unlock(rb_ractor_t *r)
+{
+    RACTOR_UNLOCK(r);
+}
+
 // Ractor status
 
 static const char *
@@ -2396,7 +2407,9 @@ rb_ractor_require(VALUE feature, bool silent)
 
     rb_execution_context_t *ec = GET_EC();
     rb_ractor_t *main_r = GET_VM()->ractor.main_ractor;
+    /*RACTOR_LOCK(main_r);*/
     rb_ractor_interrupt_exec(main_r, ractor_require_func, (void *)crr_obj, rb_interrupt_exec_flag_value_data);
+    /*RACTOR_UNLOCK(main_r);*/
 
     // wait for require done
     ractor_port_receive(ec, crr->port);
@@ -2451,7 +2464,11 @@ rb_ractor_autoload_load(VALUE module, ID name)
 
     rb_execution_context_t *ec = GET_EC();
     rb_ractor_t *main_r = GET_VM()->ractor.main_ractor;
-    rb_ractor_interrupt_exec(main_r, ractor_autoload_load_func, (void *)crr_obj, rb_interrupt_exec_flag_value_data);
+    /*RACTOR_LOCK(main_r);*/
+    /*{*/
+        rb_ractor_interrupt_exec(main_r, ractor_autoload_load_func, (void *)crr_obj, rb_interrupt_exec_flag_value_data);
+    /*}*/
+    /*RACTOR_UNLOCK(main_r);*/
 
     // wait for require done
     ractor_port_receive(ec, crr->port);

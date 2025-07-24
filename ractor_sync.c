@@ -986,6 +986,9 @@ ractor_wakeup_all(rb_ractor_t *r, enum ractor_wakeup_status wakeup_status)
     return wakeup_p;
 }
 
+void rb_thread_sched_lock(struct rb_thread_struct *th);
+void rb_thread_sched_unlock(struct rb_thread_struct *th);
+
 static void
 ubf_ractor_wait(void *ptr)
 {
@@ -998,6 +1001,7 @@ ubf_ractor_wait(void *ptr)
     th->unblock.func = NULL;
     th->unblock.arg  = NULL;
 
+    rb_thread_sched_unlock(th);
     rb_native_mutex_unlock(&th->interrupt_lock);
     {
         RACTOR_LOCK(r);
@@ -1014,6 +1018,7 @@ ubf_ractor_wait(void *ptr)
         RACTOR_UNLOCK(r);
     }
     rb_native_mutex_lock(&th->interrupt_lock);
+    rb_thread_sched_lock(th);
 }
 
 static enum ractor_wakeup_status
@@ -1151,7 +1156,6 @@ ractor_receive(rb_execution_context_t *ec, const struct ractor_port *rp)
 
     while (1) {
         VALUE v = ractor_try_receive(ec, cr, rp);
-
         if (v != Qundef) {
             return v;
         }

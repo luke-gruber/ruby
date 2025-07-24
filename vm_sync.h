@@ -27,6 +27,7 @@ NOINLINE(void rb_vm_lock_enter_body(unsigned int *lev APPEND_LOCATION_ARGS));
 void rb_vm_lock_leave_body_nb(unsigned int *lev APPEND_LOCATION_ARGS);
 void rb_vm_lock_leave_body(unsigned int *lev APPEND_LOCATION_ARGS);
 void rb_vm_barrier(void);
+void rb_vm_unlock_all(LOCATION_ARGS);
 
 #if RUBY_DEBUG
 // GET_VM()
@@ -119,7 +120,9 @@ rb_vm_lock_leave_cr(struct rb_ractor_struct *cr, unsigned int *levp, const char 
 #define RB_VM_LOCKED_P()   rb_vm_locked_p()
 
 #define RB_VM_LOCK()       rb_vm_lock(__FILE__, __LINE__)
+// NOTE: RB_VM_UNLOCK only works if you haven't locked recursively. Use RB_VM_UNLOCK_ALL to unlock recursively.
 #define RB_VM_UNLOCK()     rb_vm_unlock(__FILE__, __LINE__)
+#define RB_VM_UNLOCK_ALL() rb_vm_unlock_all(__FILE__, __LINE__)
 
 #define RB_VM_LOCK_ENTER_CR_LEV(cr, levp) rb_vm_lock_enter_cr(cr, levp, __FILE__, __LINE__)
 #define RB_VM_LOCK_LEAVE_CR_LEV(cr, levp) rb_vm_lock_leave_cr(cr, levp, __FILE__, __LINE__)

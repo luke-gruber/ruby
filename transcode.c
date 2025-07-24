@@ -427,7 +427,16 @@ load_transcoder_entry(transcoder_entry_t *entry)
         memcpy(path + sizeof(transcoder_lib_prefix) - 1, lib, len);
         rb_str_set_len(fn, total_len);
         OBJ_FREEZE(fn);
+        rb_vm_t *vm = GET_VM();
+        unsigned int lock_rec = vm->ractor.sync.lock_rec;
+        unsigned int i = 0;
+        RB_VM_UNLOCK_ALL();
+        unsigned int lev;
         rb_require_internal_silent(fn);
+        while (i < lock_rec) {
+            RB_VM_LOCK_ENTER_LEV(&lev);
+            i++;
+        }
     }
 
     if (entry->transcoder)
