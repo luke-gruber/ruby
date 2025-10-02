@@ -4492,6 +4492,7 @@ void
 rb_gc_impl_mark_weak(void *objspace_ptr, VALUE *ptr)
 {
     rb_objspace_t *objspace = objspace_ptr;
+    GC_ASSERT(during_gc);
 
     VALUE obj = *ptr;
 
@@ -4571,15 +4572,22 @@ gc_mark_set_parent(rb_objspace_t *objspace, VALUE obj)
     objspace->rgengc.parent_object_old_p = RVALUE_OLD_P(objspace, obj);
 }
 
+bool marking_children = false;
+
 static void
 gc_mark_children(rb_objspace_t *objspace, VALUE obj)
 {
-    VALUE saved_parent = objspace->rgengc.parent_object;
-    bool saved_parent_old = objspace->rgengc.parent_object_old_p;
+    if (marking_children) {
+        rb_bug("recursive marking children");
+    }
+    /*VALUE saved_parent = objspace->rgengc.parent_object;*/
+    /*bool saved_parent_old = objspace->rgengc.parent_object_old_p;*/
     gc_mark_set_parent(objspace, obj);
+    marking_children = true;
     rb_gc_mark_children(objspace, obj);
-    objspace->rgengc.parent_object = saved_parent;
-    objspace->rgengc.parent_object_old_p = saved_parent_old;
+    /*objspace->rgengc.parent_object = saved_parent;*/
+    /*objspace->rgengc.parent_object_old_p = saved_parent_old;*/
+    marking_children = false;
 }
 
 /**
@@ -5971,6 +5979,9 @@ gc_writebarrier_generational(VALUE a, VALUE b, rb_objspace_t *objspace)
 
     /* mark `a' and remember (default behavior) */
     if (!RVALUE_REMEMBERED(objspace, a)) {
+        if (during_gc) {
+            fprintf(stderr, "remember obj during gc: %s\n", rb_obj_info(a));
+        }
         int lev = RB_GC_VM_LOCK_NO_BARRIER();
         {
             rgengc_remember(objspace, a);
@@ -5987,11 +5998,18 @@ gc_writebarrier_generational(VALUE a, VALUE b, rb_objspace_t *objspace)
 static void
 gc_mark_from(rb_objspace_t *objspace, VALUE obj, VALUE parent)
 {
+    GC_ASSERT(!during_gc);
     gc_mark_set_parent(objspace, parent);
     rgengc_check_relation(objspace, obj);
-    if (gc_mark_set(objspace, obj) == FALSE) return;
+    if (gc_mark_set(objspace, obj) == FALSE) {
+        /*objspace->rgengc.parent_object = Qundef;*/
+        /*objspace->rgengc.parent_object_old_p = false;*/
+        return;
+    }
     gc_aging(objspace, obj);
     gc_grey(objspace, obj);
+    /*objspace->rgengc.parent_object = Qundef;*/
+    /*objspace->rgengc.parent_object_old_p = false;*/
 }
 
 NOINLINE(static void gc_writebarrier_incremental(VALUE a, VALUE b, rb_objspace_t *objspace));
@@ -6004,15 +6022,25 @@ gc_writebarrier_incremental(VALUE a, VALUE b, rb_objspace_t *objspace)
     if (RVALUE_BLACK_P(objspace, a)) {
         if (RVALUE_WHITE_P(objspace, b)) {
             if (!RVALUE_WB_UNPROTECTED(objspace, a)) {
+                if (during_gc) {
+                    fprintf(stderr, "WB inc obj during gc 1: %s\n", rb_obj_info(a));
+                }
                 gc_report(2, objspace, "gc_writebarrier_incremental: [IN] %p -> %s\n", (void *)a, rb_obj_info(b));
                 gc_mark_from(objspace, b, a);
             }
         }
         else if (RVALUE_OLD_P(objspace, a) && !RVALUE_OLD_P(objspace, b)) {
+
+            if (during_gc) {
+                fprintf(stderr, "WB inc obj during gc 2: %s\n", rb_obj_info(a));
+            }
             rgengc_remember(objspace, a);
         }
 
         if (RB_UNLIKELY(objspace->flags.during_compacting)) {
+                if (during_gc) {
+                    fprintf(stderr, "WB inc obj during gc 3: %s\n", rb_obj_info(a));
+                }
             MARK_IN_BITMAP(GET_HEAP_PINNED_BITS(b), b);
         }
     }
