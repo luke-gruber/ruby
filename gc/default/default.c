@@ -4574,8 +4574,12 @@ gc_mark_set_parent(rb_objspace_t *objspace, VALUE obj)
 static void
 gc_mark_children(rb_objspace_t *objspace, VALUE obj)
 {
+    VALUE saved_parent = objspace->rgengc.parent_object;
+    bool saved_parent_old = objspace->rgengc.parent_object_old_p;
     gc_mark_set_parent(objspace, obj);
     rb_gc_mark_children(objspace, obj);
+    objspace->rgengc.parent_object = saved_parent;
+    objspace->rgengc.parent_object_old_p = saved_parent_old;
 }
 
 /**
