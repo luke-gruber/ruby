@@ -1854,7 +1854,9 @@ rb_econv_asciicompat_encoding(const char *ascii_incompat_name)
                     RB_VM_LOCK_ENTER_LEV(&lev);
                 }
                 else {
+                    RB_VM_LOCK_LEAVE_LEV(&lev);
                     st_foreach(table2, asciicompat_encoding_i, (st_data_t)&data);
+                    RB_VM_LOCK_ENTER_LEV(&lev);
                 }
             }
 
