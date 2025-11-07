@@ -523,7 +523,7 @@ fstring_concurrent_set_create(VALUE str, void *data)
         OBJ_FREEZE(str);
     }
     else {
-        if (!OBJ_FROZEN(str) || CHILLED_STRING_P(str)) {
+        if (!OBJ_FROZEN_RAW(str) || CHILLED_STRING_P(str)) {
             str = str_new_frozen(rb_cString, str);
         }
         if (STR_SHARED_P(str)) { /* str should not be shared */
@@ -1514,7 +1514,7 @@ rb_str_new_frozen(VALUE orig)
 static VALUE
 rb_str_new_frozen_String(VALUE orig)
 {
-    if (OBJ_FROZEN(orig) && rb_obj_class(orig) == rb_cString) return orig;
+    if (OBJ_FROZEN_RAW(orig) && rb_obj_class(orig) == rb_cString) return orig;
     return str_new_frozen(rb_cString, orig);
 }
 
@@ -3271,7 +3271,7 @@ rb_str_freeze(VALUE str)
         FL_UNSET_RAW(str, STR_CHILLED);
     }
 
-    if (OBJ_FROZEN(str)) return str;
+    if (OBJ_FROZEN_RAW(str)) return str;
     rb_str_resize(str, RSTRING_LEN(str));
     return rb_obj_freeze(str);
 }
@@ -3290,7 +3290,7 @@ rb_str_freeze(VALUE str)
 static VALUE
 str_uplus(VALUE str)
 {
-    if (OBJ_FROZEN(str) || CHILLED_STRING_P(str)) {
+    if (OBJ_FROZEN_RAW(str) || CHILLED_STRING_P(str)) {
         return rb_str_dup(str);
     }
     else {

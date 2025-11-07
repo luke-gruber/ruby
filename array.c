@@ -160,7 +160,7 @@ should_be_T_ARRAY(VALUE ary)
     ARY_SET_CAPA_FORCE(ary, n); \
 } while (0)
 
-#define ARY_SHARED_ROOT_OCCUPIED(ary) (!OBJ_FROZEN(ary) && ARY_SHARED_ROOT_REFCNT(ary) == 1)
+#define ARY_SHARED_ROOT_OCCUPIED(ary) (!OBJ_FROZEN_RAW(ary) && ARY_SHARED_ROOT_REFCNT(ary) == 1)
 #define ARY_SET_SHARED_ROOT_REFCNT(ary, value) do { \
     RUBY_ASSERT(ARY_SHARED_ROOT_P(ary)); \
     RUBY_ASSERT(!OBJ_FROZEN(ary)); \
@@ -214,7 +214,7 @@ rb_ary_embeddable_p(VALUE ary)
      *  - Shared: we don't want to re-embed an array that points to a shared
      *    root (to save memory).
      */
-    return !(ARY_SHARED_ROOT_P(ary) || OBJ_FROZEN(ary) || ARY_SHARED_P(ary));
+    return !(ARY_SHARED_ROOT_P(ary) || OBJ_FROZEN_RAW(ary) || ARY_SHARED_P(ary));
 }
 
 size_t
@@ -471,7 +471,7 @@ ary_double_capa(VALUE ary, long min)
 static void
 rb_ary_decrement_share(VALUE shared_root)
 {
-    if (!OBJ_FROZEN(shared_root)) {
+    if (!OBJ_FROZEN_RAW(shared_root)) {
         long num = ARY_SHARED_ROOT_REFCNT(shared_root);
         ARY_SET_SHARED_ROOT_REFCNT(shared_root, num - 1);
     }
@@ -502,7 +502,7 @@ rb_ary_reset(VALUE ary)
 static VALUE
 rb_ary_increment_share(VALUE shared_root)
 {
-    if (!OBJ_FROZEN(shared_root)) {
+    if (!OBJ_FROZEN_RAW(shared_root)) {
         long num = ARY_SHARED_ROOT_REFCNT(shared_root);
         RUBY_ASSERT(num >= 0);
         ARY_SET_SHARED_ROOT_REFCNT(shared_root, num + 1);
@@ -651,7 +651,7 @@ rb_ary_freeze(VALUE ary)
 {
     RUBY_ASSERT(RB_TYPE_P(ary, T_ARRAY));
 
-    if (OBJ_FROZEN(ary)) return ary;
+    if (OBJ_FROZEN_RAW(ary)) return ary;
 
     if (!ARY_EMBED_P(ary) && !ARY_SHARED_P(ary) && !ARY_SHARED_ROOT_P(ary)) {
         ary_shrink_capa(ary);
@@ -957,7 +957,7 @@ ary_make_shared(VALUE ary)
     else if (ARY_SHARED_ROOT_P(ary)) {
         return ary;
     }
-    else if (OBJ_FROZEN(ary)) {
+    else if (OBJ_FROZEN_RAW(ary)) {
         return ary;
     }
     else {

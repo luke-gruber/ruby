@@ -1443,7 +1443,7 @@ rb_hash_foreach(VALUE hash, rb_foreach_func *func, VALUE farg)
     arg.hash = hash;
     arg.func = (rb_foreach_func *)func;
     arg.arg  = farg;
-    if (RB_OBJ_FROZEN(hash)) {
+    if (RB_OBJ_FROZEN_RAW(hash)) {
         hash_foreach_call((VALUE)&arg);
     }
     else {
@@ -4439,7 +4439,7 @@ rb_hash_assoc(VALUE hash, VALUE key)
             .key = (st_data_t)key,
         };
 
-        if (RB_OBJ_FROZEN(hash)) {
+        if (RB_OBJ_FROZEN_RAW(hash)) {
             value = assoc_lookup(arg);
         }
         else {
