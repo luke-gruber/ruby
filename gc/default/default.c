@@ -435,7 +435,7 @@ typedef struct rb_heap_struct {
     size_t total_freed_objects;
     size_t final_slots_count;
 
-    /* Sweeping statistics */
+    /* Sweeping statistics per sweep cycle */
     size_t freed_slots;
     size_t empty_slots;
 
@@ -447,6 +447,14 @@ typedef struct rb_heap_struct {
     struct heap_page *pooled_pages;
     size_t total_pages;      /* total page count in a heap */
     size_t total_slots;      /* total slot count (about total_pages * HEAP_PAGE_OBJ_LIMIT) */
+
+    size_t total_unlinked_pages;
+    size_t total_resurrected_pages;
+
+    // Control page movement between heaps
+    size_t allocated_objects_since_last_cycle;
+    double page_need_ratio; // ratio of pages this heap should keep during this sweep cycle. If `>= 1`, don't unlink any.
+    size_t pages_can_unlink_this_cycle;
 
 } rb_heap_t;
 
@@ -1532,6 +1540,7 @@ rb_gc_impl_get_measure_total_time(void *objspace_ptr)
     return objspace->flags.measure_gc;
 }
 
+// NOTE: this is per-ractor
 static size_t
 minimum_slots_for_heap(rb_objspace_t *objspace, rb_heap_t *heap)
 {
@@ -1663,6 +1672,8 @@ heap_add_poolpage(rb_objspace_t *objspace, rb_heap_t *heap, struct heap_page *pa
     GC_ASSERT(page->free_slots != 0);
     GC_ASSERT(page->freelist != NULL);
 
+    /*fprintf(stderr, "heap %d adding pooled page %p\n", (int)(heap - heaps), page);*/
+
     page->free_next = heap->pooled_pages;
     heap->pooled_pages = page;
     objspace->rincgc.pooled_slots += page->free_slots;
@@ -1670,12 +1681,30 @@ heap_add_poolpage(rb_objspace_t *objspace, rb_heap_t *heap, struct heap_page *pa
     asan_lock_freelist(page);
 }
 
+static inline void
+heap_pop_poolpage(rb_objspace_t *objspace, rb_heap_t *heap)
+{
+    GC_ASSERT(heap->pooled_pages);
+    GC_ASSERT(!heap->free_pages);
+    struct heap_page *page =  heap->pooled_pages;
+    /*fprintf(stderr, "popping pooled page %p from heap %d\n", page, (int)(heap - heaps));*/
+    struct heap_page *next = page->free_next;
+    page->free_next = NULL;
+    heap->pooled_pages = next;
+    heap->free_pages = page;
+    /*objspace->rincgc.pooled_slots -= page->free_slots;*/
+}
+
+
 static void
 heap_unlink_page(rb_objspace_t *objspace, rb_heap_t *heap, struct heap_page *page)
 {
     ccan_list_del(&page->page_node);
     heap->total_pages--;
     heap->total_slots -= page->total_slots;
+    heap->total_unlinked_pages++;
+    GC_ASSERT(heap->pages_can_unlink_this_cycle > 0);
+    heap->pages_can_unlink_this_cycle--;
 }
 
 static void
@@ -1857,7 +1886,7 @@ heap_page_body_allocate(void)
 }
 
 static struct heap_page *
-heap_page_resurrect(rb_objspace_t *objspace)
+heap_page_resurrect(rb_objspace_t *objspace, rb_heap_t *heap)
 {
     struct heap_page *page = NULL;
     if (objspace->empty_pages == NULL) {
@@ -1868,6 +1897,7 @@ heap_page_resurrect(rb_objspace_t *objspace)
         objspace->empty_pages_count--;
         page = objspace->empty_pages;
         objspace->empty_pages = page->free_next;
+        heap->total_resurrected_pages++;
     }
 
     return page;
@@ -1978,7 +2008,14 @@ heap_page_allocate_and_initialize(rb_objspace_t *objspace, rb_heap_t *heap)
                   rb_darray_size(objspace->heap_pages.sorted), objspace->heap_pages.allocatable_slots, heap->total_pages);
 
     bool allocated = false;
-    struct heap_page *page = heap_page_resurrect(objspace);
+    struct heap_page *page = NULL;
+    GC_ASSERT(heap->pooled_pages == NULL);
+
+    page = heap_page_resurrect(objspace, heap);
+
+    if (page == NULL) {
+        GC_ASSERT(heap->pooled_pages == NULL);
+    }
 
     if (page == NULL && objspace->heap_pages.allocatable_slots > 0) {
         page = heap_page_allocate(objspace);
@@ -2055,6 +2092,10 @@ heap_prepare(rb_objspace_t *objspace, rb_heap_t *heap)
 
     if (heap->free_pages == NULL) {
         heap_page_allocate_and_initialize(objspace, heap);
+    }
+
+    if (heap->free_pages == NULL && heap->pooled_pages) {
+        heap_pop_poolpage(objspace, heap);
     }
 
     /* If we still don't have a free page and not allowed to create a new page,
@@ -2255,6 +2296,7 @@ ractor_cache_allocate_slot(rb_objspace_t *objspace, rb_ractor_newobj_cache_t *ca
 
         heap_cache->allocated_objects_count++;
         rb_heap_t *heap = &heaps[heap_idx];
+        heap->allocated_objects_since_last_cycle++; // fine if it races with other ractors, we want approximation
         if (heap_cache->allocated_objects_count >= ALLOCATED_COUNT_STEP) {
             RUBY_ATOMIC_SIZE_ADD(heap->total_allocated_objects, heap_cache->allocated_objects_count);
             heap_cache->allocated_objects_count = 0;
@@ -3770,7 +3812,7 @@ gc_sweep_finish_heap(rb_objspace_t *objspace, rb_heap_t *heap)
         * GC thrashing (running GC more frequently than required). */
         struct heap_page *resurrected_page;
         while (swept_slots < min_free_slots &&
-                (resurrected_page = heap_page_resurrect(objspace))) {
+                (resurrected_page = heap_page_resurrect(objspace, heap))) {
             heap_add_page(objspace, heap, resurrected_page);
             heap_add_freepage(heap, resurrected_page);
 
@@ -3836,11 +3878,7 @@ gc_sweep_step(rb_objspace_t *objspace, rb_heap_t *heap)
     struct heap_page *sweep_page = heap->sweeping_page;
     int swept_slots = 0;
     int pooled_slots = 0;
-    // Limit migration of pages from heap to global empty pages. If we unlink too
-    // many pages and resurrect them back, this causes too much freelist building.
-    size_t unlink_limit = CEILDIV(heap->total_pages, 4);
     size_t init_slots = minimum_slots_for_heap(objspace, heap);
-    size_t min_free_slots = init_slots * gc_params.heap_free_slots_min_ratio;
 
     if (sweep_page == NULL) return FALSE;
 
@@ -3862,8 +3900,7 @@ gc_sweep_step(rb_objspace_t *objspace, rb_heap_t *heap)
 
         heap->sweeping_page = ccan_list_next(&heap->pages, sweep_page, page_node);
 
-        if (free_slots == sweep_page->total_slots && unlink_limit > 0 && (heap->total_slots - sweep_page->total_slots > min_free_slots)) {
-            unlink_limit--;
+        if (free_slots == sweep_page->total_slots && heap->pages_can_unlink_this_cycle > 0 && (heap->total_slots - sweep_page->total_slots >= init_slots)) {
             /* There are no living objects, so move this page to the global empty pages. */
             heap_unlink_page(objspace, heap, sweep_page);
 
@@ -3941,26 +3978,29 @@ gc_sweep_continue(rb_objspace_t *objspace, rb_heap_t *sweep_heap)
 
     for (int i = 0; i < HEAP_COUNT; i++) {
         rb_heap_t *heap = &heaps[i];
-        if (gc_sweep_step(objspace, heap)) {
+        if (gc_sweep_step(objspace, heap)) { // got a page
             GC_ASSERT(heap->free_pages != NULL);
         }
-        else if (heap == sweep_heap) {
-            if (objspace->empty_pages_count > 0 || objspace->heap_pages.allocatable_slots > 0) {
+        else if (heap == sweep_heap) { // need to get a page
+            if (objspace->empty_pages_count > 0 || objspace->heap_pages.allocatable_slots > 0 || heap->pooled_pages) {
                 /* [Bug #21548]
-                 *
-                 * If this heap is the heap we want to sweep, but we weren't able
-                 * to free any slots, but we also either have empty pages or could
-                 * allocate new pages, then we want to preemptively claim a page
-                 * because it's possible that sweeping another heap will call
-                 * gc_sweep_finish_heap, which may use up all of the
-                 * empty/allocatable pages. If other heaps are not finished sweeping
-                 * then we do not finish this GC and we will end up triggering a new
-                 * GC cycle during this GC phase. */
-                heap_page_allocate_and_initialize(objspace, heap);
+                *
+                * If this heap is the heap we want to sweep, but we weren't able
+                * to free any slots, but we also either have empty pages or could
+                * allocate new pages, then we want to preemptively claim a page
+                * because it's possible that sweeping another heap will call
+                * gc_sweep_finish_heap, which may use up all of the
+                * empty/allocatable pages. If other heaps are not finished sweeping
+                * then we do not finish this GC and we will end up triggering a new
+                * GC cycle during this GC phase. */
+                if (heap->pooled_pages) {
+                    heap_pop_poolpage(objspace, heap);
+                } else {
+                    heap_page_allocate_and_initialize(objspace, heap);
+                }
 
                 GC_ASSERT(heap->free_pages != NULL);
-            }
-            else {
+            } else {
                 /* Not allowed to create a new page so finish sweeping. */
                 gc_sweep_rest(objspace);
                 GC_ASSERT(gc_mode(objspace) == gc_mode_none);
@@ -5254,7 +5294,7 @@ gc_verify_internal_consistency(void *objspace_ptr)
 }
 
 static void
-heap_move_pooled_pages_to_free_pages(rb_heap_t *heap)
+heap_move_pooled_pages_to_free_pages(rb_objspace_t *objspace, rb_heap_t *heap)
 {
     if (heap->pooled_pages) {
         if (heap->free_pages) {
@@ -5263,9 +5303,11 @@ heap_move_pooled_pages_to_free_pages(rb_heap_t *heap)
                 free_pages_tail = free_pages_tail->free_next;
             }
             free_pages_tail->free_next = heap->pooled_pages;
+            /*fprintf(stderr, "heap %d moving pooled pages list %p to end of free_pages\n", (int)(heap - heaps), heap->pooled_pages);*/
         }
         else {
             heap->free_pages = heap->pooled_pages;
+            /*fprintf(stderr, "heap %d moving pooled pages list %p to free_pages\n", (int)(heap - heaps), heap->pooled_pages);*/
         }
 
         heap->pooled_pages = NULL;
@@ -5406,10 +5448,11 @@ gc_marks_finish(rb_objspace_t *objspace)
 
     {
         const unsigned long r_mul = objspace->live_ractor_cache_count > 8 ? 8 : objspace->live_ractor_cache_count; // upto 8
+        bool gc_method_called = objspace->profile.latest_gc_info & GPR_FLAG_METHOD;
 
         size_t empty_slots = objspace->empty_pages_count * HEAP_PAGE_OBJ_LIMIT;
         size_t total_slots = objspace_available_slots(objspace) + empty_slots;
-        size_t sweep_slots = total_slots - objspace->marked_slots; /* will be swept slots */
+        size_t free_slots = total_slots - objspace->marked_slots;
         size_t max_free_slots = (size_t)(total_slots * gc_params.heap_free_slots_max_ratio);
         size_t min_free_slots = (size_t)(total_slots * gc_params.heap_free_slots_min_ratio);
         if (min_free_slots < gc_params.heap_free_slots * r_mul) {
@@ -5422,22 +5465,78 @@ gc_marks_finish(rb_objspace_t *objspace)
 
         /* Setup freeable slots. */
         size_t total_init_slots = 0;
+        size_t total_allocated_since_last_cycle = 0;
+        size_t total_pages = 0;
         for (int i = 0; i < HEAP_COUNT; i++) {
+            rb_heap_t *heap = &heaps[i];
             total_init_slots += gc_params.heap_init_slots[i] * r_mul;
+            total_allocated_since_last_cycle += heap->allocated_objects_since_last_cycle;
+            total_pages += heap->total_pages;
+            GC_ASSERT(heap->pooled_pages == NULL);
         }
+        size_t total_pages_including_empty = total_pages + objspace->empty_pages_count;
 
         if (max_free_slots < total_init_slots) {
             max_free_slots = total_init_slots;
         }
 
-        if (sweep_slots > max_free_slots) {
-            heap_pages_freeable_pages = (sweep_slots - max_free_slots) / HEAP_PAGE_OBJ_LIMIT;
+        if (free_slots > max_free_slots) {
+            heap_pages_freeable_pages = (free_slots - max_free_slots) / HEAP_PAGE_OBJ_LIMIT;
+            double max_free_ratio;
+            if (gc_method_called) {
+                // free maximum 20% of heap per major GC cycle, 10% per minor GC cycle
+                max_free_ratio = full_marking ? 5.0 : 10.0;
+            } else {
+                // free maximum 10% of total heap per major GC cycle, 5% per minor GC cycle
+                max_free_ratio = full_marking ? 10.0 : 20.0;
+            }
+            if (heap_pages_freeable_pages > (size_t)(total_pages_including_empty / max_free_ratio)) {
+                heap_pages_freeable_pages = (size_t)(total_pages_including_empty / max_free_ratio);
+            }
         }
         else {
             heap_pages_freeable_pages = 0;
         }
+        GC_ASSERT(heap_pages_freeable_pages < total_pages_including_empty);
 
-        if (objspace->heap_pages.allocatable_slots == 0 && sweep_slots < min_free_slots) {
+        size_t total_alloced = MAX(total_allocated_since_last_cycle, 1);
+        // calculate page_need_ratio for this sweep cycle: % of pages we need to keep vs pages we can unlink
+        for (int i = 0; i < HEAP_COUNT; i++) {
+            rb_heap_t *heap = &heaps[i];
+            // Calculate the heap's share of recent allocations
+            /*fprintf(stderr, "allocated since last cycle:%lu, total_alloced:%lu\n", heap->allocated_objects_since_last_cycle, total_alloced);*/
+            double heap_alloc_share = heap->allocated_objects_since_last_cycle / (total_alloced * 1.0);
+            // Calculate the heap's current share of total pages (excluding empty pages)
+            double heap_page_share = heap->total_pages / (MAX((total_pages - heap_pages_freeable_pages),1) * 1.0);
+            // The page need ratio indicates if the heap needs more pages (>1) or can give up pages (<1)
+            heap->page_need_ratio = heap_alloc_share / heap_page_share;
+            if (heap->page_need_ratio < 1.0) {
+                heap->pages_can_unlink_this_cycle = (size_t)((1.0 - heap->page_need_ratio) * heap->total_pages);
+                // max unlink percentage is 33% of total pages per major or minor cycle
+                if (heap->pages_can_unlink_this_cycle > CEILDIV(heap->total_pages, 3)) {
+                    heap->pages_can_unlink_this_cycle = (size_t)CEILDIV(heap->total_pages, 3);
+                }
+            } else {
+                heap->pages_can_unlink_this_cycle = 0;
+            }
+            if (0) {
+                fprintf(stderr, "heap %d: heap->total_pages:%lu, total_pages:%lu, unlinkable_pages:%lu, allocated_since_last_cycle:%lu, total since last cycle:%lu, freeable_pages:%lu, alloc_share:%lf, page_share:%lf, need_ratio:%lf\n",
+                        (int)(heap - heaps),
+                        heap->total_pages,
+                        total_pages,
+                        heap->pages_can_unlink_this_cycle,
+                        heap->allocated_objects_since_last_cycle,
+                        total_allocated_since_last_cycle,
+                        heap_pages_freeable_pages,
+                        heap_alloc_share,
+                        heap_page_share,
+                        heap->page_need_ratio);
+            }
+            heap->allocated_objects_since_last_cycle = 0;
+        }
+
+        if (objspace->heap_pages.allocatable_slots == 0 && free_slots < min_free_slots) {
+            GC_ASSERT(heap_pages_freeable_pages == 0);
             if (!full_marking) {
                 if (objspace->profile.count - objspace->rgengc.last_major_gc < RVALUE_OLD_AGE) {
                     full_marking = TRUE;
@@ -5449,7 +5548,7 @@ gc_marks_finish(rb_objspace_t *objspace)
             }
 
             if (full_marking) {
-                heap_allocatable_slots_expand(objspace, NULL, sweep_slots, total_slots);
+                heap_allocatable_slots_expand(objspace, NULL, free_slots, total_slots);
             }
         }
 
@@ -5473,7 +5572,7 @@ gc_marks_finish(rb_objspace_t *objspace)
         gc_report(1, objspace, "gc_marks_finish (marks %"PRIdSIZE" objects, "
                   "old %"PRIdSIZE" objects, total %"PRIdSIZE" slots, "
                   "sweep %"PRIdSIZE" slots, allocatable %"PRIdSIZE" slots, next GC: %s)\n",
-                  objspace->marked_slots, objspace->rgengc.old_objects, objspace_available_slots(objspace), sweep_slots, objspace->heap_pages.allocatable_slots,
+                  objspace->marked_slots, objspace->rgengc.old_objects, objspace_available_slots(objspace), free_slots, objspace->heap_pages.allocatable_slots,
                   gc_needs_major_flags ? "major" : "minor");
     }
 
@@ -5769,7 +5868,7 @@ gc_marks_start(rb_objspace_t *objspace, int full_mark)
         for (int i = 0; i < HEAP_COUNT; i++) {
             rb_heap_t *heap = &heaps[i];
             rgengc_mark_and_rememberset_clear(objspace, heap);
-            heap_move_pooled_pages_to_free_pages(heap);
+            heap_move_pooled_pages_to_free_pages(objspace, heap);
 
             if (objspace->flags.during_compacting) {
                 struct heap_page *page = NULL;
@@ -7618,6 +7717,9 @@ enum gc_stat_heap_sym {
     gc_stat_heap_sym_force_incremental_marking_finish_count,
     gc_stat_heap_sym_total_allocated_objects,
     gc_stat_heap_sym_total_freed_objects,
+
+    gc_stat_heap_sym_total_unlinked_pages,
+    gc_stat_heap_sym_total_resurrected_pages,
     gc_stat_heap_sym_last
 };
 
@@ -7639,6 +7741,8 @@ setup_gc_stat_heap_symbols(void)
         S(force_incremental_marking_finish_count);
         S(total_allocated_objects);
         S(total_freed_objects);
+        S(total_unlinked_pages);
+        S(total_resurrected_pages);
 #undef S
     }
 }
@@ -7663,6 +7767,8 @@ stat_one_heap(rb_heap_t *heap, VALUE hash, VALUE key)
     SET(force_incremental_marking_finish_count, heap->force_incremental_marking_finish_count);
     SET(total_allocated_objects, heap->total_allocated_objects);
     SET(total_freed_objects, heap->total_freed_objects);
+    SET(total_unlinked_pages, heap->total_unlinked_pages);
+    SET(total_resurrected_pages, heap->total_resurrected_pages);
 #undef SET
 
     if (!NIL_P(key)) {
