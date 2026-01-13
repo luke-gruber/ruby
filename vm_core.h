@@ -673,6 +673,20 @@ struct global_object_list {
     struct global_object_list *next;
 };
 
+//enum {
+    //rsched_status_idle,
+    //rsched_status_acquired
+//} rsched_status_t;
+
+// A native thread acquires an R_Sched to run ruby code in a ractor.
+typedef struct rb_rsched_struct {
+    int index; // index into vm->ractor.rscheds array
+    rb_nativethread_lock_t lock; // lock to access runq, either from NT associated with it or another NT
+    struct rb_native_thread *nt_owner;
+
+    struct ccan_list_head runq; // runq
+} rb_rsched_t;
+
 typedef struct rb_vm_struct {
     VALUE self;
 
@@ -683,6 +697,13 @@ typedef struct rb_vm_struct {
 
         struct rb_ractor_struct *main_ractor;
         struct rb_thread_struct *main_thread; // == vm->ractor.main_ractor->threads.main
+
+        int rsched_cnt;
+        rb_rsched_t rscheds[8];
+
+        int nt_parked_cnt;
+        rb_nativethread_lock_t park_lock;
+        rb_nativethread_cond_t park_cond;
 
         struct {
             // monitor

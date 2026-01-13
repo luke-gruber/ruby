@@ -1292,7 +1292,7 @@ jit_cont_new(rb_execution_context_t *ec)
         rb_memerror();
     cont->ec = ec;
 
-    rb_native_mutex_lock(&jit_cont_lock);
+    rb_native_mutex_lock_track(&jit_cont_lock, LOCK_JIT_CONT);
     if (first_jit_cont == NULL) {
         cont->next = cont->prev = NULL;
     }
@@ -1313,7 +1313,7 @@ jit_cont_free(struct rb_jit_cont *cont)
 {
     if (!cont) return;
 
-    rb_native_mutex_lock(&jit_cont_lock);
+    rb_native_mutex_lock_track(&jit_cont_lock, LOCK_JIT_CONT);
     if (cont == first_jit_cont) {
         first_jit_cont = cont->next;
         if (first_jit_cont != NULL)

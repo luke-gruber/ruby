@@ -70,7 +70,7 @@ ractor_lock(rb_ractor_t *r, const char *file, int line)
     RUBY_DEBUG_LOG2(file, line, "locking r:%u%s", r->pub.id, rb_current_ractor_raw(false) == r ? " (self)" : "");
 
     ASSERT_ractor_unlocking(r);
-    rb_native_mutex_lock(&r->sync.lock);
+    rb_native_mutex_lock_track(&r->sync.lock, LOCK_RACTOR);
 
     const rb_execution_context_t *ec = rb_current_ec_noinline();
     if (ec) {

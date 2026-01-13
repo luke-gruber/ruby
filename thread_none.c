@@ -49,7 +49,19 @@ rb_thread_sched_destroy(struct rb_thread_sched *sched)
 }
 #endif
 
+#ifdef VM_MUTEX_COUNTERS
+/* Stub implementations for no-thread builds */
+void rb_mutex_counter_incr_lock(int lock_type) {}
+void rb_mutex_counter_incr_lock_contention(int lock_type) {}
+void rb_mutex_counter_display_results(void) {}
+#endif
+
 // Do nothing for mutex guard
+void
+rb_native_mutex_lock_track(rb_nativethread_lock_t *lock, int lock_type)
+{
+}
+
 void
 rb_native_mutex_lock(rb_nativethread_lock_t *lock)
 {

@@ -305,6 +305,12 @@ rb_nativethread_lock_destroy(rb_nativethread_lock_t *lock)
 }
 
 void
+rb_nativethread_lock_lock_track(rb_nativethread_lock_t *lock, int lock_type)
+{
+    rb_native_mutex_lock_track(lock, lock_type);
+}
+
+void
 rb_nativethread_lock_lock(rb_nativethread_lock_t *lock)
 {
     rb_native_mutex_lock(lock);
@@ -329,7 +335,7 @@ unblock_function_set(rb_thread_t *th, rb_unblock_function_t *func, void *arg, in
             RUBY_VM_CHECK_INTS(th->ec);
         }
 
-        rb_native_mutex_lock(&th->interrupt_lock);
+        rb_native_mutex_lock_track(&th->interrupt_lock, LOCK_TH_INTERRUPT);
     } while (!th->ec->raised_flag && RUBY_VM_INTERRUPTED_ANY(th->ec) &&
              (rb_native_mutex_unlock(&th->interrupt_lock), TRUE));
 
@@ -345,7 +351,7 @@ unblock_function_set(rb_thread_t *th, rb_unblock_function_t *func, void *arg, in
 static void
 unblock_function_clear(rb_thread_t *th)
 {
-    rb_native_mutex_lock(&th->interrupt_lock);
+    rb_native_mutex_lock_track(&th->interrupt_lock, LOCK_TH_INTERRUPT);
     th->unblock.func = 0;
     rb_native_mutex_unlock(&th->interrupt_lock);
 }
@@ -375,7 +381,7 @@ threadptr_set_interrupt_locked(rb_thread_t *th, bool trap)
 static void
 threadptr_set_interrupt(rb_thread_t *th, int trap)
 {
-    rb_native_mutex_lock(&th->interrupt_lock);
+    rb_native_mutex_lock_track(&th->interrupt_lock, LOCK_TH_INTERRUPT);
     {
         threadptr_set_interrupt_locked(th, trap);
     }
@@ -6236,7 +6242,7 @@ rb_threadptr_interrupt_exec(rb_thread_t *th, rb_interrupt_exec_func_t *func, voi
         .data = data,
     };
 
-    rb_native_mutex_lock(&th->interrupt_lock);
+    rb_native_mutex_lock_track(&th->interrupt_lock, LOCK_TH_INTERRUPT);
     {
         ccan_list_add_tail(&th->interrupt_exec_tasks, &task->node);
         threadptr_set_interrupt_locked(th, true);
@@ -6250,7 +6256,7 @@ threadptr_interrupt_exec_exec(rb_thread_t *th)
     while (1) {
         struct rb_interrupt_exec_task *task;
 
-        rb_native_mutex_lock(&th->interrupt_lock);
+        rb_native_mutex_lock_track(&th->interrupt_lock, LOCK_TH_INTERRUPT);
         {
             task = ccan_list_pop(&th->interrupt_exec_tasks, struct rb_interrupt_exec_task, node);
         }
@@ -6276,7 +6282,7 @@ threadptr_interrupt_exec_exec(rb_thread_t *th)
 static void
 threadptr_interrupt_exec_cleanup(rb_thread_t *th)
 {
-    rb_native_mutex_lock(&th->interrupt_lock);
+    rb_native_mutex_lock_track(&th->interrupt_lock, LOCK_TH_INTERRUPT);
     {
         struct rb_interrupt_exec_task *task;
 

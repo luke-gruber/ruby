@@ -263,6 +263,9 @@ rb_ec_cleanup(rb_execution_context_t *ec, enum ruby_tag_type ex)
     th = th0;
     rb_thread_stop_timer_thread();
     ruby_vm_destruct(th->vm);
+#ifdef VM_MUTEX_COUNTERS
+    rb_mutex_counter_display_results();
+#endif
     // For YJIT, call this after ruby_vm_destruct() frees jit_cont for the root fiber.
     rb_jit_cont_finish();
 

@@ -19,6 +19,20 @@
  * please use Mutex directly.
  */
 
+enum rb_lock_type {
+    LOCK_VM_SYNC,
+    LOCK_RACTOR_SCHED,
+    LOCK_RACTOR,
+    LOCK_TH_SCHED,
+    LOCK_TH_INTERRUPT,
+    LOCK_UBF_LIST,
+    LOCK_TIMER_WAITING,
+    LOCK_NT_STACK,
+    LOCK_WORKQUEUE,
+    LOCK_JIT_CONT,
+    LOCK_STR_CRYPT,
+};
+
 #if defined(_WIN32)
 #include <windows.h>
 typedef HANDLE rb_nativethread_id_t;
@@ -125,6 +139,11 @@ void rb_nativethread_lock_unlock(rb_nativethread_lock_t *lock);
 
 /** @alias{rb_nativethread_lock_lock} */
 void rb_native_mutex_lock(rb_nativethread_lock_t *lock);
+
+/* Internal mutex tracking functions for VM contention monitoring */
+void rb_nativethread_lock_lock_track(rb_nativethread_lock_t *lock, int lock_type);
+void rb_native_mutex_lock_track(rb_nativethread_lock_t *lock, int lock_type);
+void rb_mutex_counter_display_results(void);
 
 /**
  * Identical  to  rb_native_mutex_lock(),  except  it  doesn't  block  in  case

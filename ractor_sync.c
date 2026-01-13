@@ -1025,7 +1025,7 @@ ubf_ractor_wait(void *ptr)
         }
         RACTOR_UNLOCK(r);
     }
-    rb_native_mutex_lock(&th->interrupt_lock);
+    rb_native_mutex_lock_track(&th->interrupt_lock, LOCK_TH_INTERRUPT);
 }
 
 static enum ractor_wakeup_status

@@ -89,7 +89,7 @@ vm_lock_enter(rb_ractor_t *cr, rb_vm_t *vm, bool locked, bool no_barrier, unsign
         VM_ASSERT(cr->sync.locked_by != rb_ractor_self(cr));
 #endif
         // lock
-        rb_native_mutex_lock(&vm->ractor.sync.lock);
+        rb_native_mutex_lock_track(&vm->ractor.sync.lock, LOCK_VM_SYNC);
         VM_ASSERT(vm->ractor.sync.lock_owner == NULL);
         VM_ASSERT(vm->ractor.sync.lock_rec == 0);
 

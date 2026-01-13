@@ -78,11 +78,14 @@ struct rb_thread_sched_item {
     struct coroutine_context *context;
 };
 
+struct rb_rsched_struct;
+
 struct rb_native_thread {
     rb_atomic_t serial;
     struct rb_vm_struct *vm;
 
     rb_nativethread_id_t thread_id;
+    struct rb_rsched_struct *rsched;
 
 #ifdef RB_THREAD_T_HAS_NATIVE_ID
     int tid;

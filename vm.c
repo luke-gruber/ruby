@@ -4592,8 +4592,22 @@ Init_BareVM(void)
     vm->unused_block_warning_table = set_init_numtable();
     vm->global_hooks.type = hook_list_type_global;
 
+    vm->ractor.rsched_cnt = 8;
+    for (int i = 0; i < vm->ractor.rsched_cnt; i++) {
+        rb_rsched_t *rsched = &vm->ractor.rscheds[i];
+        rsched->index = i;
+        rsched->nt_owner = NULL;
+
+        ccan_list_head_init(&rsched->runq);
+        rb_native_mutex_initialize(&rsched->lock);
+    }
+    rb_native_mutex_initialize(&vm->ractor.park_lock);
+    rb_native_cond_initialize(&vm->ractor.park_cond);
+    vm->ractor.nt_parked_cnt = 0;
+
     // setup main thread
     th->nt = ZALLOC(struct rb_native_thread);
+    th->nt->rsched = &vm->ractor.rscheds[0]; // rsched assignment
     th->vm = vm;
     th->ractor = vm->ractor.main_ractor = rb_ractor_main_alloc();
     Init_native_thread(th);

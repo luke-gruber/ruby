@@ -114,6 +114,101 @@ mutex_debug(const char *msg, void *lock)
     }
 }
 
+#ifdef VM_MUTEX_COUNTERS
+/* Mutex counter structure for tracking lock statistics */
+struct rb_mutex_counter {
+    rb_atomic_t lock_count;
+    rb_atomic_t contention_count;
+    const char *name;
+};
+
+/* Array of counters for each lock type */
+static struct rb_mutex_counter mutex_counters[] = {
+    [LOCK_VM_SYNC] = { .lock_count = 0, .contention_count = 0, .name = "LOCK_VM_SYNC" },
+    [LOCK_RACTOR_SCHED] = { .lock_count = 0, .contention_count = 0, .name = "LOCK_RACTOR_SCHED" },
+    [LOCK_RACTOR] = { .lock_count = 0, .contention_count = 0, .name = "LOCK_RACTOR" },
+    [LOCK_TH_SCHED] = { .lock_count = 0, .contention_count = 0, .name = "LOCK_TH_SCHED" },
+    [LOCK_TH_INTERRUPT] = { .lock_count = 0, .contention_count = 0, .name = "LOCK_TH_INTERRUPT" },
+    [LOCK_UBF_LIST] = { .lock_count = 0, .contention_count = 0, .name = "LOCK_UBF_LIST" },
+    [LOCK_TIMER_WAITING] = { .lock_count = 0, .contention_count = 0, .name = "LOCK_TIMER_WAITING" },
+    [LOCK_NT_STACK] = { .lock_count = 0, .contention_count = 0, .name = "LOCK_NT_STACK" },
+    [LOCK_WORKQUEUE] = { .lock_count = 0, .contention_count = 0, .name = "LOCK_WORKQUEUE" },
+    [LOCK_JIT_CONT] = { .lock_count = 0, .contention_count = 0, .name = "LOCK_JIT_CONT" },
+    [LOCK_STR_CRYPT] = { .lock_count = 0, .contention_count = 0, .name = "LOCK_STR_CRYPT" },
+};
+
+static void rb_mutex_counter_incr_lock(int lock_type);
+static void rb_mutex_counter_incr_lock_contention(int lock_type);
+
+/* Increment lock acquisition counter */
+static void
+rb_mutex_counter_incr_lock(int lock_type)
+{
+    if (lock_type >= 0 && lock_type < (int)(sizeof(mutex_counters) / sizeof(mutex_counters[0]))) {
+        RUBY_ATOMIC_FETCH_ADD(mutex_counters[lock_type].lock_count, 1);
+    }
+}
+
+/* Increment lock contention counter */
+static void
+rb_mutex_counter_incr_lock_contention(int lock_type)
+{
+    if (lock_type >= 0 && lock_type < (int)(sizeof(mutex_counters) / sizeof(mutex_counters[0]))) {
+        RUBY_ATOMIC_FETCH_ADD(mutex_counters[lock_type].contention_count, 1);
+    }
+}
+
+/* Display mutex counter results (called at exit or for debugging) */
+void
+rb_mutex_counter_display_results(void)
+{
+    fprintf(stderr, "\n=== Mutex Lock Statistics ===\n");
+    fprintf(stderr, "%-20s %15s %15s %10s\n", "Lock Type", "Acquisitions", "Contentions", "Ratio %");
+    fprintf(stderr, "%-20s %15s %15s %10s\n", "---------", "------------", "-----------", "-------");
+
+    for (int i = 0; i < (int)(sizeof(mutex_counters) / sizeof(mutex_counters[0])); i++) {
+        rb_atomic_t lock_count = RUBY_ATOMIC_LOAD(mutex_counters[i].lock_count);
+        rb_atomic_t contention_count = RUBY_ATOMIC_LOAD(mutex_counters[i].contention_count);
+
+        if (lock_count > 0) {
+            double ratio = (double)contention_count / lock_count * 100.0;
+            fprintf(stderr, "%-20s %15" PRIu32 " %15" PRIu32 " %9.2f%%\n",
+                    mutex_counters[i].name, lock_count, contention_count, ratio);
+        }
+    }
+    fprintf(stderr, "\n");
+}
+#else
+void rb_mutex_counter_display_results(void) { }
+#endif /* VM_MUTEX_COUNTERS */
+
+void
+rb_native_mutex_lock_track(pthread_mutex_t *lock, int lock_type)
+{
+    int r;
+#if NATIVE_MUTEX_LOCK_DEBUG_YIELD
+    native_thread_yield();
+#endif
+    mutex_debug("lock", lock);
+#ifdef VM_MUTEX_COUNTERS
+    if ((r = pthread_mutex_trylock(lock)) != 0) {
+        if (r == EBUSY) {
+            rb_mutex_counter_incr_lock_contention(lock_type);
+            if ((r = pthread_mutex_lock(lock)) != 0) {
+                rb_bug_errno("pthread_mutex_lock", r);
+            }
+        } else {
+            rb_bug_errno("pthread_mutex_trylock", r);
+        }
+    }
+    rb_mutex_counter_incr_lock(lock_type);
+#else
+    if ((r = pthread_mutex_lock(lock)) != 0) {
+        rb_bug_errno("pthread_mutex_lock", r);
+    }
+#endif
+}
+
 void
 rb_native_mutex_lock(pthread_mutex_t *lock)
 {
@@ -400,7 +495,7 @@ thread_sched_set_unlocked(struct rb_thread_sched *sched, rb_thread_t *th)
 static void
 thread_sched_lock_(struct rb_thread_sched *sched, rb_thread_t *th, const char *file, int line)
 {
-    rb_native_mutex_lock(&sched->lock_);
+    rb_native_mutex_lock_track(&sched->lock_, LOCK_TH_SCHED);
 
 #if VM_CHECK_MODE
     RUBY_DEBUG_LOG2(file, line, "r:%d th:%u", th ? (int)rb_ractor_id(th->ractor) : -1, rb_th_serial(th));
@@ -478,7 +573,7 @@ ractor_sched_set_unlocked(rb_vm_t *vm, rb_ractor_t *cr)
 static void
 ractor_sched_lock_(rb_vm_t *vm, rb_ractor_t *cr, const char *file, int line)
 {
-    rb_native_mutex_lock(&vm->ractor.sched.lock);
+    rb_native_mutex_lock_track(&vm->ractor.sched.lock, LOCK_RACTOR_SCHED);
 
 #if VM_CHECK_MODE
     RUBY_DEBUG_LOG2(file, line, "cr:%u prev_owner:%u", rb_ractor_serial(cr), rb_ractor_serial(vm->ractor.sched.lock_owner));
@@ -1036,7 +1131,7 @@ ubf_set(rb_thread_t *th, rb_unblock_function_t *func, void *arg)
         return true;
     }
 
-    rb_native_mutex_lock(&th->interrupt_lock);
+    rb_native_mutex_lock_track(&th->interrupt_lock, LOCK_TH_INTERRUPT);
     {
         if (!th->ec->raised_flag && RUBY_VM_INTERRUPTED(th->ec)) {
             rb_native_mutex_unlock(&th->interrupt_lock);
@@ -1056,7 +1151,7 @@ static void
 ubf_clear(rb_thread_t *th)
 {
     if (th->unblock.func) {
-        rb_native_mutex_lock(&th->interrupt_lock);
+        rb_native_mutex_lock_track(&th->interrupt_lock, LOCK_TH_INTERRUPT);
         {
             th->unblock.func = NULL;
             th->unblock.arg  = NULL;
@@ -1440,7 +1535,7 @@ rb_ractor_sched_barrier_start(rb_vm_t *vm, rb_ractor_t *cr)
         rb_native_cond_broadcast(&vm->ractor.sched.barrier_release_cond);
 
         // acquire VM lock
-        rb_native_mutex_lock(&vm->ractor.sync.lock);
+        rb_native_mutex_lock_track(&vm->ractor.sync.lock, LOCK_VM_SYNC);
         vm->ractor.sync.lock_rec = lock_rec;
         vm->ractor.sync.lock_owner = cr;
     }
@@ -1523,7 +1618,7 @@ rb_ractor_sched_barrier_join(rb_vm_t *vm, rb_ractor_t *cr)
         ractor_sched_unlock(vm, cr);
     }
 
-    rb_native_mutex_lock(&vm->ractor.sync.lock);
+    rb_native_mutex_lock_track(&vm->ractor.sync.lock, LOCK_VM_SYNC);
     // VM locked here
 }
 
@@ -2455,7 +2550,7 @@ native_cond_sleep(rb_thread_t *th, rb_hrtime_t *rel)
 
     THREAD_BLOCKING_BEGIN(th);
     {
-        rb_native_mutex_lock(lock);
+        rb_native_mutex_lock_track(lock, LOCK_TH_INTERRUPT);
         th->unblock.func = ubf_pthread_cond_signal;
         th->unblock.arg = th;
 
@@ -2518,7 +2613,7 @@ register_ubf_list(rb_thread_t *th)
 
     VM_ASSERT(th->unblock.func != NULL);
 
-    rb_native_mutex_lock(&ubf_list_lock);
+    rb_native_mutex_lock_track(&ubf_list_lock, LOCK_UBF_LIST);
     {
         // check not connected yet
         if (ccan_list_empty((struct ccan_list_head*)node)) {
@@ -2542,7 +2637,7 @@ unregister_ubf_list(rb_thread_t *th)
     VM_ASSERT(th->unblock.func == NULL);
 
     if (!ccan_list_empty((struct ccan_list_head*)node)) {
-        rb_native_mutex_lock(&ubf_list_lock);
+        rb_native_mutex_lock_track(&ubf_list_lock, LOCK_UBF_LIST);
         {
             VM_ASSERT(ubf_list_contain_p(th));
             ccan_list_del_init(node);
@@ -2582,7 +2677,7 @@ static void
 ubf_wakeup_all_threads(void)
 {
     rb_thread_t *th;
-    rb_native_mutex_lock(&ubf_list_lock);
+    rb_native_mutex_lock_track(&ubf_list_lock, LOCK_UBF_LIST);
     {
         ccan_list_for_each(&ubf_list_head, th, sched.node.ubf) {
             ubf_wakeup_thread(th);
@@ -2903,7 +2998,7 @@ timer_thread_set_timeout(rb_vm_t *vm)
 
     // Always check waiting threads to find minimum timeout
     // even when scheduler has work (grq_cnt > 0)
-    rb_native_mutex_lock(&timer_th.waiting_lock);
+    rb_native_mutex_lock_track(&timer_th.waiting_lock, LOCK_TIMER_WAITING);
     {
         struct rb_thread_sched_waiting *w = ccan_list_top(&timer_th.waiting, struct rb_thread_sched_waiting, node);
         rb_thread_t *th = thread_sched_waiting_thread(w);
@@ -3012,12 +3107,12 @@ timer_thread_check_timeout(rb_vm_t *vm)
     rb_thread_t *th;
     uint32_t event_serial;
 
-    rb_native_mutex_lock(&timer_th.waiting_lock);
+    rb_native_mutex_lock_track(&timer_th.waiting_lock, LOCK_TIMER_WAITING);
     {
         while ((th = timer_thread_deq_wakeup(vm, now, &event_serial)) != NULL) {
             rb_native_mutex_unlock(&timer_th.waiting_lock);
             timer_thread_wakeup_thread(th, event_serial);
-            rb_native_mutex_lock(&timer_th.waiting_lock);
+            rb_native_mutex_lock_track(&timer_th.waiting_lock, LOCK_TIMER_WAITING);
         }
     }
     rb_native_mutex_unlock(&timer_th.waiting_lock);

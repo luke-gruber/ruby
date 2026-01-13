@@ -30,6 +30,10 @@ static volatile DWORD ruby_native_thread_key = TLS_OUT_OF_INDEXES;
 
 static int w32_wait_events(HANDLE *events, int count, DWORD timeout, rb_thread_t *th);
 
+#ifdef VM_MUTEX_COUNTERS
+void rb_mutex_counter_display_results(void) {}
+#endif
+
 rb_internal_thread_event_hook_t *
 rb_internal_thread_add_event_hook(rb_internal_thread_event_callback callback, rb_event_flag_t internal_event, void *user_data)
 {
@@ -363,6 +367,18 @@ native_sleep(rb_thread_t *th, rb_hrtime_t *rel)
         rb_native_mutex_unlock(&th->interrupt_lock);
     }
     THREAD_BLOCKING_END(th);
+}
+
+void
+rb_native_mutex_lock_track(rb_nativethread_lock_t *lock, int lock_type)
+{
+    (void)lock_type;
+#ifdef USE_WIN32_MUTEX
+    w32_mutex_lock(lock->mutex, false);
+#else
+    EnterCriticalSection(&lock->crit);
+#endif
+    /* TODO: Add contention tracking for Windows if needed */
 }
 
 void

@@ -10948,7 +10948,7 @@ rb_str_crypt(VALUE str, VALUE salt)
 # endif
     res = crypt_r(s, saltp, data);
 #else
-    rb_nativethread_lock_lock(&crypt_mutex.lock);
+    rb_nativethread_lock_lock_track(&crypt_mutex.lock, LOCK_STR_CRYPT);
     res = crypt(s, saltp);
 #endif
     if (!res) {

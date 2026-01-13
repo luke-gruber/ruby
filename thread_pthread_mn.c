@@ -10,7 +10,7 @@ timer_thread_cancel_waiting(rb_thread_t *th)
 {
     bool canceled = false;
 
-    rb_native_mutex_lock(&timer_th.waiting_lock);
+    rb_native_mutex_lock_track(&timer_th.waiting_lock, LOCK_TIMER_WAITING);
     {
         if (th->sched.waiting_reason.flags) {
             canceled = true;
@@ -306,7 +306,7 @@ nt_alloc_stack(rb_vm_t *vm, void **vm_stack, void **machine_stack)
 {
     int err = 0;
 
-    rb_native_mutex_lock(&nt_machine_stack_lock);
+    rb_native_mutex_lock_track(&nt_machine_stack_lock, LOCK_NT_STACK);
     {
       retry:
         if (nt_free_stack_chunks) {
@@ -373,7 +373,7 @@ nt_free_stack(void *mstack)
 {
     if (!mstack) return;
 
-    rb_native_mutex_lock(&nt_machine_stack_lock);
+    rb_native_mutex_lock_track(&nt_machine_stack_lock, LOCK_NT_STACK);
     {
         struct nt_machine_stack_footer *msf = nt_stack_chunk_get_msf(GET_VM(), mstack);
         struct nt_stack_chunk_header *ch = msf->ch;
@@ -400,7 +400,7 @@ native_thread_check_and_create_shared(rb_vm_t *vm)
 {
     bool need_to_make = false;
 
-    rb_native_mutex_lock(&vm->ractor.sched.lock);
+    rb_native_mutex_lock_track(&vm->ractor.sched.lock, LOCK_RACTOR_SCHED);
     {
         unsigned int schedulable_ractor_cnt = vm->ractor.cnt;
         RUBY_ASSERT(schedulable_ractor_cnt >= 1);
@@ -748,7 +748,7 @@ timer_thread_register_waiting(rb_thread_t *th, int fd, enum thread_sched_waiting
         }
     }
 
-    rb_native_mutex_lock(&timer_th.waiting_lock);
+    rb_native_mutex_lock_track(&timer_th.waiting_lock, LOCK_TIMER_WAITING);
     {
 #if HAVE_SYS_EVENT_H
         if (num_events > 0) {
@@ -984,7 +984,7 @@ timer_thread_polling(rb_vm_t *vm)
 
                 struct rb_thread_sched *sched = TH_SCHED(th);
                 thread_sched_lock(sched, th);
-                rb_native_mutex_lock(&timer_th.waiting_lock);
+                rb_native_mutex_lock_track(&timer_th.waiting_lock, LOCK_TIMER_WAITING);
                 {
                     if (th->sched.waiting_reason.flags) {
                         // delete from chain
@@ -1030,7 +1030,7 @@ timer_thread_polling(rb_vm_t *vm)
 
                 struct rb_thread_sched *sched = TH_SCHED(th);
                 thread_sched_lock(sched, th);
-                rb_native_mutex_lock(&timer_th.waiting_lock);
+                rb_native_mutex_lock_track(&timer_th.waiting_lock, LOCK_TIMER_WAITING);
                 {
                     if (th->sched.waiting_reason.flags) {
                         // delete from chain

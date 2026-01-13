@@ -1842,7 +1842,7 @@ rb_workqueue_register(unsigned flags, rb_postponed_job_func_t func, void *data)
     wq_job->func = func;
     wq_job->data = data;
 
-    rb_nativethread_lock_lock(&vm->workqueue_lock);
+    rb_nativethread_lock_lock_track(&vm->workqueue_lock, LOCK_WORKQUEUE);
     ccan_list_add_tail(&vm->workqueue, &wq_job->jnode);
     rb_nativethread_lock_unlock(&vm->workqueue_lock);
 
@@ -1997,7 +1997,7 @@ rb_postponed_job_flush(rb_vm_t *vm)
 
     ccan_list_head_init(&tmp);
 
-    rb_nativethread_lock_lock(&vm->workqueue_lock);
+    rb_nativethread_lock_lock_track(&vm->workqueue_lock, LOCK_WORKQUEUE);
     ccan_list_append_list(&tmp, &vm->workqueue);
     rb_nativethread_lock_unlock(&vm->workqueue_lock);
 
@@ -2037,7 +2037,7 @@ rb_postponed_job_flush(rb_vm_t *vm)
     /* If we threw an exception, there might be leftover workqueue items; carry them over
      * to a subsequent execution of flush */
     if (!ccan_list_empty(&tmp)) {
-        rb_nativethread_lock_lock(&vm->workqueue_lock);
+        rb_nativethread_lock_lock_track(&vm->workqueue_lock, LOCK_WORKQUEUE);
         ccan_list_prepend_list(&vm->workqueue, &tmp);
         rb_nativethread_lock_unlock(&vm->workqueue_lock);
 
