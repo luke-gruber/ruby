@@ -799,8 +799,10 @@ thread_sched_enq(struct rb_thread_sched *sched, rb_thread_t *ready_th)
             if (ready_th->sched_reg_window == 0) {
                 uint32_t running_time_acc = ready_th->running_time_acc_us;
                 ready_th->running_time_acc_us = 0;
-                // < 1/2 regular timeslice for 4 reg prio schedulings, bump to high prio queue
-                if (running_time_acc < (50 * 1000)) {
+                uint32_t half_timeslice = 50 * 1000;
+                half_timeslice << ready_th->priority;
+                // < 1/2 timeslice for 4 reg prio schedulings, bump to high prio queue
+                if (running_time_acc < half_timeslice) {
                     goto sched_high;
                 }
             }
