@@ -1160,10 +1160,14 @@ typedef struct rb_thread_struct {
     int8_t priority; /* -3 .. 3 (RUBY_THREAD_PRIORITY_{MIN,MAX}) */
     uint32_t running_time_us; /* 12500..800000 */
 
-    void *blocking_region_buffer;
-    int consecutive_io_ops;
+    // sched priority system
+    uint32_t running_time_acc_us; // Time taken in reg prio during window. Used to bump prio.
     uint32_t sched_tick;
+    int consecutive_io_ops;
+    int sched_prio;
+    int sched_reg_window;
 
+    void *blocking_region_buffer;
     VALUE thgroup;
     VALUE value;
 

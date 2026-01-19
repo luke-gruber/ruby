@@ -774,12 +774,13 @@ thread_sched_enq(struct rb_thread_sched *sched, rb_thread_t *ready_th)
         // VM_ASSERT(!ractor_sched_timeslice_threads_contain_p(ready_th->vm, sched->running));
     }
 
-    ready_th->sched_tick = ++sched->sched_tick;
+    ready_th->sched_tick = ++sched->sched_tick; // track enqueue ordering for deq
 
     bool prio_decision = sched->readyq_high_cnt > 0 || sched->readyq_reg_cnt > 0;
     if (!prio_decision) {
         ccan_list_add_tail(&sched->readyq_prio_high, &ready_th->sched.node.readyq);
         sched->readyq_high_cnt++;
+        // don't change th->sched_prio
         return;
     }
 
@@ -787,13 +788,31 @@ thread_sched_enq(struct rb_thread_sched *sched, rb_thread_t *ready_th)
 
     // TODO: 1/10 of timeslice, not hardcoded value
     if ((just_did_io && ready_th->running_time_us < (10 * 1000) && ready_th->consecutive_io_ops <= 3) && ready_th->priority >= 0) {
+        sched_high:
         ccan_list_add_tail(&sched->readyq_prio_high, &ready_th->sched.node.readyq);
         sched->readyq_high_cnt++;
+        ready_th->sched_prio = 1;
     }
     else {
+        if (ready_th->sched_prio == 0 && ready_th->priority >= 0) {
+            ready_th->sched_reg_window = (ready_th->sched_reg_window + 1) % 4;
+            if (ready_th->sched_reg_window == 0) {
+                uint32_t running_time_acc = ready_th->running_time_acc_us;
+                ready_th->running_time_acc_us = 0;
+                // < 1/2 regular timeslice for 4 reg prio schedulings, bump to high prio queue
+                if (running_time_acc < (50 * 1000)) {
+                    goto sched_high;
+                }
+            }
+        }
         ccan_list_add_tail(&sched->readyq_prio_reg, &ready_th->sched.node.readyq);
         sched->readyq_reg_cnt++;
         ready_th->consecutive_io_ops = 0;
+        if (ready_th->sched_prio == 1) {
+            ready_th->sched_reg_window = 0;
+            ready_th->running_time_acc_us = 0;
+        }
+        ready_th->sched_prio = 0;
     }
 }
 
