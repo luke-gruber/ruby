@@ -1161,6 +1161,8 @@ typedef struct rb_thread_struct {
     uint32_t running_time_us; /* 12500..800000 */
 
     void *blocking_region_buffer;
+    int consecutive_io_ops;
+    uint32_t sched_tick;
 
     VALUE thgroup;
     VALUE value;

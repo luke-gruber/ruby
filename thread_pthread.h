@@ -131,8 +131,12 @@ struct rb_thread_sched {
     bool is_running_timeslice;
     bool enable_mn_threads;
 
-    struct ccan_list_head readyq;
-    int readyq_cnt;
+    struct ccan_list_head readyq_prio_high;
+    struct ccan_list_head readyq_prio_reg;
+    int readyq_high_cnt;
+    int readyq_reg_cnt;
+    uint32_t prio_decisions_tick;
+    uint32_t sched_tick;
     // ractor scheduling
     struct ccan_list_node grq_node;
 };

@@ -1494,8 +1494,10 @@ rb_thread_sleep(int sec)
 static void
 rb_thread_schedule_limits(uint32_t limits_us)
 {
+    rb_thread_t *th = GET_THREAD();
+    th->consecutive_io_ops = 0;
+    VM_ASSERT(!th->blocking_region_buffer);
     if (!rb_thread_alone()) {
-        rb_thread_t *th = GET_THREAD();
         RUBY_DEBUG_LOG("us:%u", (unsigned int)limits_us);
 
         if (th->running_time_us >= limits_us) {
@@ -1550,6 +1552,7 @@ blocking_region_end(rb_thread_t *th, struct rb_blocking_region_buffer *region)
     /* entry to ubf_list impossible at this point, so unregister is safe: */
     unregister_ubf_list(th);
 
+    th->consecutive_io_ops++;
     thread_sched_to_running(TH_SCHED(th), th);
     rb_ractor_thread_switch(th->ractor, th, false);
 
@@ -5842,7 +5845,7 @@ rb_check_deadlock(rb_ractor_t *r)
     if (GET_THREAD()->vm->thread_ignore_deadlock) return;
 
 #ifdef RUBY_THREAD_PTHREAD_H
-    if (r->threads.sched.readyq_cnt > 0) return;
+    if (r->threads.sched.readyq_high_cnt > 0 || r->threads.sched.readyq_reg_cnt > 0) return;
 #endif
 
     int sleeper_num = rb_ractor_sleeper_thread_num(r);

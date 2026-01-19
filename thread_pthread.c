@@ -341,20 +341,20 @@ th_has_dedicated_nt(const rb_thread_t *th)
     return th->nt->dedicated > 0;
 }
 
-RBIMPL_ATTR_MAYBE_UNUSED()
-static void
-thread_sched_dump_(const char *file, int line, struct rb_thread_sched *sched)
-{
-    fprintf(stderr, "@%s:%d running:%d\n", file, line, sched->running ? (int)sched->running->serial : -1);
-    rb_thread_t *th;
-    int i = 0;
-    ccan_list_for_each(&sched->readyq, th, sched.node.readyq) {
-        i++; if (i>10) rb_bug("too many");
-        fprintf(stderr, "  ready:%d (%sNT:%d)\n", th->serial,
-                th->nt ? (th->nt->dedicated ? "D" : "S") : "x",
-                th->nt ? (int)th->nt->serial : -1);
-    }
-}
+/*RBIMPL_ATTR_MAYBE_UNUSED()*/
+/*static void*/
+/*thread_sched_dump_(const char *file, int line, struct rb_thread_sched *sched)*/
+/*{*/
+    /*fprintf(stderr, "@%s:%d running:%d\n", file, line, sched->running ? (int)sched->running->serial : -1);*/
+    /*rb_thread_t *th;*/
+    /*int i = 0;*/
+    /*ccan_list_for_each(&sched->readyq, th, sched.node.readyq) {*/
+        /*i++; if (i>10) rb_bug("too many");*/
+        /*fprintf(stderr, "  ready:%d (%sNT:%d)\n", th->serial,*/
+                /*th->nt ? (th->nt->dedicated ? "D" : "S") : "x",*/
+                /*th->nt ? (int)th->nt->serial : -1);*/
+    /*}*/
+/*}*/
 
 #define ractor_sched_dump(s) ractor_sched_dump_(__FILE__, __LINE__, s)
 
@@ -643,7 +643,7 @@ thread_sched_add_running_thread(struct rb_thread_sched *sched, rb_thread_t *th)
     VM_ASSERT(sched->running == th);
 
     rb_vm_t *vm = th->vm;
-    thread_sched_setup_running_threads(sched, th->ractor, vm, th, NULL, ccan_list_empty(&sched->readyq) ? NULL : th);
+    thread_sched_setup_running_threads(sched, th->ractor, vm, th, NULL, (sched->readyq_high_cnt == 0 && sched->readyq_reg_cnt == 0) ? NULL : th);
 }
 
 static void
@@ -692,16 +692,16 @@ thread_sched_set_running(struct rb_thread_sched *sched, rb_thread_t *th)
     sched->running = th;
 }
 
-RBIMPL_ATTR_MAYBE_UNUSED()
-static bool
-thread_sched_readyq_contain_p(struct rb_thread_sched *sched, rb_thread_t *th)
-{
-    rb_thread_t *rth;
-    ccan_list_for_each(&sched->readyq, rth, sched.node.readyq) {
-        if (rth == th) return true;
-    }
-    return false;
-}
+/*RBIMPL_ATTR_MAYBE_UNUSED()*/
+/*static bool*/
+/*thread_sched_readyq_contain_p(struct rb_thread_sched *sched, rb_thread_t *th)*/
+/*{*/
+    /*rb_thread_t *rth;*/
+    /*ccan_list_for_each(&sched->readyq, rth, sched.node.readyq) {*/
+        /*if (rth == th) return true;*/
+    /*}*/
+    /*return false;*/
+/*}*/
 
 // deque thread from the ready queue.
 // if the ready queue is empty, return NULL.
@@ -715,14 +715,36 @@ thread_sched_deq(struct rb_thread_sched *sched)
 
     VM_ASSERT(sched->running != NULL);
 
-    if (ccan_list_empty(&sched->readyq)) {
+    if ((sched->readyq_high_cnt + sched->readyq_reg_cnt) == 0) {
         next_th = NULL;
     }
     else {
-        next_th = ccan_list_pop(&sched->readyq, rb_thread_t, sched.node.readyq);
-
-        VM_ASSERT(sched->readyq_cnt > 0);
-        sched->readyq_cnt--;
+        bool prio_decision =  sched->readyq_high_cnt > 0 && sched->readyq_reg_cnt > 0;
+        if (prio_decision) {
+            if (ccan_list_top(&sched->readyq_prio_high, struct rb_thread_struct, sched.node.readyq)->sched_tick <
+                ccan_list_top(&sched->readyq_prio_reg, struct rb_thread_struct, sched.node.readyq)->sched_tick) {
+                // not considered a priority decision, as the high priority thread was enqueued first
+                goto choose_high;
+            }
+            // When the prio_reg thread was enqueued first, half the time we pick the higher prio thread to run
+            sched->prio_decisions_tick++;
+            if (sched->prio_decisions_tick % 2 == 0) {
+                goto choose_reg;
+            }
+            goto choose_high;
+        }
+        else if (sched->readyq_high_cnt > 0) {
+            choose_high:
+            next_th = ccan_list_pop(&sched->readyq_prio_high, rb_thread_t, sched.node.readyq);
+            VM_ASSERT(sched->readyq_high_cnt > 0);
+            sched->readyq_high_cnt--;
+        }
+        else {
+            choose_reg:
+            next_th = ccan_list_pop(&sched->readyq_prio_reg, rb_thread_t, sched.node.readyq);
+            VM_ASSERT(sched->readyq_reg_cnt > 0);
+            sched->readyq_reg_cnt--;
+        }
         ccan_list_node_init(&next_th->sched.node.readyq);
     }
 
@@ -739,10 +761,10 @@ thread_sched_enq(struct rb_thread_sched *sched, rb_thread_t *ready_th)
     RUBY_DEBUG_LOG("ready_th:%u readyq_cnt:%d", rb_th_serial(ready_th), sched->readyq_cnt);
 
     VM_ASSERT(sched->running != NULL);
-    VM_ASSERT(!thread_sched_readyq_contain_p(sched, ready_th));
+    /*VM_ASSERT(!thread_sched_readyq_contain_p(sched, ready_th));*/
 
     if (sched->is_running) {
-        if (ccan_list_empty(&sched->readyq)) {
+        if ((sched->readyq_high_cnt + sched->readyq_reg_cnt) == 0) {
             // add sched->running to timeslice
             thread_sched_setup_running_threads(sched, ready_th->ractor, ready_th->vm, NULL, NULL, sched->running);
         }
@@ -752,8 +774,27 @@ thread_sched_enq(struct rb_thread_sched *sched, rb_thread_t *ready_th)
         // VM_ASSERT(!ractor_sched_timeslice_threads_contain_p(ready_th->vm, sched->running));
     }
 
-    ccan_list_add_tail(&sched->readyq, &ready_th->sched.node.readyq);
-    sched->readyq_cnt++;
+    ready_th->sched_tick = ++sched->sched_tick;
+
+    bool prio_decision = sched->readyq_high_cnt > 0 || sched->readyq_reg_cnt > 0;
+    if (!prio_decision) {
+        ccan_list_add_tail(&sched->readyq_prio_high, &ready_th->sched.node.readyq);
+        sched->readyq_high_cnt++;
+        return;
+    }
+
+    bool just_did_io = ready_th->blocking_region_buffer != 0;
+
+    // TODO: 1/10 of timeslice, not hardcoded value
+    if ((just_did_io && ready_th->running_time_us < (10 * 1000) && ready_th->consecutive_io_ops <= 3) && ready_th->priority >= 0) {
+        ccan_list_add_tail(&sched->readyq_prio_high, &ready_th->sched.node.readyq);
+        sched->readyq_high_cnt++;
+    }
+    else {
+        ccan_list_add_tail(&sched->readyq_prio_reg, &ready_th->sched.node.readyq);
+        sched->readyq_reg_cnt++;
+        ready_th->consecutive_io_ops = 0;
+    }
 }
 
 // DNT: kick condvar
@@ -797,7 +838,7 @@ thread_sched_to_ready_common(struct rb_thread_sched *sched, rb_thread_t *th, boo
     RUBY_DEBUG_LOG("th:%u running:%u redyq_cnt:%d", rb_th_serial(th), rb_th_serial(sched->running), sched->readyq_cnt);
 
     VM_ASSERT(sched->running != th);
-    VM_ASSERT(!thread_sched_readyq_contain_p(sched, th));
+    /*VM_ASSERT(!thread_sched_readyq_contain_p(sched, th));*/
     RB_INTERNAL_THREAD_HOOK(RUBY_INTERNAL_THREAD_EVENT_READY, th);
 
     if (sched->running == NULL) {
@@ -1131,7 +1172,7 @@ thread_sched_yield(struct rb_thread_sched *sched, rb_thread_t *th)
 
     thread_sched_lock(sched, th);
     {
-        if (!ccan_list_empty(&sched->readyq)) {
+        if (sched->readyq_high_cnt > 0 || sched->readyq_reg_cnt > 0) {
             RB_INTERNAL_THREAD_HOOK(RUBY_INTERNAL_THREAD_EVENT_SUSPENDED, th);
             thread_sched_wakeup_next_thread(sched, th, !th_has_dedicated_nt(th));
             bool can_direct_transfer = !th_has_dedicated_nt(th);
@@ -1140,7 +1181,8 @@ thread_sched_yield(struct rb_thread_sched *sched, rb_thread_t *th)
             th->status = THREAD_RUNNABLE;
         }
         else {
-            VM_ASSERT(sched->readyq_cnt == 0);
+            VM_ASSERT(ccan_list_empty(&sched->readyq_prio_high));
+            VM_ASSERT(ccan_list_empty(&sched->readyq_prio_reg));
         }
     }
     thread_sched_unlock(sched, th);
@@ -1155,8 +1197,10 @@ rb_thread_sched_init(struct rb_thread_sched *sched, bool atfork)
     sched->lock_owner = NULL;
 #endif
 
-    ccan_list_head_init(&sched->readyq);
-    sched->readyq_cnt = 0;
+    ccan_list_head_init(&sched->readyq_prio_high);
+    ccan_list_head_init(&sched->readyq_prio_reg);
+    sched->readyq_high_cnt = 0;
+    sched->readyq_reg_cnt = 0;
 
 #if USE_MN_THREADS
     if (!atfork) sched->enable_mn_threads = true; // MN is enabled on Ractors
