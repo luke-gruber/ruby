@@ -173,6 +173,7 @@ static inline void blocking_region_end(rb_thread_t *th, struct rb_blocking_regio
   thread_sched_to_waiting((sched), (th));
 
 #define THREAD_BLOCKING_END(th) \
+  th->consecutive_io_ops += 1; \
   thread_sched_to_running((sched), (th)); \
   rb_ractor_thread_switch(th->ractor, th, false); \
 } while(0)
