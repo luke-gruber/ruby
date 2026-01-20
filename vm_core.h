@@ -1161,11 +1161,12 @@ typedef struct rb_thread_struct {
     uint32_t running_time_us; /* 12500..800000 */
 
     // sched priority system
-    uint32_t running_time_acc_us; // Time taken in reg prio during window. Used to bump prio.
-    uint32_t sched_tick;
-    int consecutive_io_ops;
-    int sched_prio;
-    int sched_reg_window;
+    uint32_t running_time_acc_us; // Time taken in reg prio during reg window. Used to bump prio.
+    uint32_t sched_tick; // globally increasing number for all threads on ractor
+    int8_t consecutive_io_ops; // 0..3
+    int8_t sched_prio; // 0..1
+    int8_t sched_reg_window; // 0..3
+    int8_t mutex_held_prio_boost; // 0..2
 
     void *blocking_region_buffer;
     VALUE thgroup;
