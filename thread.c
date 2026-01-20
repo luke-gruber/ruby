@@ -1558,6 +1558,7 @@ blocking_region_end(rb_thread_t *th, struct rb_blocking_region_buffer *region)
     rb_ractor_thread_switch(th->ractor, th, false);
 
     th->blocking_region_buffer = 0;
+    th->nogvl_prio = false;
     rb_ractor_blocking_threads_dec(th->ractor, __FILE__, __LINE__);
     if (th->status == THREAD_STOPPED) {
         th->status = region->prev_status;
@@ -1626,6 +1627,10 @@ rb_nogvl(void *(*func)(void *), void *data1,
         if (flags & RB_NOGVL_UBF_ASYNC_SAFE) {
             vm->ubf_async_safe = 1;
         }
+    }
+
+    if ((flags & RB_NOGVL_PRIORITY)) {
+        th->nogvl_prio = true;
     }
 
     rb_vm_t *volatile saved_vm = vm;

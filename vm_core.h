@@ -1166,7 +1166,7 @@ typedef struct rb_thread_struct {
     int8_t consecutive_io_ops; // 0..3
     int8_t sched_prio; // 0..1
     int8_t sched_reg_window; // 0..3
-    int8_t mutex_held_prio_boost; // 0..2
+    bool nogvl_prio;
 
     void *blocking_region_buffer;
     VALUE thgroup;

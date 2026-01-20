@@ -72,6 +72,13 @@
  */
 #define RB_NOGVL_OFFLOAD_SAFE  (0x4)
 
+/**
+ * Passing this flag to rb_nogvl() indicates that when the thread is finished with the
+ * nogvl work, the ruby thread might be enqueued on a high priority ready queue (if one
+ * exists).
+ */
+#define RB_NOGVL_PRIORITY (0x8)
+
 /** @} */
 
 RBIMPL_SYMBOL_EXPORT_BEGIN()

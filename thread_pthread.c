@@ -784,17 +784,9 @@ thread_sched_enq(struct rb_thread_sched *sched, rb_thread_t *ready_th)
         return;
     }
 
-    // Don't always boost the priority of mutex holders to prevent bad actors (threads taking mutex in a tight loop)
-    // from having too much priority. Give them a few chances at priority if they haven't been running long. If they
-    // context switch a few times with it held, too bad.
-    if (ready_th->keeping_mutexes != NULL && ready_th->running_time_us <= (10 * 1000) && ready_th->mutex_held_prio_boost < 2) {
-        ready_th->mutex_held_prio_boost++;
-        goto sched_high;
-    }
-
     bool just_did_io = ready_th->blocking_region_buffer != 0;
 
-    if ((just_did_io && ready_th->running_time_us < (10 * 1000) && ready_th->consecutive_io_ops <= 3) && ready_th->priority >= 0) {
+    if (ready_th->nogvl_prio || ((just_did_io && ready_th->running_time_us < (10 * 1000) && ready_th->consecutive_io_ops <= 3) && ready_th->priority >= 0)) {
         sched_high:
         ccan_list_add_tail(&sched->readyq_prio_high, &ready_th->sched.node.readyq);
         sched->readyq_high_cnt++;

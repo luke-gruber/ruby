@@ -456,9 +456,6 @@ rb_mutex_unlock_th(rb_mutex_t *mutex, rb_thread_t *th, rb_serial_t ec_serial)
 
     mutex->ec_serial = 0;
     thread_mutex_remove(th, mutex);
-    if (th->keeping_mutexes == NULL) {
-        th->mutex_held_prio_boost = 0;
-    }
 
     ccan_list_for_each_safe(&mutex->waitq, cur, next, node) {
         ccan_list_del_init(&cur->node);
