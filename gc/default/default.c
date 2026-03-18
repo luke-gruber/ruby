@@ -4530,7 +4530,7 @@ gc_pre_sweep_page(rb_objspace_t *objspace, rb_heap_t *heap, struct heap_page *pa
     psweep_debug(1, "[sweep] gc_pre_sweep_page(heap:%p page:%p) start\n", heap, page);
     GC_ASSERT(page->heap == heap);
     page->pre_deferred_free_slots = 0;
-    page->free_slots = 0;
+    /*page->free_slots = 0;*/
 
     int page_rvalue_count = page->total_slots * slot_bits;
     int out_of_range_bits = (NUM_IN_PAGE(p) + page_rvalue_count) % BITS_BITLENGTH;
@@ -4694,18 +4694,19 @@ gc_sweep_step_worker(rb_objspace_t *objspace, rb_heap_t *heap)
                 // We're guaranteed to stay in background mode during this (starting GC requires taking the
                 // sweep_lock to change sweep background mode to false)
                 GC_ASSERT(sweep_page->pre_final_slots == 0);
+                if (pre_freed_slots > 0) {
+                    RUBY_ATOMIC_SIZE_ADD(sweep_page->heap->total_freed_objects, (size_t)pre_freed_slots);
+                }
                 clear_pre_sweep_fields(sweep_page);
                 gc_post_sweep_page(objspace, heap, sweep_page, true);
                 move_to_empty_pages(objspace, heap, sweep_page);
                 continue;
             }
             else if (free_slots > 0) {
-                // These are just for statistics, not used in calculations
                 RUBY_ATOMIC_SIZE_ADD(heap->freed_slots, sweep_page->pre_freed_slots);
                 RUBY_ATOMIC_SIZE_ADD(heap->empty_slots, sweep_page->pre_empty_slots);
-
-                sweep_page->free_slots = free_slots;
                 RUBY_ATOMIC_SIZE_ADD(sweep_page->heap->total_freed_objects, sweep_page->pre_freed_slots);
+                sweep_page->free_slots = free_slots;
                 clear_pre_sweep_fields(sweep_page);
                 gc_post_sweep_page(objspace, heap, sweep_page, false);
                 if (sweep_page->deferred_freelist) {
@@ -4737,6 +4738,7 @@ gc_sweep_step_worker(rb_objspace_t *objspace, rb_heap_t *heap)
             else {
                 // Don't even add to `swept_pages`, no further processing needed by ruby thread (no free slots)
                 clear_pre_sweep_fields(sweep_page);
+                sweep_page->free_slots = 0;
                 gc_post_sweep_page(objspace, heap, sweep_page, false);
                 continue;
             }
@@ -5354,7 +5356,6 @@ gc_sweep_step(rb_objspace_t *objspace, rb_heap_t *heap)
         }
         else if (free_slots > 0) {
             GC_ASSERT(free_slots < sweep_page->total_slots);
-            // These are just for statistics, not used in calculations
             RUBY_ATOMIC_SIZE_ADD(heap->freed_slots,  ctx.freed_slots);
             RUBY_ATOMIC_SIZE_ADD(heap->empty_slots,  ctx.empty_slots);
 
