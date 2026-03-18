@@ -2073,8 +2073,8 @@ heap_unlink_page(rb_objspace_t *objspace, rb_heap_t *heap, struct heap_page *pag
     ccan_list_del(&page->page_node);
     GC_ASSERT(heap->total_pages > 0);
     heap->total_pages--;
-    GC_ASSERT(heap->total_slots >= page->total_slots);
-    heap->total_slots -= page->total_slots;
+    GC_ASSERT((size_t)RUBY_ATOMIC_VALUE_LOAD(heap->total_slots) >= page->total_slots);
+    RUBY_ATOMIC_SIZE_SUB(heap->total_slots, page->total_slots);
 }
 
 static void
@@ -2380,7 +2380,7 @@ heap_add_page(rb_objspace_t *objspace, rb_heap_t *heap, struct heap_page *page, 
     if (!sweep_lock_taken) sweep_lock_unlock(&objspace->sweep_lock);
 
     heap->total_pages++;
-    heap->total_slots += page->total_slots;
+    RUBY_ATOMIC_SIZE_ADD(heap->total_slots, page->total_slots);
 }
 
 static int
@@ -2471,9 +2471,9 @@ heap_prepare(rb_objspace_t *objspace, rb_heap_t *heap)
         sweep_lock_unlock(&objspace->sweep_lock);
         return;
     }
-    if (heap->total_slots < gc_params.heap_init_slots[heap - heaps] &&
+    if ((size_t)RUBY_ATOMIC_VALUE_LOAD(heap->total_slots) < gc_params.heap_init_slots[heap - heaps] &&
             heap->sweeping_page == NULL && heap->swept_pages == NULL && !heap->pre_sweeping_page) {
-        psweep_debug(1, "[gc] heap_prepare: force allocate page (total_slots:%lu, init_slots:%lu)\n", heap->total_slots,
+        psweep_debug(1, "[gc] heap_prepare: force allocate page (total_slots:%lu, init_slots:%lu)\n", RUBY_ATOMIC_VALUE_LOAD(heap->total_slots),
                      gc_params.heap_init_slots[heap - heaps]);
         heap_page_allocate_and_initialize_force(objspace, heap, true);
         GC_ASSERT(heap->free_pages != NULL);
@@ -2504,7 +2504,7 @@ heap_prepare(rb_objspace_t *objspace, rb_heap_t *heap)
             if (objspace->heap_pages.allocatable_slots == 0 && !gc_config_full_mark_val) {
                 heap_allocatable_slots_expand(objspace, heap,
                         (size_t)RUBY_ATOMIC_VALUE_LOAD(heap->freed_slots) + (size_t)RUBY_ATOMIC_VALUE_LOAD(heap->empty_slots),
-                        heap->total_slots);
+                        (size_t)RUBY_ATOMIC_VALUE_LOAD(heap->total_slots));
                 GC_ASSERT(objspace->heap_pages.allocatable_slots > 0);
             }
             /* Do steps of incremental marking or lazy sweeping if the GC run permits. */
@@ -3584,7 +3584,7 @@ objspace_available_slots(rb_objspace_t *objspace)
     size_t total_slots = 0;
     for (int i = 0; i < HEAP_COUNT; i++) {
         rb_heap_t *heap = &heaps[i];
-        total_slots += heap->total_slots;
+        total_slots += (size_t)RUBY_ATOMIC_VALUE_LOAD(heap->total_slots);
     }
     return total_slots;
 }
@@ -5010,7 +5010,7 @@ gc_sweep_finish_heap(rb_objspace_t *objspace, rb_heap_t *heap)
             if (is_full_marking(objspace) ||
                     objspace->profile.count - objspace->rgengc.last_major_gc < RVALUE_OLD_AGE) {
                 if (objspace->heap_pages.allocatable_slots < min_free_slots) {
-                    heap_allocatable_slots_expand(objspace, heap, swept_slots, heap->total_slots);
+                    heap_allocatable_slots_expand(objspace, heap, swept_slots, (size_t)RUBY_ATOMIC_VALUE_LOAD(heap->total_slots));
                 }
             }
             else {
@@ -9340,10 +9340,10 @@ stat_one_heap(rb_heap_t *heap, VALUE hash, VALUE key)
 
     SET(slot_size, heap->slot_size);
     SET(heap_live_slots, heap->total_allocated_objects - (size_t)RUBY_ATOMIC_VALUE_LOAD(heap->total_freed_objects) - heap->final_slots_count);
-    SET(heap_free_slots, heap->total_slots - (heap->total_allocated_objects - (size_t)RUBY_ATOMIC_VALUE_LOAD(heap->total_freed_objects)));
+    SET(heap_free_slots, (size_t)RUBY_ATOMIC_VALUE_LOAD(heap->total_slots) - (heap->total_allocated_objects - (size_t)RUBY_ATOMIC_VALUE_LOAD(heap->total_freed_objects)));
     SET(heap_final_slots, heap->final_slots_count);
     SET(heap_eden_pages, heap->total_pages);
-    SET(heap_eden_slots, heap->total_slots);
+    SET(heap_eden_slots, (size_t)RUBY_ATOMIC_VALUE_LOAD(heap->total_slots));
     SET(total_allocated_pages, heap->total_allocated_pages);
     SET(force_major_gc_count, heap->force_major_gc_count);
     SET(force_incremental_marking_finish_count, heap->force_incremental_marking_finish_count);
