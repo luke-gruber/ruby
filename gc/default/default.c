@@ -1317,7 +1317,7 @@ total_freed_objects(rb_objspace_t *objspace)
     size_t count = 0;
     for (int i = 0; i < HEAP_COUNT; i++) {
         rb_heap_t *heap = &heaps[i];
-        count += heap->total_freed_objects;
+        count += (size_t)RUBY_ATOMIC_VALUE_LOAD(heap->total_freed_objects);
     }
     return count;
 }
@@ -2503,7 +2503,7 @@ heap_prepare(rb_objspace_t *objspace, rb_heap_t *heap)
         else {
             if (objspace->heap_pages.allocatable_slots == 0 && !gc_config_full_mark_val) {
                 heap_allocatable_slots_expand(objspace, heap,
-                        heap->freed_slots + heap->empty_slots,
+                        (size_t)RUBY_ATOMIC_VALUE_LOAD(heap->freed_slots) + (size_t)RUBY_ATOMIC_VALUE_LOAD(heap->empty_slots),
                         heap->total_slots);
                 GC_ASSERT(objspace->heap_pages.allocatable_slots > 0);
             }
@@ -3577,6 +3577,7 @@ rb_gc_impl_each_object(void *objspace_ptr, void (*func)(VALUE obj, void *data), 
 
 /* Sweeping */
 
+// total slots from all linked pages (doesn't include empty pages).
 static size_t
 objspace_available_slots(rb_objspace_t *objspace)
 {
@@ -3597,7 +3598,7 @@ objspace_live_slots(rb_objspace_t *objspace)
 static size_t
 objspace_free_slots(rb_objspace_t *objspace)
 {
-    return objspace_available_slots(objspace) - objspace_live_slots(objspace) - total_final_slots_count(objspace);
+    return objspace_available_slots(objspace) - objspace_live_slots(objspace);
 }
 
 static void
@@ -4267,7 +4268,7 @@ gc_sweep_page(rb_objspace_t *objspace, rb_heap_t *heap, struct gc_sweep_context 
                    sweep_page->total_slots,
                    ctx->freed_slots, ctx->empty_slots, ctx->final_slots);
 
-    sweep_page->heap->total_freed_objects += ctx->freed_slots;
+    RUBY_ATOMIC_SIZE_ADD(sweep_page->heap->total_freed_objects, ctx->freed_slots);
     sweep_page->free_slots = ctx->freed_slots + ctx->empty_slots;
 
     if (RUBY_ATOMIC_PTR_LOAD(heap_pages_deferred_final) && !finalizing) {
@@ -4699,11 +4700,11 @@ gc_sweep_step_worker(rb_objspace_t *objspace, rb_heap_t *heap)
             }
             else if (free_slots > 0) {
                 // These are just for statistics, not used in calculations
-                heap->freed_slots += sweep_page->pre_freed_slots;
-                heap->empty_slots += sweep_page->pre_empty_slots;
+                RUBY_ATOMIC_SIZE_ADD(heap->freed_slots, sweep_page->pre_freed_slots);
+                RUBY_ATOMIC_SIZE_ADD(heap->empty_slots, sweep_page->pre_empty_slots);
 
                 sweep_page->free_slots = free_slots;
-                sweep_page->heap->total_freed_objects += sweep_page->pre_freed_slots;
+                RUBY_ATOMIC_SIZE_ADD(sweep_page->heap->total_freed_objects, sweep_page->pre_freed_slots);
                 clear_pre_sweep_fields(sweep_page);
                 gc_post_sweep_page(objspace, heap, sweep_page, false);
                 if (sweep_page->deferred_freelist) {
@@ -5285,14 +5286,14 @@ gc_sweep_step(rb_objspace_t *objspace, rb_heap_t *heap)
 
         if (free_in_user_thread_p) {
             GC_ASSERT(sweep_page->free_slots == free_slots); // gc_sweep_page() sets sweep_page->free slots
-            GC_ASSERT(sweep_page->heap->total_freed_objects >= (unsigned long)ctx.freed_slots);
+            GC_ASSERT((unsigned long)RUBY_ATOMIC_VALUE_LOAD(sweep_page->heap->total_freed_objects) >= (unsigned long)ctx.freed_slots);
             GC_ASSERT(!sweep_page->deferred_freelist);
         } else {
             sweep_page->free_slots = free_slots;
             // NOTE: sweep_page->final slots have already been updated by make_zombie
             GC_ASSERT(sweep_page->free_slots <= sweep_page->total_slots);
             GC_ASSERT(sweep_page->final_slots <= sweep_page->total_slots);
-            sweep_page->heap->total_freed_objects += ctx.freed_slots;
+            RUBY_ATOMIC_SIZE_ADD(sweep_page->heap->total_freed_objects, ctx.freed_slots);
             // merge freelists
             asan_unlock_freelist(sweep_page);
             asan_unlock_deferred_freelist(sweep_page);
@@ -5344,8 +5345,8 @@ gc_sweep_step(rb_objspace_t *objspace, rb_heap_t *heap)
         }
         else if (free_slots > 0) {
             // These are just for statistics, not used in calculations
-            heap->freed_slots += ctx.freed_slots;
-            heap->empty_slots += ctx.empty_slots;
+            RUBY_ATOMIC_SIZE_ADD(heap->freed_slots,  ctx.freed_slots);
+            RUBY_ATOMIC_SIZE_ADD(heap->empty_slots,  ctx.empty_slots);
 
             if (pooled_slots < GC_INCREMENTAL_SWEEP_POOL_SLOT_COUNT) {
                 psweep_debug(0, "[gc] gc_sweep_step: adding pooled_page:%p, pooled_slots:%d\n", sweep_page, pooled_slots);
@@ -9338,8 +9339,8 @@ stat_one_heap(rb_heap_t *heap, VALUE hash, VALUE key)
         rb_hash_aset(hash, gc_stat_heap_symbols[gc_stat_heap_sym_##name], SIZET2NUM(attr));
 
     SET(slot_size, heap->slot_size);
-    SET(heap_live_slots, heap->total_allocated_objects - heap->total_freed_objects - heap->final_slots_count);
-    SET(heap_free_slots, heap->total_slots - (heap->total_allocated_objects - heap->total_freed_objects));
+    SET(heap_live_slots, heap->total_allocated_objects - (size_t)RUBY_ATOMIC_VALUE_LOAD(heap->total_freed_objects) - heap->final_slots_count);
+    SET(heap_free_slots, heap->total_slots - (heap->total_allocated_objects - (size_t)RUBY_ATOMIC_VALUE_LOAD(heap->total_freed_objects)));
     SET(heap_final_slots, heap->final_slots_count);
     SET(heap_eden_pages, heap->total_pages);
     SET(heap_eden_slots, heap->total_slots);
@@ -9347,7 +9348,7 @@ stat_one_heap(rb_heap_t *heap, VALUE hash, VALUE key)
     SET(force_major_gc_count, heap->force_major_gc_count);
     SET(force_incremental_marking_finish_count, heap->force_incremental_marking_finish_count);
     SET(total_allocated_objects, heap->total_allocated_objects);
-    SET(total_freed_objects, heap->total_freed_objects);
+    SET(total_freed_objects, (size_t)RUBY_ATOMIC_VALUE_LOAD(heap->total_freed_objects));
 #undef SET
 
     if (!NIL_P(key)) {
