@@ -4530,6 +4530,7 @@ gc_pre_sweep_page(rb_objspace_t *objspace, rb_heap_t *heap, struct heap_page *pa
     psweep_debug(1, "[sweep] gc_pre_sweep_page(heap:%p page:%p) start\n", heap, page);
     GC_ASSERT(page->heap == heap);
     page->pre_deferred_free_slots = 0;
+    page->free_slots = 0;
 
     int page_rvalue_count = page->total_slots * slot_bits;
     int out_of_range_bits = (NUM_IN_PAGE(p) + page_rvalue_count) % BITS_BITLENGTH;
@@ -5224,7 +5225,10 @@ gc_sweep_step(rb_objspace_t *objspace, rb_heap_t *heap)
         RUBY_DEBUG_LOG("sweep_page:%p", (void *)sweep_page);
 
         struct gc_sweep_context ctx = {
-            .page = sweep_page
+            .page = sweep_page,
+            .freed_slots = 0,
+            .final_slots = 0,
+            .empty_slots = 0
         };
 
         unsigned short deferred_free_final_slots = 0;
@@ -5290,6 +5294,11 @@ gc_sweep_step(rb_objspace_t *objspace, rb_heap_t *heap)
             GC_ASSERT(!sweep_page->deferred_freelist);
         } else {
             sweep_page->free_slots = free_slots;
+            if (sweep_page->free_slots < 0) {
+                fprintf(stderr, "ERROR\n");
+                exit(EXIT_FAILURE);
+            }
+            GC_ASSERT(sweep_page->free_slots > 0);
             // NOTE: sweep_page->final slots have already been updated by make_zombie
             GC_ASSERT(sweep_page->free_slots <= sweep_page->total_slots);
             GC_ASSERT(sweep_page->final_slots <= sweep_page->total_slots);
@@ -5344,6 +5353,7 @@ gc_sweep_step(rb_objspace_t *objspace, rb_heap_t *heap)
             move_to_empty_pages(objspace, heap, sweep_page);
         }
         else if (free_slots > 0) {
+            GC_ASSERT(free_slots < sweep_page->total_slots);
             // These are just for statistics, not used in calculations
             RUBY_ATOMIC_SIZE_ADD(heap->freed_slots,  ctx.freed_slots);
             RUBY_ATOMIC_SIZE_ADD(heap->empty_slots,  ctx.empty_slots);
@@ -9207,6 +9217,7 @@ rb_gc_impl_stat(void *objspace_ptr, VALUE hash_or_sym)
     rb_objspace_t *objspace = objspace_ptr;
     VALUE hash = Qnil, key = Qnil;
 
+    wait_for_background_sweeping_to_finish(objspace, true, false, "stat");
     setup_gc_stat_symbols();
 
     ractor_cache_flush_count(objspace, rb_gc_get_ractor_newobj_cache());
