@@ -239,15 +239,29 @@ rb_concurrent_set_find(VALUE *set_obj_ptr, VALUE key)
 
     while (true) {
         struct concurrent_set_entry *entry = &set->entries[idx];
-        VALUE curr_hash = rbimpl_atomic_value_load(&entry->hash, RBIMPL_ATOMIC_ACQUIRE);
-
-        if (curr_hash == CONCURRENT_SET_EMPTY) {
-            return 0;
-        }
-
         VALUE raw_key = rbimpl_atomic_value_load(&entry->key, RBIMPL_ATOMIC_ACQUIRE);
         bool continuation = raw_key & CONCURRENT_SET_CONTINUATION_BIT;
         VALUE curr_key = raw_key & CONCURRENT_SET_KEY_MASK;
+
+        if (curr_key == CONCURRENT_SET_EMPTY) {
+            if (!continuation) return 0;
+
+            idx = concurrent_set_probe_next(&probe);
+            continue;
+        }
+
+        if (curr_key == CONCURRENT_SET_MOVED) {
+            // Wait for resize to complete
+            rb_native_mutex_lock(&resize_lock);
+            rb_native_mutex_unlock(&resize_lock);
+            goto retry;
+        }
+
+        VALUE curr_hash = rbimpl_atomic_value_load(&entry->hash, RBIMPL_ATOMIC_ACQUIRE);
+
+        if (curr_key == CONCURRENT_SET_DELETED) {
+            return 0;
+        }
 
         if (curr_hash != hash) {
             if (!continuation) {
@@ -257,36 +271,25 @@ rb_concurrent_set_find(VALUE *set_obj_ptr, VALUE key)
             continue;
         }
 
-        switch (curr_key) {
-          case CONCURRENT_SET_EMPTY:
-            // In-progress insert: hash written but key not yet
-            break;
-          case CONCURRENT_SET_DELETED:
-            break;
-          case CONCURRENT_SET_MOVED:
-            // Wait
-            rb_native_mutex_lock(&resize_lock);
-            rb_native_mutex_unlock(&resize_lock);
-            goto retry;
-          default: {
-            if (UNLIKELY(!RB_SPECIAL_CONST_P(curr_key) && rb_objspace_garbage_object_p(curr_key))) {
-                // This is a weakref set, so after marking but before sweeping is complete we may find a matching garbage object.
-                // Skip it and let the GC pass clean it up
-                break;
-            }
+        // same hash, could still be different key
 
-            if (set->funcs->cmp(key, curr_key)) {
-                // We've found a match.
-                RB_GC_GUARD(set_obj);
-                return curr_key;
-            }
+        if (UNLIKELY(!RB_SPECIAL_CONST_P(curr_key) && rb_objspace_garbage_object_p(curr_key))) {
+            // This is a weakref set, so after marking but before sweeping is complete we may find a matching garbage object.
+            // Skip it and let the GC pass clean it up
+            if (!continuation) return 0;
 
-            if (!continuation) {
-                return 0;
-            }
+            idx = concurrent_set_probe_next(&probe);
+            continue;
+        }
 
-            break;
-          }
+        if (set->funcs->cmp(key, curr_key)) {
+            // We've found a match.
+            RB_GC_GUARD(set_obj);
+            return curr_key;
+        }
+
+        if (!continuation) {
+            return 0;
         }
 
         idx = concurrent_set_probe_next(&probe);
