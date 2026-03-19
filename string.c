@@ -610,13 +610,11 @@ rb_obj_is_fstring_table(VALUE obj)
 void
 rb_gc_free_fstring(VALUE obj)
 {
-    ASSERT_vm_locking_with_barrier();
-
     RUBY_ASSERT(FL_TEST(obj, RSTRING_FSTR));
     RUBY_ASSERT(OBJ_FROZEN(obj));
     RUBY_ASSERT(!FL_TEST(obj, STR_SHARED));
 
-    rb_concurrent_set_delete_by_identity(fstring_table_obj, obj);
+    rb_concurrent_set_delete_by_identity(fstring_table_obj, &fstring_table_obj, obj);
 
     RB_DEBUG_COUNTER_INC(obj_str_fstr);
 
@@ -627,7 +625,7 @@ void
 rb_fstring_foreach_with_replace(int (*callback)(VALUE *str, void *data), void *data)
 {
     if (fstring_table_obj) {
-        rb_concurrent_set_foreach_with_replace(fstring_table_obj, callback, data);
+        rb_concurrent_set_foreach_with_replace(fstring_table_obj, &fstring_table_obj, callback, data);
     }
 }
 
@@ -12774,7 +12772,7 @@ Init_String(void)
 {
     rb_cString  = rb_define_class("String", rb_cObject);
 
-    rb_concurrent_set_foreach_with_replace(fstring_table_obj, fstring_set_class_i, NULL);
+    rb_concurrent_set_foreach_with_replace(fstring_table_obj, &fstring_table_obj, fstring_set_class_i, NULL);
 
     rb_include_module(rb_cString, rb_mComparable);
     rb_define_alloc_func(rb_cString, empty_str_alloc);

@@ -393,7 +393,7 @@ rb_free_global_symbol_table_i(VALUE *sym_ptr, void *data)
 void
 rb_free_global_symbol_table(void)
 {
-    rb_concurrent_set_foreach_with_replace(ruby_global_symbols.sym_set, rb_free_global_symbol_table_i, NULL);
+    rb_concurrent_set_foreach_with_replace(ruby_global_symbols.sym_set, &ruby_global_symbols.sym_set, rb_free_global_symbol_table_i, NULL);
 }
 
 WARN_UNUSED_RESULT(static ID lookup_str_id(VALUE str));
@@ -913,7 +913,7 @@ rb_sym_global_symbol_table_foreach_weak_reference(int (*callback)(VALUE *key, vo
         .data = data,
     };
 
-    rb_concurrent_set_foreach_with_replace(ruby_global_symbols.sym_set, rb_sym_global_symbol_table_foreach_weak_reference_i, &foreach_data);
+    rb_concurrent_set_foreach_with_replace(ruby_global_symbols.sym_set, &ruby_global_symbols.sym_set, rb_sym_global_symbol_table_foreach_weak_reference_i, &foreach_data);
 }
 
 void
@@ -922,7 +922,7 @@ rb_gc_free_dsymbol(VALUE sym)
     VALUE str = RSYMBOL(sym)->fstr;
 
     if (str) {
-        rb_concurrent_set_delete_by_identity(ruby_global_symbols.sym_set, sym);
+        rb_concurrent_set_delete_by_identity(ruby_global_symbols.sym_set, &ruby_global_symbols.sym_set, sym);
 
         RSYMBOL(sym)->fstr = 0;
     }
@@ -1065,8 +1065,10 @@ rb_sym_all_symbols(void)
     VALUE ary;
 
     GLOBAL_SYMBOLS_LOCKING(symbols) {
+        rb_vm_barrier();
+
         ary = rb_ary_new2(rb_concurrent_set_size(symbols->sym_set));
-        rb_concurrent_set_foreach_with_replace(symbols->sym_set, symbols_i, (void *)ary);
+        rb_concurrent_set_foreach_with_replace(symbols->sym_set, &symbols->sym_set, symbols_i, (void *)ary);
     }
 
     return ary;
