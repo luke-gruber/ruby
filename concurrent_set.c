@@ -4,14 +4,14 @@
 #include "ruby/atomic.h"
 #include "vm_sync.h"
 
-#define CONCURRENT_SET_CONTINUATION_BIT ((VALUE)1 << (sizeof(VALUE) * CHAR_BIT - 1))
-#define CONCURRENT_SET_HASH_MASK (~CONCURRENT_SET_CONTINUATION_BIT)
+#define CONCURRENT_SET_CONTINUATION_BIT ((VALUE)0x2)
+#define CONCURRENT_SET_KEY_MASK (~CONCURRENT_SET_CONTINUATION_BIT)
 
 enum concurrent_set_special_values {
-    CONCURRENT_SET_EMPTY,
-    CONCURRENT_SET_DELETED,
-    CONCURRENT_SET_MOVED,
-    CONCURRENT_SET_SPECIAL_VALUE_COUNT
+    CONCURRENT_SET_EMPTY = 0,
+    CONCURRENT_SET_DELETED = 1,
+    CONCURRENT_SET_MOVED = 4,
+    CONCURRENT_SET_SPECIAL_VALUE_COUNT = 5,
 };
 
 struct concurrent_set_entry {
@@ -28,32 +28,24 @@ struct concurrent_set {
 };
 
 static void
-concurrent_set_mark_continuation(struct concurrent_set_entry *entry, VALUE curr_hash_and_flags)
+concurrent_set_mark_continuation(struct concurrent_set_entry *entry, VALUE curr_key)
 {
-    if (curr_hash_and_flags & CONCURRENT_SET_CONTINUATION_BIT) return;
+    if (curr_key & CONCURRENT_SET_CONTINUATION_BIT) return;
 
-    RUBY_ASSERT((curr_hash_and_flags & CONCURRENT_SET_HASH_MASK) != 0);
-
-    VALUE new_hash = curr_hash_and_flags | CONCURRENT_SET_CONTINUATION_BIT;
-    VALUE prev_hash = rbimpl_atomic_value_cas(&entry->hash, curr_hash_and_flags, new_hash, RBIMPL_ATOMIC_RELEASE, RBIMPL_ATOMIC_RELAXED);
-
-    // At the moment we only expect to be racing concurrently against another
-    // thread also setting the continuation bit.
-    // In the future if deletion is concurrent this will need adjusting
-    RUBY_ASSERT(prev_hash == curr_hash_and_flags || prev_hash == new_hash);
-    (void)prev_hash;
+    while (true) {
+        VALUE new_key = curr_key | CONCURRENT_SET_CONTINUATION_BIT;
+        VALUE prev_key = rbimpl_atomic_value_cas(&entry->key, curr_key, new_key, RBIMPL_ATOMIC_RELEASE, RBIMPL_ATOMIC_RELAXED);
+        if (prev_key == curr_key || (prev_key & CONCURRENT_SET_CONTINUATION_BIT)) return;
+        curr_key = prev_key;
+    }
 }
 
 static VALUE
 concurrent_set_hash(const struct concurrent_set *set, VALUE key)
 {
     VALUE hash = set->funcs->hash(key);
-    hash &= CONCURRENT_SET_HASH_MASK;
-    if (hash == 0) {
-        hash ^= CONCURRENT_SET_HASH_MASK;
-    }
+    if (hash == 0) hash = ~(VALUE)0;
     RUBY_ASSERT(hash != 0);
-    RUBY_ASSERT(!(hash & CONCURRENT_SET_CONTINUATION_BIT));
     return hash;
 }
 
@@ -168,13 +160,14 @@ concurrent_set_try_resize_without_locking(VALUE old_set_obj, VALUE *set_obj_ptr)
 
     for (int i = 0; i < old_capacity; i++) {
         struct concurrent_set_entry *old_entry = &old_entries[i];
-        VALUE key = rbimpl_atomic_value_exchange(&old_entry->key, CONCURRENT_SET_MOVED, RBIMPL_ATOMIC_ACQUIRE);
+        VALUE raw_key = rbimpl_atomic_value_exchange(&old_entry->key, CONCURRENT_SET_MOVED, RBIMPL_ATOMIC_ACQUIRE);
+        VALUE key = raw_key & CONCURRENT_SET_KEY_MASK;
         RUBY_ASSERT(key != CONCURRENT_SET_MOVED);
 
         if (key < CONCURRENT_SET_SPECIAL_VALUE_COUNT) continue;
         if (!RB_SPECIAL_CONST_P(key) && rb_objspace_garbage_object_p(key)) continue;
 
-        VALUE hash = rbimpl_atomic_value_load(&old_entry->hash, RBIMPL_ATOMIC_RELAXED) & CONCURRENT_SET_HASH_MASK;
+        VALUE hash = rbimpl_atomic_value_load(&old_entry->hash, RBIMPL_ATOMIC_RELAXED);
         RUBY_ASSERT(hash != 0);
         RUBY_ASSERT(hash == concurrent_set_hash(old_set, key));
 
@@ -196,8 +189,8 @@ concurrent_set_try_resize_without_locking(VALUE old_set_obj, VALUE *set_obj_ptr)
                 break;
             }
 
-            RUBY_ASSERT(entry->key >= CONCURRENT_SET_SPECIAL_VALUE_COUNT);
-            entry->hash |= CONCURRENT_SET_CONTINUATION_BIT;
+            RUBY_ASSERT((entry->key & CONCURRENT_SET_KEY_MASK) >= CONCURRENT_SET_SPECIAL_VALUE_COUNT);
+            entry->key |= CONCURRENT_SET_CONTINUATION_BIT;
             idx = concurrent_set_probe_next(&probe);
         }
     }
@@ -242,13 +235,15 @@ rb_concurrent_set_find(VALUE *set_obj_ptr, VALUE key)
 
     while (true) {
         struct concurrent_set_entry *entry = &set->entries[idx];
-        VALUE curr_hash_and_flags = rbimpl_atomic_value_load(&entry->hash, RBIMPL_ATOMIC_ACQUIRE);
-        VALUE curr_hash = curr_hash_and_flags & CONCURRENT_SET_HASH_MASK;
-        bool continuation = curr_hash_and_flags & CONCURRENT_SET_CONTINUATION_BIT;
+        VALUE curr_hash = rbimpl_atomic_value_load(&entry->hash, RBIMPL_ATOMIC_ACQUIRE);
 
-        if (curr_hash_and_flags == CONCURRENT_SET_EMPTY) {
+        if (curr_hash == CONCURRENT_SET_EMPTY) {
             return 0;
         }
+
+        VALUE raw_key = rbimpl_atomic_value_load(&entry->key, RBIMPL_ATOMIC_ACQUIRE);
+        bool continuation = raw_key & CONCURRENT_SET_CONTINUATION_BIT;
+        VALUE curr_key = raw_key & CONCURRENT_SET_KEY_MASK;
 
         if (curr_hash != hash) {
             if (!continuation) {
@@ -257,8 +252,6 @@ rb_concurrent_set_find(VALUE *set_obj_ptr, VALUE key)
             idx = concurrent_set_probe_next(&probe);
             continue;
         }
-
-        VALUE curr_key = rbimpl_atomic_value_load(&entry->key, RBIMPL_ATOMIC_ACQUIRE);
 
         switch (curr_key) {
           case CONCURRENT_SET_EMPTY:
@@ -333,30 +326,29 @@ start_search:
 
     while (true) {
         struct concurrent_set_entry *entry = &set->entries[idx];
-        VALUE curr_hash_and_flags = rbimpl_atomic_value_load(&entry->hash, RBIMPL_ATOMIC_ACQUIRE);
-        VALUE curr_hash = curr_hash_and_flags & CONCURRENT_SET_HASH_MASK;
-        bool continuation = curr_hash_and_flags & CONCURRENT_SET_CONTINUATION_BIT;
+        VALUE curr_hash = rbimpl_atomic_value_load(&entry->hash, RBIMPL_ATOMIC_ACQUIRE);
 
-        if (curr_hash_and_flags == CONCURRENT_SET_EMPTY) {
+        if (curr_hash == CONCURRENT_SET_EMPTY) {
             // Reserve this slot for our hash value
-            curr_hash_and_flags = rbimpl_atomic_value_cas(&entry->hash, CONCURRENT_SET_EMPTY, hash, RBIMPL_ATOMIC_RELEASE, RBIMPL_ATOMIC_RELAXED);
-            if (curr_hash_and_flags != CONCURRENT_SET_EMPTY) {
+            curr_hash = rbimpl_atomic_value_cas(&entry->hash, CONCURRENT_SET_EMPTY, hash, RBIMPL_ATOMIC_RELEASE, RBIMPL_ATOMIC_RELAXED);
+            if (curr_hash != CONCURRENT_SET_EMPTY) {
                 // Lost race, retry same slot to check winner's hash
                 continue;
             }
 
-            // CAS succeeded, so these are the values stored
-            curr_hash_and_flags = hash;
+            // CAS succeeded
             curr_hash = hash;
 
             // Fall through to try to claim key
         }
 
+        VALUE raw_key = rbimpl_atomic_value_load(&entry->key, RBIMPL_ATOMIC_ACQUIRE);
+        bool continuation = raw_key & CONCURRENT_SET_CONTINUATION_BIT;
+        VALUE curr_key = raw_key & CONCURRENT_SET_KEY_MASK;
+
         if (curr_hash != hash) {
             goto probe_next;
         }
-
-        VALUE curr_key = rbimpl_atomic_value_load(&entry->key, RBIMPL_ATOMIC_ACQUIRE);
 
         switch (curr_key) {
           case CONCURRENT_SET_EMPTY: {
@@ -370,8 +362,9 @@ start_search:
                 goto retry;
             }
 
-            VALUE prev_key = rbimpl_atomic_value_cas(&entry->key, CONCURRENT_SET_EMPTY, key, RBIMPL_ATOMIC_RELEASE, RBIMPL_ATOMIC_RELAXED);
-            if (prev_key == CONCURRENT_SET_EMPTY) {
+            VALUE new_key = key | (raw_key & CONCURRENT_SET_CONTINUATION_BIT);
+            VALUE prev_key = rbimpl_atomic_value_cas(&entry->key, raw_key, new_key, RBIMPL_ATOMIC_RELEASE, RBIMPL_ATOMIC_RELAXED);
+            if (prev_key == raw_key) {
                 RUBY_ASSERT(rb_concurrent_set_find(set_obj_ptr, key) == key);
                 RB_GC_GUARD(set_obj);
                 return key;
@@ -399,7 +392,7 @@ start_search:
                 if (continuation) {
                     goto probe_next;
                 }
-                rbimpl_atomic_value_cas(&entry->key, curr_key, CONCURRENT_SET_EMPTY, RBIMPL_ATOMIC_RELEASE, RBIMPL_ATOMIC_RELAXED);
+                rbimpl_atomic_value_cas(&entry->key, raw_key, CONCURRENT_SET_EMPTY, RBIMPL_ATOMIC_RELEASE, RBIMPL_ATOMIC_RELAXED);
                 continue;
             }
 
@@ -418,8 +411,7 @@ start_search:
         }
 
       probe_next:
-        RUBY_ASSERT(curr_hash_and_flags != CONCURRENT_SET_EMPTY);
-        concurrent_set_mark_continuation(entry, curr_hash_and_flags);
+        concurrent_set_mark_continuation(entry, raw_key);
         idx = concurrent_set_probe_next(&probe);
     }
 }
@@ -429,9 +421,8 @@ concurrent_set_delete_entry_locked(struct concurrent_set *set, struct concurrent
 {
     ASSERT_vm_locking_with_barrier();
 
-    if (entry->hash & CONCURRENT_SET_CONTINUATION_BIT) {
-        entry->hash = CONCURRENT_SET_CONTINUATION_BIT;
-        entry->key = CONCURRENT_SET_DELETED;
+    if (entry->key & CONCURRENT_SET_CONTINUATION_BIT) {
+        entry->key = CONCURRENT_SET_DELETED | CONCURRENT_SET_CONTINUATION_BIT;
         set->deleted_entries++;
     }
     else {
@@ -455,7 +446,8 @@ rb_concurrent_set_delete_by_identity(VALUE set_obj, VALUE key)
 
     while (true) {
         struct concurrent_set_entry *entry = &set->entries[idx];
-        VALUE curr_key = entry->key;
+        VALUE raw_key = entry->key;
+        VALUE curr_key = raw_key & CONCURRENT_SET_KEY_MASK;
 
         switch (curr_key) {
           case CONCURRENT_SET_EMPTY:
@@ -468,7 +460,7 @@ rb_concurrent_set_delete_by_identity(VALUE set_obj, VALUE key)
             break;
           default:
             if (key == curr_key) {
-                RUBY_ASSERT((entry->hash & CONCURRENT_SET_HASH_MASK) == hash);
+                RUBY_ASSERT(entry->hash == hash);
                 concurrent_set_delete_entry_locked(set, entry);
                 return curr_key;
             }
@@ -488,7 +480,9 @@ rb_concurrent_set_foreach_with_replace(VALUE set_obj, int (*callback)(VALUE *key
 
     for (unsigned int i = 0; i < set->capacity; i++) {
         struct concurrent_set_entry *entry = &set->entries[i];
-        VALUE key = entry->key;
+        VALUE raw_key = entry->key;
+        bool continuation = raw_key & CONCURRENT_SET_CONTINUATION_BIT;
+        VALUE key = raw_key & CONCURRENT_SET_KEY_MASK;
 
         switch (key) {
           case CONCURRENT_SET_EMPTY:
@@ -498,7 +492,12 @@ rb_concurrent_set_foreach_with_replace(VALUE set_obj, int (*callback)(VALUE *key
             rb_bug("rb_concurrent_set_foreach_with_replace: moved entry");
             break;
           default: {
-            int ret = callback(&entry->key, data);
+            VALUE cb_key = key;
+            int ret = callback(&cb_key, data);
+            if (cb_key != key) {
+                // Key was replaced by callback
+                entry->key = cb_key | (continuation ? CONCURRENT_SET_CONTINUATION_BIT : 0);
+            }
             switch (ret) {
               case ST_STOP:
                 return;
