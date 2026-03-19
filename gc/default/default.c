@@ -4701,13 +4701,14 @@ gc_sweep_step_worker(rb_objspace_t *objspace, rb_heap_t *heap)
                 // We're guaranteed to stay in background mode during this (starting GC requires taking the
                 // sweep_lock to change sweep background mode to false)
                 GC_ASSERT(sweep_page->pre_final_slots == 0);
-                if (pre_freed_slots > 0) {
-                    RUBY_ATOMIC_SIZE_ADD(sweep_page->heap->total_freed_objects, (size_t)pre_freed_slots);
-                }
-                clear_pre_sweep_fields(sweep_page);
-                gc_post_sweep_page(objspace, heap, sweep_page, true);
-                move_to_empty_pages(objspace, heap, sweep_page);
-                continue;
+                /*if (pre_freed_slots > 0) {*/
+                    /*RUBY_ATOMIC_SIZE_ADD(sweep_page->heap->total_freed_objects, (size_t)pre_freed_slots);*/
+                /*}*/
+                /*clear_pre_sweep_fields(sweep_page);*/
+                /*gc_post_sweep_page(objspace, heap, sweep_page, true);*/
+                /*move_to_empty_pages(objspace, heap, sweep_page);*/
+                /*continue;*/
+                // Let the ruby GC thread deal with adding it to empty pages list
             }
             else if (free_slots > 0) {
                 RUBY_ATOMIC_SIZE_ADD(heap->freed_slots, sweep_page->pre_freed_slots);
@@ -4782,7 +4783,12 @@ gc_sweep_step_worker(rb_objspace_t *objspace, rb_heap_t *heap)
             }
         }
         else {
-            heap->pre_swept_slots_deferred += free_slots;
+            if (free_slots == sweep_page->total_slots && sweep_page->pre_deferred_free_slots == 0) {
+                // do nothing
+            }
+            else {
+                heap->pre_swept_slots_deferred += free_slots;
+            }
             if (RB_UNLIKELY(objspace->background_sweep_abort)) {
                 psweep_debug(-2, "[sweep] (bg) gc_sweep_step_worker: break early heap:%p (%ld) (abort)\n", heap, heap - heaps);
                 break;
