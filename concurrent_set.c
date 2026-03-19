@@ -22,7 +22,7 @@ struct concurrent_set_entry {
 struct concurrent_set {
     rb_atomic_t size;
     unsigned int capacity;
-    unsigned int deleted_entries;
+    rb_atomic_t deleted_entries;
     const struct rb_concurrent_set_funcs *funcs;
     struct concurrent_set_entry *entries;
 };
@@ -141,7 +141,7 @@ concurrent_set_try_resize_without_locking(VALUE old_set_obj, VALUE *set_obj_ptr)
 
     // This may overcount by up to the number of threads concurrently attempting to insert
     // GC may also happen between now and the set being rebuilt
-    int expected_size = rbimpl_atomic_load(&old_set->size, RBIMPL_ATOMIC_RELAXED) - old_set->deleted_entries;
+    int expected_size = rbimpl_atomic_load(&old_set->size, RBIMPL_ATOMIC_RELAXED) - rbimpl_atomic_load(&old_set->deleted_entries, RBIMPL_ATOMIC_RELAXED);
 
     // NOTE: new capacity must make sense with load factor, don't change one without checking the other.
     struct concurrent_set_entry *old_entries = old_set->entries;
@@ -435,8 +435,6 @@ concurrent_set_delete_entry_locked(struct concurrent_set *set, struct concurrent
 VALUE
 rb_concurrent_set_delete_by_identity(VALUE set_obj, VALUE key)
 {
-    ASSERT_vm_locking_with_barrier();
-
     struct concurrent_set *set = RTYPEDDATA_GET_DATA(set_obj);
 
     VALUE hash = concurrent_set_hash(set, key);
@@ -446,7 +444,7 @@ rb_concurrent_set_delete_by_identity(VALUE set_obj, VALUE key)
 
     while (true) {
         struct concurrent_set_entry *entry = &set->entries[idx];
-        VALUE raw_key = entry->key;
+        VALUE raw_key = rbimpl_atomic_value_load(&entry->key, RBIMPL_ATOMIC_ACQUIRE);
         VALUE curr_key = raw_key & CONCURRENT_SET_KEY_MASK;
 
         switch (curr_key) {
@@ -461,8 +459,29 @@ rb_concurrent_set_delete_by_identity(VALUE set_obj, VALUE key)
           default:
             if (key == curr_key) {
                 RUBY_ASSERT(entry->hash == hash);
-                concurrent_set_delete_entry_locked(set, entry);
-                return curr_key;
+
+                VALUE new_key;
+                if (raw_key & CONCURRENT_SET_CONTINUATION_BIT) {
+                    new_key = CONCURRENT_SET_DELETED | CONCURRENT_SET_CONTINUATION_BIT;
+                }
+                else {
+                    new_key = CONCURRENT_SET_EMPTY;
+                }
+
+                VALUE prev_key = rbimpl_atomic_value_cas(&entry->key, raw_key, new_key, RBIMPL_ATOMIC_RELEASE, RBIMPL_ATOMIC_RELAXED);
+                if (prev_key == raw_key) {
+                    if (raw_key & CONCURRENT_SET_CONTINUATION_BIT) {
+                        rbimpl_atomic_add(&set->deleted_entries, 1, RBIMPL_ATOMIC_RELAXED);
+                    }
+                    else {
+                        rbimpl_atomic_sub(&set->size, 1, RBIMPL_ATOMIC_RELAXED);
+                    }
+                    return curr_key;
+                }
+
+                // CAS failed - likely the continuation bit was added concurrently.
+                // Retry at the same slot.
+                continue;
             }
             break;
         }
