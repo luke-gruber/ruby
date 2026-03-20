@@ -357,7 +357,7 @@ start_search:
             }
 
             // Claim the slot by setting the key.
-            VALUE new_key = key | (raw_key & CONCURRENT_SET_CONTINUATION_BIT);
+            VALUE new_key = key | (continuation ? CONCURRENT_SET_CONTINUATION_BIT : 0);
             VALUE prev_key = rbimpl_atomic_value_cas(&entry->key, raw_key, new_key, RBIMPL_ATOMIC_RELEASE, RBIMPL_ATOMIC_RELAXED);
             if (prev_key == raw_key) {
                 // Slot claimed. Now set the hash.
@@ -548,6 +548,7 @@ rb_concurrent_set_foreach_with_replace_locked(VALUE set_obj, int (*callback)(VAL
                 if (cb_key != key) {
                     // Key was replaced by callback
                     entry->key = cb_key | (continuation ? CONCURRENT_SET_CONTINUATION_BIT : 0);
+                    entry->hash = concurrent_set_hash(set, cb_key);
                 }
                 break;
             }
