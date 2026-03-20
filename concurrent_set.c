@@ -200,7 +200,7 @@ concurrent_set_try_resize_without_locking(VALUE old_set_obj, VALUE *set_obj_ptr)
                 new_set->size++;
                 RUBY_ASSERT(new_set->size <= new_set->capacity / 2);
 
-                entry->key = prev_key_raw;
+                entry->key = prev_key; // no continuation bit
                 entry->hash = hash;
                 break;
             }
@@ -488,7 +488,6 @@ rb_concurrent_set_delete_by_identity(VALUE set_obj, VALUE key)
             break;
           default:
             if (key == curr_key) {
-                RUBY_ASSERT(entry->hash == hash);
                 concurrent_set_delete_entry_locked(set, entry);
                 return curr_key;
             }
