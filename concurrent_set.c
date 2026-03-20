@@ -249,15 +249,16 @@ rb_concurrent_set_find(VALUE *set_obj_ptr, VALUE key)
             continue;
         }
 
+        if (curr_key == CONCURRENT_SET_DELETED) {
+            idx = concurrent_set_probe_next(&probe);
+            continue;
+        }
+
         if (curr_key == CONCURRENT_SET_MOVED) {
             // Wait for resize to complete
             rb_native_mutex_lock(&resize_lock);
             rb_native_mutex_unlock(&resize_lock);
             goto retry;
-        }
-
-        if (curr_key == CONCURRENT_SET_DELETED) {
-            return 0;
         }
 
         VALUE curr_hash = rbimpl_atomic_value_load(&entry->hash, RBIMPL_ATOMIC_ACQUIRE);
@@ -388,6 +389,7 @@ start_search:
             if (continuation) {
                 goto probe_next;
             }
+            rbimpl_atomic_value_cas(&entry->hash, curr_hash, CONCURRENT_SET_EMPTY, RBIMPL_ATOMIC_RELEASE, RBIMPL_ATOMIC_RELAXED);
             rbimpl_atomic_value_cas(&entry->key, raw_key, CONCURRENT_SET_EMPTY, RBIMPL_ATOMIC_RELEASE, RBIMPL_ATOMIC_RELAXED);
             continue;
         }
@@ -440,12 +442,13 @@ rb_concurrent_set_delete_by_identity_locked(VALUE set_obj, VALUE key)
     while (true) {
         struct concurrent_set_entry *entry = &set->entries[idx];
         VALUE raw_key = rbimpl_atomic_value_load(&entry->key, RBIMPL_ATOMIC_ACQUIRE);
+        bool continuation = raw_key & CONCURRENT_SET_CONTINUATION_BIT;
         VALUE curr_key = raw_key & CONCURRENT_SET_KEY_MASK;
 
         switch (curr_key) {
           case CONCURRENT_SET_EMPTY:
-            // We didn't find our entry to delete.
-            return 0;
+            if (!continuation) return 0;
+            break;
           case CONCURRENT_SET_DELETED:
             break;
           case CONCURRENT_SET_MOVED:
@@ -455,13 +458,13 @@ rb_concurrent_set_delete_by_identity_locked(VALUE set_obj, VALUE key)
             if (key == curr_key) {
                 RUBY_ASSERT(entry->hash == hash);
 
-                if (!(raw_key & CONCURRENT_SET_CONTINUATION_BIT)) {
+                if (!continuation) {
                     // Clear hash first so the slot is clean when key becomes EMPTY.
                     rbimpl_atomic_value_cas(&entry->hash, hash, CONCURRENT_SET_EMPTY, RBIMPL_ATOMIC_RELEASE, RBIMPL_ATOMIC_RELAXED);
                 }
 
                 VALUE new_key;
-                if (raw_key & CONCURRENT_SET_CONTINUATION_BIT) {
+                if (continuation) {
                     new_key = CONCURRENT_SET_DELETED | CONCURRENT_SET_CONTINUATION_BIT;
                 }
                 else {
@@ -470,7 +473,7 @@ rb_concurrent_set_delete_by_identity_locked(VALUE set_obj, VALUE key)
 
                 VALUE prev_key = rbimpl_atomic_value_cas(&entry->key, raw_key, new_key, RBIMPL_ATOMIC_RELEASE, RBIMPL_ATOMIC_RELAXED);
                 if (prev_key == raw_key) {
-                    if (raw_key & CONCURRENT_SET_CONTINUATION_BIT) {
+                    if (continuation) {
                         rbimpl_atomic_add(&set->deleted_entries, 1, RBIMPL_ATOMIC_RELAXED);
                     }
                     else {
@@ -479,10 +482,7 @@ rb_concurrent_set_delete_by_identity_locked(VALUE set_obj, VALUE key)
                     return curr_key;
                 }
 
-                // CAS failed - continuation bit was added concurrently.
-                // Hash was already cleared but that's fine: the entry is
-                // invisible to finds (hash=0) and we'll now take the
-                // continuation path on retry.
+                // CAS failed - we can assume key has valid hash now. Retry.
                 continue;
             }
             break;
