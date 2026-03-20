@@ -186,7 +186,7 @@ concurrent_set_try_resize_locked(VALUE old_set_obj, VALUE *set_obj_ptr)
                 new_set->size++;
                 RUBY_ASSERT(new_set->size <= new_set->capacity / 2);
 
-                entry->key = raw_key;
+                entry->key = key; // without continuation bit
                 entry->hash = hash;
                 break;
             }
