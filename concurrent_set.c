@@ -175,16 +175,12 @@ concurrent_set_try_resize_without_locking(VALUE old_set_obj, VALUE *set_obj_ptr)
         VALUE prev_key = prev_key_raw & CONCURRENT_SET_KEY_MASK;
         RUBY_ASSERT(prev_key != CONCURRENT_SET_MOVED);
 
-        if (prev_key_raw < CONCURRENT_SET_SPECIAL_VALUE_COUNT) continue;
+        if (prev_key < CONCURRENT_SET_SPECIAL_VALUE_COUNT) continue;
 
         if (!RB_SPECIAL_CONST_P(prev_key) && rb_objspace_garbage_object_p(prev_key)) continue;
 
         VALUE hash = rbimpl_atomic_value_load(&old_entry->hash, RBIMPL_ATOMIC_RELAXED);
         RUBY_ASSERT(hash != 0);
-        VALUE calc = concurrent_set_hash(old_set, prev_key);
-        if (hash != calc) {
-            fprintf(stderr, "hash: %lx (%p), calc: %lx (%p)\n", hash, (void*)hash, calc, (void*)calc);
-        }
         RUBY_ASSERT(hash == concurrent_set_hash(old_set, prev_key));
 
         // Insert key into new_set.
@@ -256,7 +252,6 @@ rb_concurrent_set_find(VALUE *set_obj_ptr, VALUE key)
         if (curr_hash == CONCURRENT_SET_EMPTY) {
             return 0;
         }
-
 
         VALUE raw_key = rbimpl_atomic_value_load(&entry->key, RBIMPL_ATOMIC_ACQUIRE);
         VALUE curr_key = raw_key & CONCURRENT_SET_KEY_MASK;
@@ -488,6 +483,7 @@ rb_concurrent_set_delete_by_identity(VALUE set_obj, VALUE key)
             break;
           default:
             if (key == curr_key) {
+                RUBY_ASSERT(entry->hash == hash);
                 concurrent_set_delete_entry_locked(set, entry);
                 return curr_key;
             }
@@ -528,11 +524,14 @@ rb_concurrent_set_foreach_with_replace(VALUE set_obj, int (*callback)(VALUE *key
               case ST_DELETE:
                 concurrent_set_delete_entry_locked(set, entry);
                 break;
-              case ST_REPLACE: {
+              case ST_CONTINUE: { // compaction callback uses ST_CONTINUE
                 if (orig_key != cb_key) {
                   entry->key = cb_key | (continuation ? CONCURRENT_SET_CONTINUATION_BIT : 0);
                 }
+                break;
               }
+              case ST_REPLACE:
+                rb_bug("unexpected callback return value: ST_REPLACE");
             }
             break;
           }
