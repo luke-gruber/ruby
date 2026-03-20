@@ -28,15 +28,15 @@ struct concurrent_set {
 };
 
 static void
-concurrent_set_mark_continuation(struct concurrent_set_entry *entry, VALUE curr_key)
+concurrent_set_mark_continuation(struct concurrent_set_entry *entry, VALUE raw_key)
 {
-    if (curr_key & CONCURRENT_SET_CONTINUATION_BIT) return;
+    if (raw_key & CONCURRENT_SET_CONTINUATION_BIT) return;
 
     while (true) {
-        VALUE new_key = curr_key | CONCURRENT_SET_CONTINUATION_BIT;
-        VALUE prev_key = rbimpl_atomic_value_cas(&entry->key, curr_key, new_key, RBIMPL_ATOMIC_RELEASE, RBIMPL_ATOMIC_RELAXED);
-        if (prev_key == curr_key || (prev_key & CONCURRENT_SET_CONTINUATION_BIT)) return;
-        curr_key = prev_key;
+        VALUE new_key = raw_key | CONCURRENT_SET_CONTINUATION_BIT;
+        VALUE prev_key = rbimpl_atomic_value_cas(&entry->key, raw_key, new_key, RBIMPL_ATOMIC_RELEASE, RBIMPL_ATOMIC_RELAXED);
+        if (prev_key == raw_key || (prev_key & CONCURRENT_SET_CONTINUATION_BIT)) return;
+        raw_key = prev_key;
     }
 }
 
@@ -200,15 +200,52 @@ concurrent_set_try_resize_locked(VALUE old_set_obj, VALUE *set_obj_ptr)
 
 // FIXME: cross-platform initializer
 static rb_nativethread_lock_t resize_lock = PTHREAD_MUTEX_INITIALIZER;
+#ifdef RUBY_THREAD_PTHREAD_H
+static pthread_t resize_lock_owner;
+#endif
+static unsigned int resize_lock_lvl;
+
+static inline void
+resize_lock_lock(bool allow_reentry)
+{
+#ifdef RUBY_THREAD_PTHREAD_H
+    if (allow_reentry && pthread_self() == resize_lock_owner) {
+        // Already held by this thread.
+    }
+    else {
+        rb_native_mutex_lock(&resize_lock);
+        resize_lock_owner = pthread_self();
+    }
+#else
+    rb_native_mutex_lock(&resize_lock);
+#endif
+    resize_lock_lvl++;
+}
+
+static inline void
+resize_lock_unlock(void)
+{
+    RUBY_ASSERT(resize_lock_lvl > 0);
+    resize_lock_lvl--;
+    if (resize_lock_lvl == 0) {
+#ifdef RUBY_THREAD_PTHREAD_H
+        resize_lock_owner = 0;
+#endif
+        rb_native_mutex_unlock(&resize_lock);
+    }
+}
 
 static void
 concurrent_set_try_resize(VALUE old_set_obj, VALUE *set_obj_ptr)
 {
-    rb_native_mutex_lock(&resize_lock);
-    {
-        concurrent_set_try_resize_locked(old_set_obj, set_obj_ptr);
+    RB_VM_LOCKING() {
+        // deletes from sweep thread must not happen during resize and sweep thread can't take VM lock
+        resize_lock_lock(false);
+        {
+            concurrent_set_try_resize_locked(old_set_obj, set_obj_ptr);
+        }
+        resize_lock_unlock();
     }
-    rb_native_mutex_unlock(&resize_lock);
 }
 
 VALUE
@@ -256,12 +293,17 @@ rb_concurrent_set_find(VALUE *set_obj_ptr, VALUE key)
 
         if (curr_key == CONCURRENT_SET_MOVED) {
             // Wait for resize to complete
-            rb_native_mutex_lock(&resize_lock);
-            rb_native_mutex_unlock(&resize_lock);
+            RB_VM_LOCKING() {}
             goto retry;
         }
 
         VALUE curr_hash = rbimpl_atomic_value_load(&entry->hash, RBIMPL_ATOMIC_ACQUIRE);
+
+        // Another thread may have CAS'd the key but not yet stored the hash.
+        // Spin until the hash is visible (the window is ~1 instruction).
+        if (UNLIKELY(curr_hash == 0)) {
+            goto retry;
+        }
 
         if (curr_hash != hash) {
             if (!continuation) {
@@ -339,8 +381,7 @@ start_search:
 
         if (curr_key == CONCURRENT_SET_MOVED) {
             // Wait for resize to complete
-            rb_native_mutex_lock(&resize_lock);
-            rb_native_mutex_unlock(&resize_lock);
+            RB_VM_LOCKING() {}
             goto retry;
         }
 
@@ -381,6 +422,13 @@ start_search:
 
         // curr_key is a real key
         VALUE curr_hash = rbimpl_atomic_value_load(&entry->hash, RBIMPL_ATOMIC_ACQUIRE);
+
+        // Another thread may have CAS'd the key but not yet stored the hash.
+        // Spin until the hash is visible (the window is ~1 instruction).
+        if (UNLIKELY(curr_hash == 0)) {
+            goto retry;
+        }
+
         if (curr_hash != hash) {
             goto probe_next;
         }
@@ -497,7 +545,8 @@ rb_concurrent_set_delete_by_identity(VALUE set_obj, VALUE *set_obj_ptr, VALUE ke
 {
     VALUE result;
     while (1) {
-        rb_native_mutex_lock(&resize_lock);
+        // this can be called by sweep thread, so we need to make sure no resize or replace is taking place on the object
+        resize_lock_lock(true);
         {
             VALUE new_set_obj;
             if ((new_set_obj = rbimpl_atomic_value_load(set_obj_ptr, RBIMPL_ATOMIC_ACQUIRE)) != set_obj) {
@@ -506,11 +555,11 @@ rb_concurrent_set_delete_by_identity(VALUE set_obj, VALUE *set_obj_ptr, VALUE ke
             }
             else {
                 result = rb_concurrent_set_delete_by_identity_locked(set_obj, key);
-                rb_native_mutex_unlock(&resize_lock);
+                resize_lock_unlock();
                 break;
             }
         }
-        rb_native_mutex_unlock(&resize_lock);
+        resize_lock_unlock();
     }
     return result;
 }
@@ -561,20 +610,11 @@ rb_concurrent_set_foreach_with_replace_locked(VALUE set_obj, int (*callback)(VAL
 void
 rb_concurrent_set_foreach_with_replace(VALUE set_obj, VALUE *set_obj_ptr, int (*callback)(VALUE *key, void *data), void *data)
 {
-    while (1) {
-        rb_native_mutex_lock(&resize_lock); // TODO: make it take rwlock_wrlock
+    RB_VM_LOCKING() {
+        resize_lock_lock(true); // don't allow concurrent deletes from sweep thread during this time
         {
-            VALUE new_set_obj;
-            if ((new_set_obj = rbimpl_atomic_value_load(set_obj_ptr, RBIMPL_ATOMIC_ACQUIRE)) != set_obj) {
-                set_obj = new_set_obj;
-                // retry
-            }
-            else {
-                rb_concurrent_set_foreach_with_replace_locked(set_obj, callback, data);
-                rb_native_mutex_unlock(&resize_lock);
-                break;
-            }
+            rb_concurrent_set_foreach_with_replace_locked(set_obj, callback, data);
         }
-        rb_native_mutex_unlock(&resize_lock);
+        resize_lock_unlock();
     }
 }
