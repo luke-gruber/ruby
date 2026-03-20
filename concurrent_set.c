@@ -199,39 +199,59 @@ concurrent_set_try_resize_locked(VALUE old_set_obj, VALUE *set_obj_ptr)
 }
 
 // FIXME: cross-platform initializer
-static rb_nativethread_lock_t resize_lock = PTHREAD_MUTEX_INITIALIZER;
-#ifdef RUBY_THREAD_PTHREAD_H
+static pthread_rwlock_t resize_lock = PTHREAD_RWLOCK_INITIALIZER;
 static pthread_t resize_lock_owner;
-#endif
 static unsigned int resize_lock_lvl;
 
 static inline void
-resize_lock_lock(bool allow_reentry)
+resize_lock_wrlock(bool allow_reentry)
 {
-#ifdef RUBY_THREAD_PTHREAD_H
     if (allow_reentry && pthread_self() == resize_lock_owner) {
         // Already held by this thread.
     }
     else {
-        rb_native_mutex_lock(&resize_lock);
+        int r;
+        if ((r = pthread_rwlock_wrlock(&resize_lock))) {
+            rb_bug_errno("pthread_rwlock_wrlock", r);
+        }
         resize_lock_owner = pthread_self();
     }
-#else
-    rb_native_mutex_lock(&resize_lock);
-#endif
     resize_lock_lvl++;
 }
 
 static inline void
-resize_lock_unlock(void)
+resize_lock_wrunlock(void)
 {
     RUBY_ASSERT(resize_lock_lvl > 0);
     resize_lock_lvl--;
     if (resize_lock_lvl == 0) {
-#ifdef RUBY_THREAD_PTHREAD_H
         resize_lock_owner = 0;
-#endif
-        rb_native_mutex_unlock(&resize_lock);
+        int r;
+        if ((r = pthread_rwlock_unlock(&resize_lock))) {
+            rb_bug_errno("pthread_rwlock_unlock", r);
+        }
+    }
+}
+
+static inline bool
+resize_lock_rdlock(void)
+{
+    if (resize_lock_owner == pthread_self()) { // we have the write lock, don't take it
+        return false;
+    }
+    int r;
+    if ((r = pthread_rwlock_rdlock(&resize_lock))) {
+        rb_bug_errno("pthread_rwlock_rdlock", r);
+    }
+    return true;
+}
+
+static inline void
+resize_lock_rdunlock(void)
+{
+    int r;
+    if ((r = pthread_rwlock_unlock(&resize_lock))) {
+        rb_bug_errno("pthread_rwlock_unlock", r);
     }
 }
 
@@ -240,11 +260,11 @@ concurrent_set_try_resize(VALUE old_set_obj, VALUE *set_obj_ptr)
 {
     RB_VM_LOCKING() {
         // deletes from sweep thread must not happen during resize and sweep thread can't take VM lock
-        resize_lock_lock(false);
+        resize_lock_wrlock(false);
         {
             concurrent_set_try_resize_locked(old_set_obj, set_obj_ptr);
         }
-        resize_lock_unlock();
+        resize_lock_wrunlock();
     }
 }
 
@@ -540,13 +560,14 @@ rb_concurrent_set_delete_by_identity_locked(VALUE set_obj, VALUE key)
     }
 }
 
+// This can be called concurrently by a ruby GC thread and the sweep thread.
 VALUE
 rb_concurrent_set_delete_by_identity(VALUE set_obj, VALUE *set_obj_ptr, VALUE key)
 {
     VALUE result;
     while (1) {
         // this can be called by sweep thread, so we need to make sure no resize or replace is taking place on the object
-        resize_lock_lock(true);
+        bool lock_taken = resize_lock_rdlock();
         {
             VALUE new_set_obj;
             if ((new_set_obj = rbimpl_atomic_value_load(set_obj_ptr, RBIMPL_ATOMIC_ACQUIRE)) != set_obj) {
@@ -555,11 +576,11 @@ rb_concurrent_set_delete_by_identity(VALUE set_obj, VALUE *set_obj_ptr, VALUE ke
             }
             else {
                 result = rb_concurrent_set_delete_by_identity_locked(set_obj, key);
-                resize_lock_unlock();
+                if (lock_taken) resize_lock_rdunlock();
                 break;
             }
         }
-        resize_lock_unlock();
+        if (lock_taken) resize_lock_rdunlock(); // resize occured
     }
     return result;
 }
@@ -611,10 +632,10 @@ void
 rb_concurrent_set_foreach_with_replace(VALUE set_obj, VALUE *set_obj_ptr, int (*callback)(VALUE *key, void *data), void *data)
 {
     RB_VM_LOCKING() {
-        resize_lock_lock(true); // don't allow concurrent deletes from sweep thread during this time
+        resize_lock_wrlock(true); // don't allow concurrent deletes from sweep thread during this time
         {
             rb_concurrent_set_foreach_with_replace_locked(set_obj, callback, data);
         }
-        resize_lock_unlock();
+        resize_lock_wrunlock();
     }
 }
