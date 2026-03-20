@@ -177,9 +177,8 @@ concurrent_set_try_resize_locked(VALUE old_set_obj, VALUE *set_obj_ptr)
 
         while (true) {
             struct concurrent_set_entry *entry = &new_set->entries[idx];
-            VALUE curr_key = rbimpl_atomic_value_load(&old_entry->key, RBIMPL_ATOMIC_RELAXED);
 
-            if (curr_key == CONCURRENT_SET_EMPTY) {
+            if ((entry->key & CONCURRENT_SET_KEY_MASK) == CONCURRENT_SET_EMPTY) {
                 new_set->size++;
                 RUBY_ASSERT(new_set->size <= new_set->capacity / 2);
 
