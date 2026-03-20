@@ -168,7 +168,11 @@ concurrent_set_try_resize_locked(VALUE old_set_obj, VALUE *set_obj_ptr)
         if (!RB_SPECIAL_CONST_P(key) && rb_objspace_garbage_object_p(key)) continue;
 
         VALUE hash = rbimpl_atomic_value_load(&old_entry->hash, RBIMPL_ATOMIC_RELAXED);
-        RUBY_ASSERT(hash != 0);
+        if (hash == 0) {
+            // The inserting thread CAS'd the key but hasn't stored the hash yet.
+            // Recompute it so the entry lands at the correct position in the new table.
+            hash = concurrent_set_hash(old_set, key);
+        }
         RUBY_ASSERT(hash == concurrent_set_hash(old_set, key));
 
         // Insert key into new_set.
@@ -182,7 +186,7 @@ concurrent_set_try_resize_locked(VALUE old_set_obj, VALUE *set_obj_ptr)
                 new_set->size++;
                 RUBY_ASSERT(new_set->size <= new_set->capacity / 2);
 
-                entry->key = key;
+                entry->key = raw_key;
                 entry->hash = hash;
                 break;
             }
@@ -319,8 +323,7 @@ rb_concurrent_set_find(VALUE *set_obj_ptr, VALUE key)
 
         VALUE curr_hash = rbimpl_atomic_value_load(&entry->hash, RBIMPL_ATOMIC_ACQUIRE);
 
-        // Another thread may have CAS'd the key but not yet stored the hash.
-        // Spin until the hash is visible (the window is ~1 instruction).
+        // Another thread may have inserted and CAS'd the key but not yet stored the hash.
         if (UNLIKELY(curr_hash == 0)) {
             goto retry;
         }
@@ -444,7 +447,6 @@ start_search:
         VALUE curr_hash = rbimpl_atomic_value_load(&entry->hash, RBIMPL_ATOMIC_ACQUIRE);
 
         // Another thread may have CAS'd the key but not yet stored the hash.
-        // Spin until the hash is visible (the window is ~1 instruction).
         if (UNLIKELY(curr_hash == 0)) {
             goto retry;
         }
@@ -457,7 +459,7 @@ start_search:
             if (continuation) {
                 goto probe_next;
             }
-            rbimpl_atomic_value_cas(&entry->hash, curr_hash, CONCURRENT_SET_EMPTY, RBIMPL_ATOMIC_RELEASE, RBIMPL_ATOMIC_RELAXED);
+            rbimpl_atomic_value_cas(&entry->hash, curr_hash, 0, RBIMPL_ATOMIC_RELEASE, RBIMPL_ATOMIC_RELAXED);
             rbimpl_atomic_value_cas(&entry->key, raw_key, CONCURRENT_SET_EMPTY, RBIMPL_ATOMIC_RELEASE, RBIMPL_ATOMIC_RELAXED);
             continue;
         }
@@ -490,7 +492,7 @@ concurrent_set_delete_entry_locked(struct concurrent_set *set, struct concurrent
         set->deleted_entries++;
     }
     else {
-        entry->hash = CONCURRENT_SET_EMPTY;
+        entry->hash = 0;
         entry->key = CONCURRENT_SET_EMPTY;
         set->size--;
     }
@@ -528,7 +530,7 @@ rb_concurrent_set_delete_by_identity_locked(VALUE set_obj, VALUE key)
 
                 if (!continuation) {
                     // Clear hash first so the slot is clean when key becomes EMPTY.
-                    rbimpl_atomic_value_cas(&entry->hash, hash, CONCURRENT_SET_EMPTY, RBIMPL_ATOMIC_RELEASE, RBIMPL_ATOMIC_RELAXED);
+                    rbimpl_atomic_value_cas(&entry->hash, hash, 0, RBIMPL_ATOMIC_RELEASE, RBIMPL_ATOMIC_RELAXED);
                 }
 
                 VALUE new_key;
@@ -618,7 +620,6 @@ rb_concurrent_set_foreach_with_replace_locked(VALUE set_obj, int (*callback)(VAL
                 if (cb_key != key) {
                     // Key was replaced by callback
                     entry->key = cb_key | (continuation ? CONCURRENT_SET_CONTINUATION_BIT : 0);
-                    entry->hash = concurrent_set_hash(set, cb_key);
                 }
                 break;
             }
