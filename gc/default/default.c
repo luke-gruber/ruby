@@ -1901,6 +1901,13 @@ minimum_slots_for_heap(rb_objspace_t *objspace, rb_heap_t *heap)
     return gc_params.heap_init_slots[heap_idx];
 }
 
+// TODO: make rb_gc_impl function
+bool in_background_sweep_mode(void)
+{
+    rb_objspace_t *objspace = rb_gc_get_objspace();
+    return objspace->background_sweep_mode;
+}
+
 /* garbage objects will be collected soon. */
 bool
 rb_gc_impl_garbage_object_p(void *objspace_ptr, VALUE ptr)

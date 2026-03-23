@@ -289,7 +289,7 @@ concurrent_set_try_resize(VALUE old_set_obj, VALUE *set_obj_ptr, void **set_data
 {
     RB_VM_LOCKING() {
         // deletes from sweep thread must not happen during resize and sweep thread can't take VM lock so it takes the resize lock
-        resize_lock_wrlock(false);
+        resize_lock_wrlock(true);
         {
             concurrent_set_try_resize_locked(old_set_obj, set_obj_ptr, set_data_ptr);
         }
@@ -707,24 +707,32 @@ rb_concurrent_set_delete_by_identity(VALUE *set_obj_ptr, void **set_data_ptr, VA
 {
     VALUE result;
     bool is_sweep_thread_p(void);
+    bool in_background_sweep_mode(void);
     struct concurrent_set *set = (struct concurrent_set *)rbimpl_atomic_value_load((VALUE *)set_data_ptr, RBIMPL_ATOMIC_ACQUIRE);
 
-    while (1) {
-        // this can be called by sweep thread, so we need to make sure no resize or replace is taking place on the object
-        bool lock_taken = resize_lock_rdlock();
-        {
-            struct concurrent_set *current_set = (struct concurrent_set *)rbimpl_atomic_value_load((VALUE *)set_data_ptr, RBIMPL_ATOMIC_ACQUIRE);
-            if (current_set != set) {
-                set = current_set;
-                // retry - resize happened
+    if (is_sweep_thread_p()) {
+        while (1) {
+            // this can be called by sweep thread, so we need to make sure no resize or replace is taking place on the object
+            // However, if the ruby GC thread is running we can't take this lock because a resize can cause GC.
+            bool lock_taken = in_background_sweep_mode() && resize_lock_rdlock();
+            {
+                struct concurrent_set *current_set = (struct concurrent_set *)rbimpl_atomic_value_load((VALUE *)set_data_ptr, RBIMPL_ATOMIC_ACQUIRE);
+                if (current_set != set) {
+                    set = current_set;
+                    // retry - resize happened
+                }
+                else {
+                    result = rb_concurrent_set_delete_by_identity_locked(set, key);
+                    if (lock_taken) resize_lock_rdunlock();
+                    break;
+                }
             }
-            else {
-                result = rb_concurrent_set_delete_by_identity_locked(set, key);
-                if (lock_taken) resize_lock_rdunlock();
-                break;
-            }
+            if (lock_taken) resize_lock_rdunlock();
         }
-        if (lock_taken) resize_lock_rdunlock(); // resize occurred
+    }
+    else {
+        struct concurrent_set *set = (struct concurrent_set *)rbimpl_atomic_value_load((VALUE *)set_data_ptr, RBIMPL_ATOMIC_ACQUIRE);
+        result = rb_concurrent_set_delete_by_identity_locked(set, key);
     }
     return result;
 }
