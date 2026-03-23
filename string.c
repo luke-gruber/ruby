@@ -443,6 +443,7 @@ rb_fstring(VALUE str)
 }
 
 static VALUE fstring_table_obj;
+static void *fstring_table_data;
 
 static VALUE
 fstring_concurrent_set_hash(VALUE str)
@@ -567,6 +568,7 @@ void
 Init_fstring_table(void)
 {
     fstring_table_obj = rb_concurrent_set_new(&fstring_concurrent_set_funcs, 8192);
+    fstring_table_data = rb_concurrent_set_get_data(fstring_table_obj);
     rb_gc_register_address(&fstring_table_obj);
 }
 
@@ -586,7 +588,7 @@ register_fstring(VALUE str, bool copy, bool force_precompute_hash)
     }
 #endif
 
-    VALUE result = rb_concurrent_set_find_or_insert(&fstring_table_obj, str, &args);
+    VALUE result = rb_concurrent_set_find_or_insert(&fstring_table_obj, str, &args, &fstring_table_data);
 
     RUBY_ASSERT(!rb_objspace_garbage_object_p(result));
     RUBY_ASSERT(RB_TYPE_P(result, T_STRING));
@@ -614,7 +616,7 @@ rb_gc_free_fstring(VALUE obj)
     RUBY_ASSERT(OBJ_FROZEN(obj));
     RUBY_ASSERT(!FL_TEST(obj, STR_SHARED));
 
-    rb_concurrent_set_delete_by_identity(fstring_table_obj, &fstring_table_obj, obj);
+    rb_concurrent_set_delete_by_identity(&fstring_table_obj, &fstring_table_data, obj);
 
     RB_DEBUG_COUNTER_INC(obj_str_fstr);
 

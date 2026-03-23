@@ -96,6 +96,7 @@ enum id_entry_type {
 typedef struct {
     rb_atomic_t next_id;
     VALUE sym_set;
+    void *sym_set_data;
 
     VALUE ids;
 } rb_symbols_t;
@@ -334,7 +335,7 @@ sym_find_or_insert_dynamic_symbol(rb_symbols_t *symbols, const VALUE str)
         .str = str
     };
     return sym_set_entry_to_sym(
-        rb_concurrent_set_find_or_insert(&symbols->sym_set, sym_set_static_sym_tag(&static_sym), (void *)true)
+        rb_concurrent_set_find_or_insert(&symbols->sym_set, sym_set_static_sym_tag(&static_sym), (void *)true, &symbols->sym_set_data)
     );
 }
 
@@ -345,7 +346,7 @@ sym_find_or_insert_static_symbol(rb_symbols_t *symbols, const VALUE str)
         .str = str
     };
     return sym_set_entry_to_sym(
-        rb_concurrent_set_find_or_insert(&symbols->sym_set, sym_set_static_sym_tag(&static_sym), (void *)false)
+        rb_concurrent_set_find_or_insert(&symbols->sym_set, sym_set_static_sym_tag(&static_sym), (void *)false, &symbols->sym_set_data)
     );
 }
 
@@ -357,7 +358,7 @@ sym_find_or_insert_static_symbol_id(rb_symbols_t *symbols, const VALUE str, ID i
         .str = str,
     };
     return sym_set_entry_to_sym(
-        rb_concurrent_set_find_or_insert(&symbols->sym_set, sym_set_static_sym_tag(&static_sym), (void *)false)
+        rb_concurrent_set_find_or_insert(&symbols->sym_set, sym_set_static_sym_tag(&static_sym), (void *)false, &symbols->sym_set_data)
     );
 }
 
@@ -367,6 +368,7 @@ Init_sym(void)
     rb_symbols_t *symbols = &ruby_global_symbols;
 
     symbols->sym_set = rb_concurrent_set_new(&sym_set_funcs, 1024);
+    symbols->sym_set_data = rb_concurrent_set_get_data(symbols->sym_set);
     symbols->ids = rb_ary_hidden_new(0);
 
     Init_op_tbl();
@@ -922,7 +924,7 @@ rb_gc_free_dsymbol(VALUE sym)
     VALUE str = RSYMBOL(sym)->fstr;
 
     if (str) {
-        rb_concurrent_set_delete_by_identity(ruby_global_symbols.sym_set, &ruby_global_symbols.sym_set, sym);
+        rb_concurrent_set_delete_by_identity(&ruby_global_symbols.sym_set, &ruby_global_symbols.sym_set_data, sym);
 
         RSYMBOL(sym)->fstr = 0;
     }
