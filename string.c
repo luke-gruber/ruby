@@ -443,7 +443,6 @@ rb_fstring(VALUE str)
 }
 
 static VALUE fstring_table_obj;
-static void *fstring_table_data;
 
 static VALUE
 fstring_concurrent_set_hash(VALUE str)
@@ -568,7 +567,6 @@ void
 Init_fstring_table(void)
 {
     fstring_table_obj = rb_concurrent_set_new(&fstring_concurrent_set_funcs, 8192);
-    fstring_table_data = rb_concurrent_set_get_data(fstring_table_obj);
     rb_gc_register_address(&fstring_table_obj);
 }
 
@@ -588,7 +586,7 @@ register_fstring(VALUE str, bool copy, bool force_precompute_hash)
     }
 #endif
 
-    VALUE result = rb_concurrent_set_find_or_insert(&fstring_table_obj, str, &args, &fstring_table_data);
+    VALUE result = rb_concurrent_set_find_or_insert(&fstring_table_obj, str, &args);
 
     RUBY_ASSERT(!rb_objspace_garbage_object_p(result));
     RUBY_ASSERT(RB_TYPE_P(result, T_STRING));
@@ -616,7 +614,7 @@ rb_gc_free_fstring(VALUE obj)
     RUBY_ASSERT(OBJ_FROZEN(obj));
     RUBY_ASSERT(!FL_TEST(obj, STR_SHARED));
 
-    rb_concurrent_set_delete_by_identity(&fstring_table_obj, &fstring_table_data, obj);
+    rb_concurrent_set_delete_by_identity(&fstring_table_obj, obj);
 
     RB_DEBUG_COUNTER_INC(obj_str_fstr);
 
@@ -627,7 +625,7 @@ void
 rb_fstring_foreach_with_replace(int (*callback)(VALUE *str, void *data), void *data)
 {
     if (fstring_table_obj) {
-        rb_concurrent_set_foreach_with_replace(fstring_table_obj, &fstring_table_obj, callback, data);
+        rb_concurrent_set_foreach_with_replace(fstring_table_obj, callback, data);
     }
 }
 
@@ -12774,7 +12772,7 @@ Init_String(void)
 {
     rb_cString  = rb_define_class("String", rb_cObject);
 
-    rb_concurrent_set_foreach_with_replace(fstring_table_obj, &fstring_table_obj, fstring_set_class_i, NULL);
+    rb_concurrent_set_foreach_with_replace(fstring_table_obj, fstring_set_class_i, NULL);
 
     rb_include_module(rb_cString, rb_mComparable);
     rb_define_alloc_func(rb_cString, empty_str_alloc);

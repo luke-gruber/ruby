@@ -7,6 +7,9 @@
 #define CONCURRENT_SET_CONTINUATION_BIT ((VALUE)0x2)
 #define CONCURRENT_SET_KEY_MASK (~CONCURRENT_SET_CONTINUATION_BIT)
 
+#define dfprintf(...) (void)0
+//#define dfprintf(...) fprintf(__VA_ARGS__)
+
 enum concurrent_set_special_values {
     CONCURRENT_SET_EMPTY = 0,
     CONCURRENT_SET_DELETED = 1,
@@ -150,7 +153,7 @@ concurrent_set_probe_next(struct concurrent_set_probe *probe)
 }
 
 static void
-concurrent_set_try_resize_locked(VALUE old_set_obj, VALUE *set_obj_ptr, void **set_data_ptr)
+concurrent_set_try_resize_locked(VALUE old_set_obj, VALUE *set_obj_ptr)
 {
     // Check if another thread has already resized.
     if (rbimpl_atomic_value_load(set_obj_ptr, RBIMPL_ATOMIC_ACQUIRE) != old_set_obj) {
@@ -219,9 +222,6 @@ concurrent_set_try_resize_locked(VALUE old_set_obj, VALUE *set_obj_ptr, void **s
         }
     }
 
-    if (set_data_ptr) {
-        rbimpl_atomic_value_store((VALUE *)set_data_ptr, (VALUE)new_set, RBIMPL_ATOMIC_RELEASE);
-    }
     rbimpl_atomic_value_store(set_obj_ptr, new_set_obj, RBIMPL_ATOMIC_RELEASE);
 
     RB_GC_GUARD(old_set_obj);
@@ -285,13 +285,13 @@ resize_lock_rdunlock(void)
 }
 
 static void
-concurrent_set_try_resize(VALUE old_set_obj, VALUE *set_obj_ptr, void **set_data_ptr)
+concurrent_set_try_resize(VALUE old_set_obj, VALUE *set_obj_ptr)
 {
     RB_VM_LOCKING() {
         // deletes from sweep thread must not happen during resize and sweep thread can't take VM lock so it takes the resize lock
         resize_lock_wrlock(true);
         {
-            concurrent_set_try_resize_locked(old_set_obj, set_obj_ptr, set_data_ptr);
+            concurrent_set_try_resize_locked(old_set_obj, set_obj_ptr);
         }
         resize_lock_wrunlock();
     }
@@ -383,7 +383,7 @@ rb_concurrent_set_find(VALUE *set_obj_ptr, VALUE key)
 }
 
 VALUE
-rb_concurrent_set_find_or_insert(VALUE *set_obj_ptr, VALUE key, void *data, void **set_data_ptr)
+rb_concurrent_set_find_or_insert(VALUE *set_obj_ptr, VALUE key, void *data)
 {
     RUBY_ASSERT(key >= CONCURRENT_SET_SPECIAL_VALUE_COUNT);
 
@@ -426,11 +426,11 @@ start_search:
             curr_hash = rbimpl_atomic_value_cas(&entry->hash, 0, hash, RBIMPL_ATOMIC_RELEASE, RBIMPL_ATOMIC_RELAXED);
             if (curr_hash != 0) {
                 // Lost race, retry same slot to check winner's hash
-                /*fprintf(stderr, "[INSERT-DEBUG] key=%p hash=%lx: hash CAS lost at idx=%d (winner hash=%lx)\n",
+                /*dfprintf(stderr, "[INSERT-DEBUG] key=%p hash=%lx: hash CAS lost at idx=%d (winner hash=%lx)\n",
                         (void *)key, (unsigned long)hash, idx, (unsigned long)curr_hash);*/
                 continue;
             }
-            /*fprintf(stderr, "[INSERT-DEBUG] key=%p hash=%lx: claimed empty hash slot at idx=%d\n",
+            /*dfprintf(stderr, "[INSERT-DEBUG] key=%p hash=%lx: claimed empty hash slot at idx=%d\n",
                     (void *)key, (unsigned long)hash, idx);*/
             curr_hash = hash;
             // Fall through to try to claim key
@@ -440,7 +440,7 @@ start_search:
         VALUE curr_key = raw_key & CONCURRENT_SET_KEY_MASK;
         bool continuation = raw_key & CONCURRENT_SET_CONTINUATION_BIT;
 
-        /*fprintf(stderr, "find_or_insert: curr_key:%p, curr_hash:%p\n", (void*)curr_key, (void*)curr_hash);*/
+        /*dfprintf(stderr, "find_or_insert: curr_key:%p, curr_hash:%p\n", (void*)curr_key, (void*)curr_hash);*/
         switch (curr_key) {
           case CONCURRENT_SET_EMPTY: {
             if (curr_hash != hash && curr_hash != CONCURRENT_SET_HASH_DELETED) { // another thread won and this was a pristine slot
@@ -451,11 +451,11 @@ start_search:
                 VALUE prev_hash = rbimpl_atomic_value_cas(&entry->hash, CONCURRENT_SET_HASH_DELETED, hash, RBIMPL_ATOMIC_RELEASE, RBIMPL_ATOMIC_RELAXED);
                 if (prev_hash != CONCURRENT_SET_HASH_DELETED) {
                     // Lost race, retry same slot to check winner's hash
-                    /*fprintf(stderr, "[INSERT-DEBUG] key=%p hash=%lx: HASH_DELETED reclaim CAS lost at idx=%d (prev_hash=%lx)\n",
+                    /*dfprintf(stderr, "[INSERT-DEBUG] key=%p hash=%lx: HASH_DELETED reclaim CAS lost at idx=%d (prev_hash=%lx)\n",
                             (void *)key, (unsigned long)hash, idx, (unsigned long)prev_hash);*/
                     continue;
                 }
-                /*fprintf(stderr, "[INSERT-DEBUG] key=%p hash=%lx: reclaimed HASH_DELETED slot at idx=%d\n",
+                /*dfprintf(stderr, "[INSERT-DEBUG] key=%p hash=%lx: reclaimed HASH_DELETED slot at idx=%d\n",
                         (void *)key, (unsigned long)hash, idx);*/
             }
             rb_atomic_t prev_size = rbimpl_atomic_fetch_add(&set->size, 1, RBIMPL_ATOMIC_RELAXED);
@@ -464,20 +464,20 @@ start_search:
             bool load_factor_reached = (uint64_t)(prev_size * 4) >= (uint64_t)(set->capacity * 3);
 
             if (UNLIKELY(load_factor_reached)) {
-                concurrent_set_try_resize(set_obj, set_obj_ptr, set_data_ptr);
+                concurrent_set_try_resize(set_obj, set_obj_ptr);
                 goto retry;
             }
 
             VALUE prev_raw_key = rbimpl_atomic_value_cas(&entry->key, raw_key, key | (continuation ? CONCURRENT_SET_CONTINUATION_BIT : 0), RBIMPL_ATOMIC_RELEASE, RBIMPL_ATOMIC_RELAXED);
             if (prev_raw_key == raw_key) {
-                /*fprintf(stderr, "[INSERT-DEBUG] key=%p hash=%lx: INSERTED at idx=%d (continuation=%d) capacity=%u size=%u\n",
+                /*dfprintf(stderr, "[INSERT-DEBUG] key=%p hash=%lx: INSERTED at idx=%d (continuation=%d) capacity=%u size=%u\n",
                         (void *)key, (unsigned long)hash, idx, continuation, set->capacity, (unsigned)set->size);*/
                 RB_GC_GUARD(set_obj);
                 return key;
             }
             else {
                 // Entry was not inserted.
-                /*fprintf(stderr, "[INSERT-DEBUG] key=%p hash=%lx: key CAS LOST at idx=%d (prev_raw_key=%lx), retrying\n",
+                /*dfprintf(stderr, "[INSERT-DEBUG] key=%p hash=%lx: key CAS LOST at idx=%d (prev_raw_key=%lx), retrying\n",
                         (void *)key, (unsigned long)hash, idx, (unsigned long)prev_raw_key);*/
                 rbimpl_atomic_sub(&set->size, 1, RBIMPL_ATOMIC_RELAXED);
 
@@ -495,7 +495,7 @@ start_search:
             goto retry;
           default:
             if (curr_hash == CONCURRENT_SET_HASH_DELETED) { // other thread is in the middle of a delete, let's wait
-                /*fprintf(stderr, "[INSERT-DEBUG] key=%p hash=%lx: found HASH_DELETED on live key=%p at idx=%d, waiting for delete to finish\n",
+                /*dfprintf(stderr, "[INSERT-DEBUG] key=%p hash=%lx: found HASH_DELETED on live key=%p at idx=%d, waiting for delete to finish\n",
                         (void *)key, (unsigned long)hash, (void *)curr_key, idx);*/
                 RB_VM_LOCKING() {
                     resize_lock_wrlock(false);
@@ -512,16 +512,16 @@ start_search:
             // this location and try to swap curr_key
             if (UNLIKELY(!RB_SPECIAL_CONST_P(curr_key) && rb_objspace_garbage_object_p(curr_key))) {
                 if (continuation) {
-                    /*fprintf(stderr, "[INSERT-DEBUG] GARBAGE key=%p at idx=%d (continuation=1, hash=%lx entry_hash=%lx), skipping to probe_next\n",
+                    /*dfprintf(stderr, "[INSERT-DEBUG] GARBAGE key=%p at idx=%d (continuation=1, hash=%lx entry_hash=%lx), skipping to probe_next\n",
                             (void *)curr_key, idx, (unsigned long)hash, (unsigned long)curr_hash);*/
                     goto probe_next;
                 }
-                /*fprintf(stderr, "[INSERT-DEBUG] GARBAGE key=%p at idx=%d (continuation=0, hash=%lx entry_hash=%lx), clearing key to EMPTY (hash NOT cleared)\n",
+                /*dfprintf(stderr, "[INSERT-DEBUG] GARBAGE key=%p at idx=%d (continuation=0, hash=%lx entry_hash=%lx), clearing key to EMPTY (hash NOT cleared)\n",
                         (void *)curr_key, idx, (unsigned long)hash, (unsigned long)curr_hash);*/
                 // NOTE: entry->key could be a different key, but we can't call the comparison function because it's a garbage object.
                 /*rbimpl_atomic_value_cas(&entry->hash, curr_hash, 0, RBIMPL_ATOMIC_RELEASE, RBIMPL_ATOMIC_RELAXED);*/
                 VALUE prev_garbage_key = rbimpl_atomic_value_cas(&entry->key, raw_key, CONCURRENT_SET_EMPTY, RBIMPL_ATOMIC_RELEASE, RBIMPL_ATOMIC_RELAXED);
-                /*fprintf(stderr, "[INSERT-DEBUG] GARBAGE clear CAS: prev_key=%lx (expected raw_key=%lx, success=%d)\n",
+                /*dfprintf(stderr, "[INSERT-DEBUG] GARBAGE clear CAS: prev_key=%lx (expected raw_key=%lx, success=%d)\n",
                         (unsigned long)prev_garbage_key, (unsigned long)raw_key, prev_garbage_key == raw_key);*/
                 // NOTE: hash not updated, so our hash value is stuck to this slot until a resize occurs.
                 continue;
@@ -529,7 +529,7 @@ start_search:
 
             if (set->funcs->cmp(key, curr_key)) {
                 // We've found a live match.
-                /*fprintf(stderr, "[INSERT-DEBUG] key=%p hash=%lx: FOUND existing match curr_key=%p at idx=%d\n",
+                /*dfprintf(stderr, "[INSERT-DEBUG] key=%p hash=%lx: FOUND existing match curr_key=%p at idx=%d\n",
                         (void *)key, (unsigned long)hash, (void *)curr_key, idx);*/
                 RB_GC_GUARD(set_obj);
 
@@ -562,13 +562,13 @@ concurrent_set_delete_entry_locked(struct concurrent_set *set, struct concurrent
     int entry_idx = (int)(entry - set->entries);
 
     if (entry->key & CONCURRENT_SET_CONTINUATION_BIT) {
-        /*fprintf(stderr, "[DELETE-ENTRY-DEBUG] key=%p hash=%lx at idx=%d: setting DELETED (continuation=1)\n",
+        /*dfprintf(stderr, "[DELETE-ENTRY-DEBUG] key=%p hash=%lx at idx=%d: setting DELETED (continuation=1)\n",
                 (void *)old_key, (unsigned long)old_hash, entry_idx);*/
         entry->key = CONCURRENT_SET_DELETED | CONCURRENT_SET_CONTINUATION_BIT;
         set->deleted_entries++;
     }
     else {
-        /*fprintf(stderr, "[DELETE-ENTRY-DEBUG] key=%p hash=%lx at idx=%d: setting EMPTY (continuation=0), clearing hash\n",
+        /*dfprintf(stderr, "[DELETE-ENTRY-DEBUG] key=%p hash=%lx at idx=%d: setting EMPTY (continuation=0), clearing hash\n",
                 (void *)old_key, (unsigned long)old_hash, entry_idx);*/
         entry->hash = 0;
         entry->key = CONCURRENT_SET_EMPTY;
@@ -578,17 +578,20 @@ concurrent_set_delete_entry_locked(struct concurrent_set *set, struct concurrent
 
 
 static VALUE
-rb_concurrent_set_delete_by_identity_locked(struct concurrent_set *set, VALUE key)
+rb_concurrent_set_delete_by_identity_locked(VALUE set_obj, VALUE key)
 {
+
+    struct concurrent_set *set = RTYPEDDATA_GET_DATA(set_obj);
 
     VALUE hash = concurrent_set_hash(set, key);
 
-    /*fprintf(stderr, "[DELETE-DEBUG] ENTER delete key=%p hash=%lx capacity=%u size=%u deleted=%u\n",
+    /*dfprintf(stderr, "[DELETE-DEBUG] ENTER delete key=%p hash=%lx capacity=%u size=%u deleted=%u\n",
             (void *)key, (unsigned long)hash, set->capacity, (unsigned)set->size, (unsigned)set->deleted_entries);*/
 
     struct concurrent_set_probe probe;
     int idx = concurrent_set_probe_start(&probe, set, hash);
     bool hash_cleared = false;
+    VALUE prev_hash = 0;
 
     while (true) {
         struct concurrent_set_entry *entry = &set->entries[idx];
@@ -600,15 +603,15 @@ rb_concurrent_set_delete_by_identity_locked(struct concurrent_set *set, VALUE ke
         switch (curr_key) {
           case CONCURRENT_SET_EMPTY:
             if (!continuation) {
-                /*fprintf(stderr, "[DELETE-DEBUG] key=%p hash=%lx: NOT FOUND (EMPTY, no continuation) at idx=%d\n",
+                /*dfprintf(stderr, "[DELETE-DEBUG] key=%p hash=%lx: NOT FOUND (EMPTY, no continuation) at idx=%d\n",
                         (void *)key, (unsigned long)hash, idx);*/
                 return 0;
             }
-            /*fprintf(stderr, "[DELETE-DEBUG] key=%p hash=%lx: EMPTY with continuation at idx=%d, continuing probe\n",
+            /*dfprintf(stderr, "[DELETE-DEBUG] key=%p hash=%lx: EMPTY with continuation at idx=%d, continuing probe\n",
                     (void *)key, (unsigned long)hash, idx);*/
             break;
           case CONCURRENT_SET_DELETED:
-            /*fprintf(stderr, "[DELETE-DEBUG] key=%p hash=%lx: DELETED slot at idx=%d (continuation=%d)\n",
+            /*dfprintf(stderr, "[DELETE-DEBUG] key=%p hash=%lx: DELETED slot at idx=%d (continuation=%d)\n",
                     (void *)key, (unsigned long)hash, idx, continuation);*/
             break;
           case CONCURRENT_SET_MOVED:
@@ -618,31 +621,31 @@ rb_concurrent_set_delete_by_identity_locked(struct concurrent_set *set, VALUE ke
             if (key == curr_key) {
                 VALUE new_key;
                 /*if (hash == CONCURRENT_SET_HASH_DELETED) {
-                    fprintf(stderr, "[DELETE-DEBUG] BUG: hash == CONCURRENT_SET_HASH_DELETED! key=%p hash=%lx\n",
+                    dfprintf(stderr, "[DELETE-DEBUG] BUG: hash == CONCURRENT_SET_HASH_DELETED! key=%p hash=%lx\n",
                             (void *)key, (unsigned long)hash);
                 }
                 if (loaded_hash != hash) {
-                    fprintf(stderr, "[DELETE-DEBUG] ASSERTION WILL FAIL: loaded_hash != hash\n");
-                    fprintf(stderr, "[DELETE-DEBUG]   key=%p (matched curr_key)\n", (void *)key);
-                    fprintf(stderr, "[DELETE-DEBUG]   expected hash=%lx, loaded_hash=%lx\n",
+                    dfprintf(stderr, "[DELETE-DEBUG] ASSERTION WILL FAIL: loaded_hash != hash\n");
+                    dfprintf(stderr, "[DELETE-DEBUG]   key=%p (matched curr_key)\n", (void *)key);
+                    dfprintf(stderr, "[DELETE-DEBUG]   expected hash=%lx, loaded_hash=%lx\n",
                             (unsigned long)hash, (unsigned long)loaded_hash);
-                    fprintf(stderr, "[DELETE-DEBUG]   loaded_hash == HASH_DELETED? %d\n",
+                    dfprintf(stderr, "[DELETE-DEBUG]   loaded_hash == HASH_DELETED? %d\n",
                             loaded_hash == CONCURRENT_SET_HASH_DELETED);
-                    fprintf(stderr, "[DELETE-DEBUG]   idx=%d, capacity=%u, size=%u, deleted=%u\n",
+                    dfprintf(stderr, "[DELETE-DEBUG]   idx=%d, capacity=%u, size=%u, deleted=%u\n",
                             idx, set->capacity, (unsigned)set->size, (unsigned)set->deleted_entries);
-                    fprintf(stderr, "[DELETE-DEBUG]   raw_key=%lx, continuation=%d\n",
+                    dfprintf(stderr, "[DELETE-DEBUG]   raw_key=%lx, continuation=%d\n",
                             (unsigned long)raw_key, continuation);
-                    fprintf(stderr, "[DELETE-DEBUG]   hash_cleared=%d\n", hash_cleared);
+                    dfprintf(stderr, "[DELETE-DEBUG]   hash_cleared=%d\n", hash_cleared);
                     VALUE reread_hash = rbimpl_atomic_value_load(&entry->hash, RBIMPL_ATOMIC_SEQ_CST);
                     VALUE reread_key = rbimpl_atomic_value_load(&entry->key, RBIMPL_ATOMIC_SEQ_CST);
-                    fprintf(stderr, "[DELETE-DEBUG]   re-read hash=%lx, re-read key=%lx\n",
+                    dfprintf(stderr, "[DELETE-DEBUG]   re-read hash=%lx, re-read key=%lx\n",
                             (unsigned long)reread_hash, (unsigned long)reread_key);
                     VALUE recomputed = concurrent_set_hash(set, key);
-                    fprintf(stderr, "[DELETE-DEBUG]   recomputed hash=%lx (matches original? %d)\n",
+                    dfprintf(stderr, "[DELETE-DEBUG]   recomputed hash=%lx (matches original? %d)\n",
                             (unsigned long)recomputed, recomputed == hash);
                 }*/
                 RUBY_ASSERT(hash != CONCURRENT_SET_HASH_DELETED);
-                RUBY_ASSERT(loaded_hash == hash);
+                RUBY_ASSERT(hash_cleared || loaded_hash == hash);
                 if (continuation) {
                     new_key = CONCURRENT_SET_DELETED | CONCURRENT_SET_CONTINUATION_BIT;
                 }
@@ -653,14 +656,7 @@ rb_concurrent_set_delete_by_identity_locked(struct concurrent_set *set, VALUE ke
                 if (!hash_cleared) {
                     // This is safe because we aren't racing against other deletions (only 1 thread can delete a key), so
                     // we know that the key isn't a different key by now and we aren't deleting a hash out from under it.
-                    VALUE prev_hash = rbimpl_atomic_value_cas(&entry->hash, hash, CONCURRENT_SET_HASH_DELETED, RBIMPL_ATOMIC_RELEASE, RBIMPL_ATOMIC_ACQUIRE);
-                    if (prev_hash == CONCURRENT_SET_HASH_DELETED) {
-                        // Another thread already started deleting this entry?
-                        // The key may have already been cleared too.
-                        /*fprintf(stderr, "[DELETE-DEBUG] key=%p: hash CAS lost (already HASH_DELETED) at idx=%d, returning\n",
-                                (void *)key, idx);*/
-                        return curr_key;
-                    }
+                    prev_hash = rbimpl_atomic_value_cas(&entry->hash, hash, CONCURRENT_SET_HASH_DELETED, RBIMPL_ATOMIC_RELEASE, RBIMPL_ATOMIC_ACQUIRE);
                     RUBY_ASSERT(prev_hash == hash);
                     hash_cleared = true;
                 }
@@ -672,21 +668,24 @@ rb_concurrent_set_delete_by_identity_locked(struct concurrent_set *set, VALUE ke
                     else {
                         rbimpl_atomic_sub(&set->size, 1, RBIMPL_ATOMIC_RELAXED);
                     }
-                    /*fprintf(stderr, "[DELETE-DEBUG] key=%p: SUCCESS deleted at idx=%d (continuation=%d)\n",
+                    /*dfprintf(stderr, "[DELETE-DEBUG] key=%p: SUCCESS deleted at idx=%d (continuation=%d)\n",
                             (void *)key, idx, continuation);*/
                     return curr_key;
                 }
                 else if (!continuation && prev_key == (raw_key | CONCURRENT_SET_CONTINUATION_BIT)) {
-                    /*fprintf(stderr, "[DELETE-DEBUG] key=%p: continuation bit set during delete at idx=%d, retrying\n",
+                    /*dfprintf(stderr, "[DELETE-DEBUG] key=%p: continuation bit set during delete at idx=%d, retrying\n",
                             (void *)key, idx);*/
                     continue; // try again, the continuation bit was just set on this key
                 } else if ((prev_key & CONCURRENT_SET_KEY_MASK) == CONCURRENT_SET_EMPTY || (prev_key & CONCURRENT_SET_KEY_MASK) == CONCURRENT_SET_DELETED) {
-                    /*fprintf(stderr, "[DELETE-DEBUG] key=%p: key already deleted by another thread at idx=%d (prev_key=%lx)\n",
+                    /*dfprintf(stderr, "[DELETE-DEBUG] key=%p: key already deleted by another thread at idx=%d (prev_key=%lx)\n",
                             (void *)key, idx, (unsigned long)prev_key);*/
-                    return curr_key; // the key was deleted by another thread (currently not possible due to how our GC works?)
+                    return curr_key; // the key was deleted by another thread
                 }
                 else { // the key was deleted to EMPTY and then a new key put there
-                    /*fprintf(stderr, "[DELETE-DEBUG] key=%p: slot reused at idx=%d (prev_key=%lx)\n",
+                    RUBY_ASSERT(prev_hash != 0);
+                    rbimpl_atomic_value_cas(&entry->hash, CONCURRENT_SET_HASH_DELETED, prev_hash, RBIMPL_ATOMIC_RELEASE, RBIMPL_ATOMIC_ACQUIRE);
+
+                    /*dfprintf(stderr, "[DELETE-DEBUG] key=%p: slot reused at idx=%d (prev_key=%lx)\n",
                             (void *)key, idx, (unsigned long)prev_key);*/
                     return curr_key;
                 }
@@ -703,12 +702,13 @@ rb_concurrent_set_delete_by_identity_locked(struct concurrent_set *set, VALUE ke
 // Uses set_data_ptr (a cached xmalloc'd struct pointer) to avoid dereferencing
 // the VALUE set_obj, which may be on an mprotected page during compaction.
 VALUE
-rb_concurrent_set_delete_by_identity(VALUE *set_obj_ptr, void **set_data_ptr, VALUE key)
+rb_concurrent_set_delete_by_identity(VALUE *set_obj_ptr, VALUE key)
 {
     VALUE result;
     bool is_sweep_thread_p(void);
     bool in_background_sweep_mode(void);
-    struct concurrent_set *set = (struct concurrent_set *)rbimpl_atomic_value_load((VALUE *)set_data_ptr, RBIMPL_ATOMIC_ACQUIRE);
+
+    VALUE set_obj = rbimpl_atomic_value_load(set_obj_ptr, RBIMPL_ATOMIC_ACQUIRE);
 
     if (is_sweep_thread_p()) {
         while (1) {
@@ -716,13 +716,13 @@ rb_concurrent_set_delete_by_identity(VALUE *set_obj_ptr, void **set_data_ptr, VA
             // However, if the ruby GC thread is running we can't take this lock because a resize can cause GC.
             bool lock_taken = in_background_sweep_mode() && resize_lock_rdlock();
             {
-                struct concurrent_set *current_set = (struct concurrent_set *)rbimpl_atomic_value_load((VALUE *)set_data_ptr, RBIMPL_ATOMIC_ACQUIRE);
-                if (current_set != set) {
-                    set = current_set;
+                VALUE current_set_obj = rbimpl_atomic_value_load(set_obj_ptr, RBIMPL_ATOMIC_ACQUIRE);
+                if (current_set_obj != set_obj) {
+                    set_obj = current_set_obj;
                     // retry - resize happened
                 }
                 else {
-                    result = rb_concurrent_set_delete_by_identity_locked(set, key);
+                    result = rb_concurrent_set_delete_by_identity_locked(set_obj, key);
                     if (lock_taken) resize_lock_rdunlock();
                     break;
                 }
@@ -731,8 +731,7 @@ rb_concurrent_set_delete_by_identity(VALUE *set_obj_ptr, void **set_data_ptr, VA
         }
     }
     else {
-        struct concurrent_set *set = (struct concurrent_set *)rbimpl_atomic_value_load((VALUE *)set_data_ptr, RBIMPL_ATOMIC_ACQUIRE);
-        result = rb_concurrent_set_delete_by_identity_locked(set, key);
+        result = rb_concurrent_set_delete_by_identity_locked(set_obj, key);
     }
     return result;
 }
@@ -788,7 +787,7 @@ rb_concurrent_set_foreach_with_replace_locked(VALUE set_obj, int (*callback)(VAL
 }
 
 void
-rb_concurrent_set_foreach_with_replace(VALUE set_obj, VALUE *set_obj_ptr, int (*callback)(VALUE *key, void *data), void *data)
+rb_concurrent_set_foreach_with_replace(VALUE set_obj, int (*callback)(VALUE *key, void *data), void *data)
 {
     RB_VM_LOCKING() {
         resize_lock_wrlock(true); // don't allow concurrent deletes from sweep thread during this time

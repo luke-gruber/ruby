@@ -96,7 +96,6 @@ enum id_entry_type {
 typedef struct {
     rb_atomic_t next_id;
     VALUE sym_set;
-    void *sym_set_data;
 
     VALUE ids;
 } rb_symbols_t;
@@ -335,7 +334,7 @@ sym_find_or_insert_dynamic_symbol(rb_symbols_t *symbols, const VALUE str)
         .str = str
     };
     return sym_set_entry_to_sym(
-        rb_concurrent_set_find_or_insert(&symbols->sym_set, sym_set_static_sym_tag(&static_sym), (void *)true, &symbols->sym_set_data)
+        rb_concurrent_set_find_or_insert(&symbols->sym_set, sym_set_static_sym_tag(&static_sym), (void *)true)
     );
 }
 
@@ -346,7 +345,7 @@ sym_find_or_insert_static_symbol(rb_symbols_t *symbols, const VALUE str)
         .str = str
     };
     return sym_set_entry_to_sym(
-        rb_concurrent_set_find_or_insert(&symbols->sym_set, sym_set_static_sym_tag(&static_sym), (void *)false, &symbols->sym_set_data)
+        rb_concurrent_set_find_or_insert(&symbols->sym_set, sym_set_static_sym_tag(&static_sym), (void *)false)
     );
 }
 
@@ -358,7 +357,7 @@ sym_find_or_insert_static_symbol_id(rb_symbols_t *symbols, const VALUE str, ID i
         .str = str,
     };
     return sym_set_entry_to_sym(
-        rb_concurrent_set_find_or_insert(&symbols->sym_set, sym_set_static_sym_tag(&static_sym), (void *)false, &symbols->sym_set_data)
+        rb_concurrent_set_find_or_insert(&symbols->sym_set, sym_set_static_sym_tag(&static_sym), (void *)false)
     );
 }
 
@@ -368,7 +367,6 @@ Init_sym(void)
     rb_symbols_t *symbols = &ruby_global_symbols;
 
     symbols->sym_set = rb_concurrent_set_new(&sym_set_funcs, 1024);
-    symbols->sym_set_data = rb_concurrent_set_get_data(symbols->sym_set);
     symbols->ids = rb_ary_hidden_new(0);
 
     Init_op_tbl();
@@ -395,7 +393,7 @@ rb_free_global_symbol_table_i(VALUE *sym_ptr, void *data)
 void
 rb_free_global_symbol_table(void)
 {
-    rb_concurrent_set_foreach_with_replace(ruby_global_symbols.sym_set, &ruby_global_symbols.sym_set, rb_free_global_symbol_table_i, NULL);
+    rb_concurrent_set_foreach_with_replace(ruby_global_symbols.sym_set, rb_free_global_symbol_table_i, NULL);
 }
 
 WARN_UNUSED_RESULT(static ID lookup_str_id(VALUE str));
@@ -915,7 +913,7 @@ rb_sym_global_symbol_table_foreach_weak_reference(int (*callback)(VALUE *key, vo
         .data = data,
     };
 
-    rb_concurrent_set_foreach_with_replace(ruby_global_symbols.sym_set, &ruby_global_symbols.sym_set, rb_sym_global_symbol_table_foreach_weak_reference_i, &foreach_data);
+    rb_concurrent_set_foreach_with_replace(ruby_global_symbols.sym_set, rb_sym_global_symbol_table_foreach_weak_reference_i, &foreach_data);
 }
 
 void
@@ -924,7 +922,7 @@ rb_gc_free_dsymbol(VALUE sym)
     VALUE str = RSYMBOL(sym)->fstr;
 
     if (str) {
-        rb_concurrent_set_delete_by_identity(&ruby_global_symbols.sym_set, &ruby_global_symbols.sym_set_data, sym);
+        rb_concurrent_set_delete_by_identity(&ruby_global_symbols.sym_set, sym);
 
         RSYMBOL(sym)->fstr = 0;
     }
@@ -1070,7 +1068,7 @@ rb_sym_all_symbols(void)
         rb_vm_barrier();
 
         ary = rb_ary_new2(rb_concurrent_set_size(symbols->sym_set));
-        rb_concurrent_set_foreach_with_replace(symbols->sym_set, &symbols->sym_set, symbols_i, (void *)ary);
+        rb_concurrent_set_foreach_with_replace(symbols->sym_set, symbols_i, (void *)ary);
     }
 
     return ary;
