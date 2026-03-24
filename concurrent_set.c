@@ -6,7 +6,6 @@
 
 // insertion probes have gone past this slot
 #define CONCURRENT_SET_CONTINUATION_BIT ((VALUE)0x2)
-// this slot has been deleted and its hash can be reclaimed
 #define CONCURRENT_SET_KEY_MASK (~CONCURRENT_SET_CONTINUATION_BIT)
 
 #define dfprintf(...) (void)0
@@ -19,6 +18,8 @@ enum concurrent_set_special_values {
     CONCURRENT_SET_SPECIAL_VALUE_COUNT = 6
 };
 
+// This slot's hash can be reclaimed if and only if the key is EMPTY. If the key is something
+// else, this bit has no meaning.
 #define CONCURRENT_SET_HASH_RECLAIMABLE_BIT ((VALUE)0x1)
 #define CONCURRENT_SET_HASH_MASK (~CONCURRENT_SET_HASH_RECLAIMABLE_BIT)
 
@@ -100,11 +101,7 @@ static const rb_data_type_t concurrent_set_type = {
         .dsize = concurrent_set_size,
     },
     /* Hack: NOT WB_PROTECTED on purpose (see above) */
-    /* Note: NOT RUBY_TYPED_EMBEDDABLE. The struct must be xmalloc'd separately
-     * so that rb_concurrent_set_delete_by_identity can access it via a cached
-     * pointer without dereferencing the VALUE (which may be on an mprotected
-     * page during compaction). */
-    .flags = RUBY_TYPED_FREE_IMMEDIATELY | RUBY_TYPED_CONCURRENT_FREE_SAFE
+    .flags = RUBY_TYPED_FREE_IMMEDIATELY | RUBY_TYPED_CONCURRENT_FREE_SAFE | RUBY_TYPED_EMBEDDABLE
 };
 
 VALUE
@@ -197,9 +194,7 @@ concurrent_set_try_resize_locked(VALUE old_set_obj, VALUE *set_obj_ptr)
 
         VALUE hash = rbimpl_atomic_value_load(&old_entry->hash, RBIMPL_ATOMIC_ACQUIRE) & CONCURRENT_SET_HASH_MASK;
         if (hash == 0) continue;
-        if (concurrent_set_hash(old_set, prev_key) != hash) { // entry was deleted, then hash was changed but key not yet
-            continue;
-        }
+        RUBY_ASSERT(concurrent_set_hash(old_set, prev_key) == hash);
 
         // Insert key into new_set.
         struct concurrent_set_probe probe;
