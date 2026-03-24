@@ -20,7 +20,7 @@ enum concurrent_set_special_values {
 
 // This slot's hash can be reclaimed if and only if the key is EMPTY. If the key is something
 // else, this bit has no meaning.
-#define CONCURRENT_SET_HASH_RECLAIMABLE_BIT ((VALUE)0x1)
+#define CONCURRENT_SET_HASH_RECLAIMABLE_BIT ((VALUE)1 << (sizeof(VALUE) * CHAR_BIT - 1))
 #define CONCURRENT_SET_HASH_MASK (~CONCURRENT_SET_HASH_RECLAIMABLE_BIT)
 
 struct concurrent_set_entry {
@@ -61,7 +61,7 @@ concurrent_set_hash(const struct concurrent_set *set, VALUE key)
 {
     VALUE hash = set->funcs->hash(key);
     hash &= CONCURRENT_SET_HASH_MASK;
-    if (hash == 0) hash = CONCURRENT_SET_HASH_MASK;
+    if (hash == 0) hash = ~(VALUE)0 & CONCURRENT_SET_HASH_MASK;
     RUBY_ASSERT(hash != 0);
     RUBY_ASSERT(!(hash & CONCURRENT_SET_HASH_RECLAIMABLE_BIT));
     return hash;
@@ -101,7 +101,8 @@ static const rb_data_type_t concurrent_set_type = {
         .dsize = concurrent_set_size,
     },
     /* Hack: NOT WB_PROTECTED on purpose (see above) */
-    .flags = RUBY_TYPED_FREE_IMMEDIATELY | RUBY_TYPED_CONCURRENT_FREE_SAFE | RUBY_TYPED_EMBEDDABLE
+    /* NOTE: don't make embedded due to compaction */
+    .flags = RUBY_TYPED_FREE_IMMEDIATELY | RUBY_TYPED_CONCURRENT_FREE_SAFE
 };
 
 VALUE
@@ -154,7 +155,7 @@ concurrent_set_probe_next(struct concurrent_set_probe *probe)
 }
 
 static void
-concurrent_set_try_resize_locked(VALUE old_set_obj, VALUE *set_obj_ptr)
+concurrent_set_try_resize_locked(VALUE old_set_obj, VALUE *set_obj_ptr, VALUE new_set_obj, int old_capacity)
 {
     // Check if another thread has already resized.
     if (rbimpl_atomic_value_load(set_obj_ptr, RBIMPL_ATOMIC_ACQUIRE) != old_set_obj) {
@@ -162,24 +163,7 @@ concurrent_set_try_resize_locked(VALUE old_set_obj, VALUE *set_obj_ptr)
     }
 
     struct concurrent_set *old_set = RTYPEDDATA_GET_DATA(old_set_obj);
-
-    // This may overcount by up to the number of threads concurrently attempting to insert
-    // GC may also happen between now and the set being rebuilt
-    int expected_size = rbimpl_atomic_load(&old_set->size, RBIMPL_ATOMIC_RELAXED) - old_set->deleted_entries;
-
-    // NOTE: new capacity must make sense with load factor, don't change one without checking the other.
     struct concurrent_set_entry *old_entries = old_set->entries;
-    int old_capacity = old_set->capacity;
-    int new_capacity = old_capacity * 2;
-    if (new_capacity > expected_size * 8) {
-        new_capacity = old_capacity / 2;
-    }
-    else if (new_capacity > expected_size * 4) {
-        new_capacity = old_capacity;
-    }
-
-    // May cause GC and therefore deletes, so must happen first.
-    VALUE new_set_obj = rb_concurrent_set_new(old_set->funcs, new_capacity);
     struct concurrent_set *new_set = RTYPEDDATA_GET_DATA(new_set_obj);
 
     for (int i = 0; i < old_capacity; i++) {
@@ -286,10 +270,29 @@ static void
 concurrent_set_try_resize(VALUE old_set_obj, VALUE *set_obj_ptr)
 {
     RB_VM_LOCKING() {
+        struct concurrent_set *old_set = RTYPEDDATA_GET_DATA(old_set_obj);
+
+        // This may overcount by up to the number of threads concurrently attempting to insert
+        // GC may also happen between now and the set being rebuilt
+        int expected_size = rbimpl_atomic_load(&old_set->size, RBIMPL_ATOMIC_RELAXED) - old_set->deleted_entries;
+
+        // NOTE: new capacity must make sense with load factor, don't change one without checking the other.
+        struct concurrent_set_entry *old_entries = old_set->entries;
+        int old_capacity = old_set->capacity;
+        int new_capacity = old_capacity * 2;
+        if (new_capacity > expected_size * 8) {
+            new_capacity = old_capacity / 2;
+        }
+        else if (new_capacity > expected_size * 4) {
+            new_capacity = old_capacity;
+        }
+
+        // May cause GC and therefore deletes, so must happen first.
+        VALUE new_set_obj = rb_concurrent_set_new(old_set->funcs, new_capacity);
         // deletes from sweep thread must not happen during resize and sweep thread can't take VM lock so it takes the resize lock
         resize_lock_wrlock(true);
         {
-            concurrent_set_try_resize_locked(old_set_obj, set_obj_ptr);
+            concurrent_set_try_resize_locked(old_set_obj, set_obj_ptr, new_set_obj, old_capacity);
         }
         resize_lock_wrunlock();
     }
@@ -682,15 +685,13 @@ rb_concurrent_set_delete_by_identity(VALUE *set_obj_ptr, VALUE key)
 {
     VALUE result;
     bool is_sweep_thread_p(void);
-    bool in_background_sweep_mode(void);
 
     VALUE set_obj = rbimpl_atomic_value_load(set_obj_ptr, RBIMPL_ATOMIC_ACQUIRE);
 
     if (is_sweep_thread_p()) {
         while (1) {
             // this can be called by sweep thread, so we need to make sure no resize or replace is taking place on the object
-            // However, if the ruby GC thread is running we can't take this lock because a resize can cause GC.
-            bool lock_taken = in_background_sweep_mode() && resize_lock_rdlock();
+            bool lock_taken = resize_lock_rdlock();
             {
                 VALUE current_set_obj = rbimpl_atomic_value_load(set_obj_ptr, RBIMPL_ATOMIC_ACQUIRE);
                 if (current_set_obj != set_obj) {
