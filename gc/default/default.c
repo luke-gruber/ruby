@@ -4931,6 +4931,7 @@ gc_sweep_finish_heap(rb_objspace_t *objspace, rb_heap_t *heap)
                 }
             }
             else if (objspace->heap_pages.allocatable_slots < (min_free_slots - swept_slots)) {
+                fprintf(stderr, "sweep_finish_heap %ld set NOFREE\n", heap - heaps);
                 gc_needs_major_flags |= GPR_FLAG_MAJOR_BY_NOFREE;
                 heap->force_major_gc_count++;
             }
@@ -6880,6 +6881,7 @@ gc_marks_finish(rb_objspace_t *objspace)
                 }
                 else {
                     gc_report(1, objspace, "gc_marks_finish: next is full GC!!)\n");
+                    fprintf(stderr, "marks_finish: set NOFREE\n");
                     gc_needs_major_flags |= GPR_FLAG_MAJOR_BY_NOFREE;
                 }
             }

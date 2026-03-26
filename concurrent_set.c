@@ -8,7 +8,6 @@
 #define CONCURRENT_SET_CONTINUATION_BIT ((VALUE)0x2)
 #define CONCURRENT_SET_KEY_MASK (~CONCURRENT_SET_CONTINUATION_BIT)
 
-/*#define CONCURRENT_SET_DEBUG 0*/
 #define CONCURRENT_SET_DEBUG 0
 
 enum concurrent_set_special_values {
@@ -60,7 +59,8 @@ concurrent_set_mark_continuation(struct concurrent_set_entry *entry, VALUE raw_k
         return true;
     }
     else {
-        // key has been made EMPTY, and anything could have happened to this slot since then. Need to retry.
+        // * key could have been made EMPTY, and anything could have happened to this slot since then. Need to retry.
+        // * key could have been moved during resize
         return false;
     }
 }
