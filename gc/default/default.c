@@ -4171,7 +4171,6 @@ gc_sweep_plane(rb_objspace_t *objspace, rb_heap_t *heap, uintptr_t p, bits_t bit
                 break;
 
               default:
-              free_object:
                 psweep_debug(0, "[gc] gc_sweep_plane: heap:%p (%ld) freeing obj:%p (%s)\n", heap, heap - heaps, (void*)vp, rb_obj_info(vp));
 #if RGENGC_CHECK_MODE
                 if (!is_full_marking(objspace)) {
@@ -4188,6 +4187,7 @@ gc_sweep_plane(rb_objspace_t *objspace, rb_heap_t *heap, uintptr_t p, bits_t bit
                 CHECK(RVALUE_UNCOLLECTIBLE);
 #undef CHECK
 #endif
+              free_object:
                 if (RB_UNLIKELY(objspace->hook_events & RUBY_INTERNAL_EVENT_FREEOBJ)) {
                     rb_gc_event_hook(vp, RUBY_INTERNAL_EVENT_FREEOBJ);
                 }
