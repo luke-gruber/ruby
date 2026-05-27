@@ -5000,9 +5000,9 @@ gc_sweep_step_worker(rb_objspace_t *objspace, rb_heap_t *heap, int *swept_pages_
                 }
             }
         }
+        sweep_thread_signal_enqueued_pages(objspace, heap);
 
     }
-    sweep_thread_signal_enqueued_pages(objspace, heap);
     // sweep_lock is acquired
 }
 
