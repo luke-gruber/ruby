@@ -5791,6 +5791,7 @@ gc_sweep_continue(rb_objspace_t *objspace, rb_heap_t *sweep_heap)
 
     gc_sweeping_enter(objspace, "gc_sweep_continue");
 
+#if USE_PARALLEL_SWEEP
     if (objspace->sweep_thread) {
         bool signal = false;
         sweep_lock_lock(objspace);
@@ -5808,6 +5809,7 @@ gc_sweep_continue(rb_objspace_t *objspace, rb_heap_t *sweep_heap)
             rb_native_cond_signal(&objspace->sweep_cond);
         }
     }
+#endif
 
     for (int i = 0; i < HEAP_COUNT; i++) {
         rb_heap_t *heap = &heaps[i];
