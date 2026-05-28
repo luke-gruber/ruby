@@ -5364,17 +5364,6 @@ gc_sweep_finish(rb_objspace_t *objspace)
 }
 
 #if USE_PARALLEL_SWEEP
-// Dequeue a page for the Ruby GC thread to process. Returns NULL when no work is
-// available for this heap. When the returned page came from our own claim (not the
-// worker's pre-sweep stack), *dequeued_unswept_page is set to true and the caller
-// must do the full sweep itself.
-//
-// Order of preference:
-//   1) Pop one page from heap->drained_local (left over from a previous bulk drain).
-//   2) Bulk-drain the entire pre_swept stack via xchg and retry.
-//   3) Pop one index from the leftover claimed_local range.
-//   4) Claim a fresh chunk and pop the first.
-//   5) Block briefly if the worker still has in-flight pages, then retry.
 static struct heap_page *
 gc_sweep_dequeue_page(rb_objspace_t *objspace, rb_heap_t *heap, bool free_in_user_thread, bool *dequeued_unswept_page, bool *is_last_page)
 {
@@ -8631,6 +8620,7 @@ gc_sweeping_enter(rb_objspace_t *objspace, const char *from_fn)
     sweep_lock_lock(objspace);
     {
         objspace->background_sweep_mode = false;
+        objspace->background_sweep_restart_heaps = false;
     }
     sweep_lock_unlock(objspace);
 #if PSWEEP_COLLECT_TIMINGS > 0
