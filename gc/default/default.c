@@ -4925,7 +4925,7 @@ clear_pre_sweep_fields(rb_objspace_t *objspace, struct heap_page *page)
     }
 }
 
-#define SWEEP_CHUNK 2
+#define SWEEP_CHUNK 1
 
 /* Atomically claim a chunk of page indices to sweep. Returns true and writes [start, end)
  * into out params on success. Returns false when there is no more work to claim. */
@@ -5092,11 +5092,9 @@ gc_sweep_step_worker(rb_objspace_t *objspace, rb_heap_t *heap)
                 size_t cur_idx, cur_in_flight;
                 sweep_load_claim_state(heap, &cur_idx, &cur_in_flight);
                 size_t total = rb_darray_size(heap->sweep_pages);
-                if (cur_idx < total && total - cur_idx <= SWEEP_CHUNK) {
+                if (cur_idx < total && total - cur_idx <= SWEEP_CHUNK*2) {
                     no_more_work = true;
                     break;
-                } else if (chunk_sz == SWEEP_CHUNK && cur_idx < total && total - cur_idx <= (SWEEP_CHUNK * 2)) {
-                    chunk_sz = SWEEP_CHUNK/2;
                 }
 
                 size_t chunk_start, chunk_end;
