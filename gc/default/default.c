@@ -4925,7 +4925,7 @@ clear_pre_sweep_fields(rb_objspace_t *objspace, struct heap_page *page)
     }
 }
 
-#define SWEEP_CHUNK 4
+#define SWEEP_CHUNK 2
 
 /* Atomically claim a chunk of page indices to sweep. Returns true and writes [start, end)
  * into out params on success. Returns false when there is no more work to claim. */
@@ -5134,12 +5134,6 @@ gc_sweep_step_worker(rb_objspace_t *objspace, rb_heap_t *heap)
                 batch_tail = page;
             }
             batch_count++;
-
-            /* Halfway into a batch, do a cheap atomic peek at the abort flag.
-             * If a Ruby thread has raised it, drain what we have and bail */
-            if (batch_count == (chunk_sz / 2) && rbimpl_atomic_load(&objspace->background_sweep_abort, RBIMPL_ATOMIC_ACQUIRE)) {
-                break;
-            }
         }
 
         if (batch_head != NULL) {
