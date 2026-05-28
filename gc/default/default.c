@@ -5088,9 +5088,6 @@ sweep_thread_signal_enqueued_pages(rb_objspace_t *objspace, rb_heap_t *heap)
     // sweep_lock is acquired
     if (!objspace->background_sweep_mode) {
         rb_native_cond_signal(&heap->sweep_page_cond);
-        /*sweep_lock_set_unlocked(objspace);*/
-        /*rb_native_cond_wait(&heap->sweep_page_cond_done, &objspace->sweep_lock);*/
-        /*sweep_lock_set_locked(objspace);*/
     }
 }
 
@@ -5159,7 +5156,6 @@ gc_sweep_step_worker(rb_objspace_t *objspace, rb_heap_t *heap)
         struct heap_page *batch_tail = NULL;
         int batch_count = 0;
         bool no_more_work = false;
-        bool aborted_mid_batch = false;
         /* Pre-swept slots that will end up on this heap's free/pool list
          * (NOT pages going to the empty pool). Folded into heap->pre_swept_bg_slots
          * under sweep_lock at the bottom of this iteration. */
@@ -5230,7 +5226,6 @@ gc_sweep_step_worker(rb_objspace_t *objspace, rb_heap_t *heap)
             /* Halfway into a batch, do a cheap atomic peek at the abort flag.
              * If a Ruby thread has raised it, drain what we have and bail */
             if (batch_count == (chunk_sz / 2) && rbimpl_atomic_load(&objspace->background_sweep_abort, RBIMPL_ATOMIC_ACQUIRE)) {
-                aborted_mid_batch = true;
                 break;
             }
         }
@@ -5244,8 +5239,11 @@ gc_sweep_step_worker(rb_objspace_t *objspace, rb_heap_t *heap)
 
         if (batch_bg_slots > 0 && objspace->background_sweep_mode && !objspace->background_sweep_abort && !objspace->background_sweep_restart_heaps) {
             heap->pre_swept_bg_slots += batch_bg_slots;
-            if (!no_more_work && heap->pre_swept_bg_slots > slot_budget) {
+            if (!no_more_work && heap->pre_swept_bg_slots > slot_budget && !heap->skip_sweep_continue) {
                 heap->skip_sweep_continue = true;
+                return WORKER_NEXT_HEAP_BG;
+            }
+            else if (!no_more_work && heap->skip_sweep_continue && batch_bg_slots > slot_budget) {
                 return WORKER_NEXT_HEAP_BG;
             }
         }
@@ -5264,26 +5262,25 @@ gc_sweep_step_worker(rb_objspace_t *objspace, rb_heap_t *heap)
             }
         }
 
-        if (RB_UNLIKELY(aborted_mid_batch)) {
+        if (RB_UNLIKELY(objspace->background_sweep_abort)) {
             sweep_thread_signal_enqueued_pages(objspace, heap);
             return WORKER_ABORT_SWEEP_HEAPS;
+        } else if (objspace->background_sweep_restart_heaps) {
+            sweep_thread_signal_enqueued_pages(objspace, heap);
+            return WORKER_RESTART_SWEEP_HEAPS;
         }
 
         if (!objspace->background_sweep_mode) {
+            if (heap->skip_sweep_continue) {
+                sweep_thread_signal_enqueued_pages(objspace, heap);
+                return WORKER_SKIP_HEAP;
+            }
             /* Only honor the foreground-done break when the local cache is fully drained. */
             if (!objspace->sweep_rest && done_worker_incremental_sweep_steps_p(objspace, heap) &&
                     heap->worker_cache_start >= heap->worker_cache_end) {
                 heap->background_sweep_steps = ATOMIC_LOAD_RELAXED(heap->foreground_sweep_steps);
                 sweep_thread_signal_enqueued_pages(objspace, heap);
                 return WORKER_NEXT_HEAP_FG;
-            }
-        }
-        else {
-            if (RB_UNLIKELY(objspace->background_sweep_abort)) {
-                return WORKER_ABORT_SWEEP_HEAPS;
-            }
-            else if (objspace->background_sweep_restart_heaps) {
-                return WORKER_RESTART_SWEEP_HEAPS;
             }
         }
         // notify of newly swept pages in case Ruby thread is waiting on us
@@ -5341,9 +5338,9 @@ gc_sweep_thread_func(void *ptr)
             }
             enum sweep_step_worker_state state = gc_sweep_step_worker(objspace, heap);
             switch (state) {
-                case WORKER_SKIP_HEAP:
                 case WORKER_NEXT_HEAP_FG:
                 case WORKER_NEXT_HEAP_BG:
+                case WORKER_SKIP_HEAP:
                 case WORKER_DONE_HEAP:
                     break;
                 case WORKER_DONE_ALL_HEAPS:
@@ -5360,6 +5357,8 @@ gc_sweep_thread_func(void *ptr)
                 break;
             } else if (restart) {
                 objspace->background_sweep_restart_heaps = false;
+                goto restart_heaps;
+            } else if (i == HEAP_COUNT-1 && objspace->background_sweep_mode) {
                 goto restart_heaps;
             }
         }
@@ -6162,11 +6161,6 @@ gc_sweep_continue(rb_objspace_t *objspace, rb_heap_t *sweep_heap)
             rb_native_cond_signal(&objspace->sweep_cond);
         }
     }
-
-#if PSWEEP_LOCK_STATS > 0
-    current_step_type = 1;
-    step_contention[1].step_count++;
-#endif
 #endif // USE_PARALLEL_SWEEP
     for (int i = 0; i < HEAP_COUNT; i++) {
         rb_heap_t *heap = &heaps[i];
@@ -9078,8 +9072,6 @@ gc_sweeping_enter(rb_objspace_t *objspace, const char *from_fn)
     GC_ASSERT(during_gc != 0);
 
 #if USE_PARALLEL_SWEEP
-    MAYBE_UNUSED(const unsigned int immediate_sweep) = objspace->flags.immediate_sweep;
-    psweep_debug(1, "[gc] gc_sweeping_enter from %s (immediate:%u)\n", from_fn, immediate_sweep);
     sweep_lock_lock(objspace);
     {
         objspace->background_sweep_mode = false;
