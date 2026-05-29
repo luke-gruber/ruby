@@ -1491,36 +1491,7 @@ sweep_lock_set_unlocked(rb_objspace_t *objspace)
 static bool
 heap_is_sweep_done(rb_objspace_t *objspace, rb_heap_t *heap)
 {
-    if (heap->is_finished_sweeping) {
-        return true;
-    }
-
-    if (!objspace->use_background_sweep_thread) {
-        return heap->sweeping_page == NULL;
-    }
-
-    if (heap->sweeping_page) { // benign race
-        return false;
-    }
-
-    bool done;
-    sweep_lock_lock(objspace);
-    {
-        if (heap->sweeping_page || heap->swept_pages) {
-            done = false;
-        }
-        else if (heap->pre_sweeping_page) {
-            sweep_lock_set_unlocked(objspace);
-            rb_native_cond_wait(&heap->sweep_page_cond, &objspace->sweep_lock);
-            sweep_lock_set_locked(objspace);
-            done = false;
-        }
-        else {
-            done = true;
-        }
-    }
-    sweep_lock_unlock(objspace);
-    return done;
+    return heap->is_finished_sweeping;
 }
 #else
 static bool
@@ -4930,17 +4901,12 @@ gc_sweep_step_worker(rb_objspace_t *objspace, rb_heap_t *heap, int *swept_pages_
             return WORKER_DONE_HEAP;
         }
         struct heap_page *next = ccan_list_next(&heap->pages, page, page_node);
-        if (!next) {
-            heap->done_background_sweep = true;
-            objspace->heaps_done_background_sweep++;
-            return WORKER_DONE_HEAP;
-        }
         heap->sweeping_page = next;
         heap->pre_sweeping_page = page;
+        page->free_next = NULL;
         sweep_lock_unlock(objspace);
 
         GC_ASSERT(page->before_sweep);
-        page->free_next = NULL;
         gc_pre_sweep_page(objspace, heap, page);
         *swept_pages_num += 1;
 
@@ -4965,7 +4931,6 @@ gc_sweep_step_worker(rb_objspace_t *objspace, rb_heap_t *heap, int *swept_pages_
         {
             if (!heap->swept_pages) {
                 heap->swept_pages = page;
-                heap->latest_swept_page = page;
             }
             else {
                 heap->latest_swept_page->free_next = page;
