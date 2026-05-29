@@ -5331,7 +5331,6 @@ gc_sweep_finish(rb_objspace_t *objspace)
                 fprintf(stderr, "heap %ld zombies_created:%u freed_slots:%lu empty_slots:%lu zombie_slots:%lu, total_slots:%lu\n",
                     heap - heaps, heap->made_zombies, heap->freed_slots, heap->empty_slots, heap->zombie_slots, heap->total_slots);
             }
-
             rb_bug("MISMATCH: marked_slots:%lu, pooled_slots:%lu, empty_pages:%lu", objspace->marked_slots, objspace->rincgc.pooled_slots, objspace->empty_pages_count);
         }
     }
@@ -5539,14 +5538,24 @@ gc_sweep_step(rb_objspace_t *objspace, rb_heap_t *heap)
     bool use_sweep_thread = objspace->use_background_sweep_thread;
 #endif
     bool is_last_page = false;
+    bool dequeued_unswept_page;
+    bool free_in_user_thread_p;
+    struct heap_page *sweep_page;
+
+    if (!use_sweep_thread) {
+        sweep_lock_lock(objspace);
+        GC_ASSERT(!objspace->sweep_thread_sweeping);
+        GC_ASSERT(!objspace->sweep_thread_sweep_requested);
+        sweep_lock_unlock(objspace);
+    }
 
     while (1) {
 #if USE_PARALLEL_SWEEP
-        bool free_in_user_thread_p = !use_sweep_thread;
-        bool dequeued_unswept_page = false;
+        free_in_user_thread_p = !use_sweep_thread;
+        dequeued_unswept_page = false;
         // NOTE: pages we dequeue from the sweep thread need to be AFTER the list of heap->free_pages so we don't free from pages
         // we've allocated from since sweep started.
-        struct heap_page *sweep_page = gc_sweep_dequeue_page(objspace, heap, free_in_user_thread_p, &dequeued_unswept_page, &is_last_page);
+        sweep_page = gc_sweep_dequeue_page(objspace, heap, free_in_user_thread_p, &dequeued_unswept_page, &is_last_page);
         if (RB_UNLIKELY(!sweep_page)) {
             psweep_debug(-2, "[gc] gc_sweep_step heap:%p (%ld) deq() = nil, break\n", heap, heap - heaps);
             is_last_page = true;
@@ -5751,7 +5760,7 @@ gc_sweep_continue(rb_objspace_t *objspace, rb_heap_t *sweep_heap)
     gc_sweeping_enter(objspace, "gc_sweep_continue");
 
 #if USE_PARALLEL_SWEEP
-    if (objspace->sweep_thread) {
+    if (objspace->sweep_thread && objspace->use_background_sweep_thread) {
         bool signal = false;
         sweep_lock_lock(objspace);
         {
