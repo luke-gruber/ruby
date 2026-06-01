@@ -477,6 +477,18 @@ typedef struct rb_heap_struct {
     struct heap_page *compact_cursor;
     uintptr_t compact_cursor_index;
     struct heap_page *pooled_pages;
+    /* Lightly-demoted empty pages owned by this heap. Each page is also in
+     * objspace->empty_pages (dual membership) — this list is a per-heap index
+     * that lets gc_sweep_finish_heap and heap_page_allocate_and_initialize
+     * pop a same-heap empty page in O(1) without scanning the global list.
+     * Lightly-demoted pages have total_slots == 0 (so the standard
+     * "in empty pool" predicate still works) but keep heap, slot_size, start,
+     * freelist, and per-slot poison intact. The relink fast path recomputes
+     * total_slots and free_slots from slot_size+start; the only required work
+     * is a bitmap memset and the list link operations. Pages are pushed via
+     * page->empty_next. */
+    struct heap_page *empty_pages;
+    size_t empty_pages_count;
     size_t total_pages;      /* total page count in a heap */
     size_t total_slots;      /* total slot count */
 
@@ -835,7 +847,15 @@ struct heap_page {
 
     rb_heap_t *heap;
 
+    /* objspace->empty_pages is doubly-linked via free_next / free_prev so
+     * popping a page from the middle (e.g. when it was selected through the
+     * heap-local index list) is O(1). free_prev is NULL when the page is at
+     * the head, or when the page is not on the global empty list. */
     struct heap_page *free_next;
+    struct heap_page *free_prev;
+    /* heap->empty_pages is singly-linked via empty_next. NULL when the page
+     * is not on its heap's local empty list. */
+    struct heap_page *empty_next;
     struct heap_page_body *body;
     struct ccan_list_node page_node;
 
@@ -874,12 +894,26 @@ static inline bool
 heap_page_in_global_empty_pages_pool(rb_objspace_t *objspace, struct heap_page *page)
 {
     if (page->total_slots == 0) {
-        GC_ASSERT(page->start == 0);
-        GC_ASSERT(page->slot_size == 0);
-        GC_ASSERT(page->heap == NULL);
         GC_ASSERT(page->free_slots == 0);
-        asan_unpoisoning_memory_region(&page->freelist, sizeof(&page->freelist)) {
-            GC_ASSERT(page->freelist == NULL);
+        if (page->heap == NULL) {
+            /* Fully demoted (initial state, or after cross-heap reuse): all
+             * page state has been cleared; the page can be safely repurposed
+             * for any heap. */
+            GC_ASSERT(page->start == 0);
+            GC_ASSERT(page->slot_size == 0);
+            asan_unpoisoning_memory_region(&page->freelist, sizeof(&page->freelist)) {
+                GC_ASSERT(page->freelist == NULL);
+            }
+        }
+        else {
+            /* Lightly demoted: kept on heap->empty_pages so the same heap can
+             * relink it cheaply (no per-slot freelist walk, no bulk body
+             * unpoison). Metadata, freelist, and per-slot poison are intact. */
+            GC_ASSERT(page->start != 0);
+            GC_ASSERT(page->slot_size != 0);
+            asan_unpoisoning_memory_region(&page->freelist, sizeof(&page->freelist)) {
+                GC_ASSERT(page->freelist != NULL);
+            }
         }
 
         return true;
@@ -1253,6 +1287,10 @@ static bool gc_marks_continue(rb_objspace_t *objspace, rb_heap_t *heap);
 static void gc_sweep(rb_objspace_t *objspace);
 static void gc_sweep_finish_heap(rb_objspace_t *objspace, rb_heap_t *heap);
 static void gc_sweep_continue(rb_objspace_t *objspace, rb_heap_t *heap);
+
+static void empty_pages_local_unlink(rb_heap_t *heap, struct heap_page *page);
+static void heap_add_page(rb_objspace_t *objspace, rb_heap_t *heap, struct heap_page *page);
+static void heap_add_freepage(rb_heap_t *heap, struct heap_page *page);
 
 static inline void gc_mark(rb_objspace_t *objspace, VALUE ptr);
 static inline void gc_pin(rb_objspace_t *objspace, VALUE ptr);
@@ -1936,6 +1974,10 @@ heap_pages_free_unused_pages(rb_objspace_t *objspace)
 {
     if (objspace->empty_pages != NULL && heap_pages_freeable_pages > 0) {
         GC_ASSERT(objspace->empty_pages_count > 0);
+
+        /* Rebuild the global empty list as we walk sorted pages. Pages that
+         * survive are re-pushed onto the doubly-linked global list; pages
+         * that get freed are first unlinked from any heap-local index. */
         objspace->empty_pages = NULL;
         objspace->empty_pages_count = 0;
 
@@ -1944,12 +1986,25 @@ heap_pages_free_unused_pages(rb_objspace_t *objspace)
             struct heap_page *page = rb_darray_get(objspace->heap_pages.sorted, i);
 
             if (heap_page_in_global_empty_pages_pool(objspace, page) && heap_pages_freeable_pages > 0) {
+                if (page->heap != NULL) {
+                    /* Light-demoted: still on its origin heap's local index.
+                     * Unlink before freeing the page struct. */
+                    empty_pages_local_unlink(page->heap, page);
+                }
                 heap_page_free(objspace, page);
                 heap_pages_freeable_pages--;
             }
             else {
                 if (heap_page_in_global_empty_pages_pool(objspace, page)) {
+                    /* Re-link onto the (now-empty) global list, preserving
+                     * the doubly-linked invariant. The heap-local list (if
+                     * any) is unaffected. */
+                    page->free_prev = NULL;
+                    page->free_next = NULL;
                     page->free_next = objspace->empty_pages;
+                    if (objspace->empty_pages) {
+                        objspace->empty_pages->free_prev = page;
+                    }
                     objspace->empty_pages = page;
                     objspace->empty_pages_count++;
                 }
@@ -2069,20 +2124,219 @@ heap_page_body_allocate(void)
     return page_body;
 }
 
-static struct heap_page *
-heap_page_resurrect(rb_objspace_t *objspace)
+/* --- Empty pages list maintenance ---------------------------------------
+ *
+ * objspace->empty_pages is the global tomb pool; it's doubly-linked via
+ * page->free_next / page->free_prev so a page selected through a heap-local
+ * index can be unlinked from the middle in O(1).
+ *
+ * heap->empty_pages is a per-heap index of lightly-demoted pages owned by
+ * that heap. Light-demoted pages live on BOTH lists (dual membership) so
+ * gc_sweep_finish_heap can pop a same-heap page without scanning the global
+ * list, and so other consumers (cross-heap reuse, compaction, page free)
+ * still see them through the global list.
+ *
+ * Light-demoted pages keep heap, slot_size, slot_size_reciprocal, start,
+ * freelist, and per-slot asan poison intact. total_slots / free_slots are
+ * zeroed so heap_page_in_global_empty_pages_pool stays the canonical
+ * "in empty pool" predicate. The relink fast path recomputes total_slots
+ * from slot_size + start; the only work needed is bitmap memset + list
+ * relinks.
+ *
+ * Full-demoted pages have page->heap == NULL and zero metadata; they're
+ * only on the global list and can be safely added to any heap.
+ */
+
+static inline void
+empty_pages_global_push(rb_objspace_t *objspace, struct heap_page *page)
 {
-    struct heap_page *page = NULL;
-    if (objspace->empty_pages == NULL) {
-        GC_ASSERT(objspace->empty_pages_count == 0);
+    page->free_prev = NULL;
+    page->free_next = objspace->empty_pages;
+    if (objspace->empty_pages) {
+        objspace->empty_pages->free_prev = page;
+    }
+    objspace->empty_pages = page;
+    objspace->empty_pages_count++;
+}
+
+static inline void
+empty_pages_global_unlink(rb_objspace_t *objspace, struct heap_page *page)
+{
+    GC_ASSERT(objspace->empty_pages_count > 0);
+    if (page->free_prev) {
+        page->free_prev->free_next = page->free_next;
     }
     else {
-        GC_ASSERT(objspace->empty_pages_count > 0);
-        objspace->empty_pages_count--;
-        page = objspace->empty_pages;
+        GC_ASSERT(objspace->empty_pages == page);
         objspace->empty_pages = page->free_next;
     }
+    if (page->free_next) {
+        page->free_next->free_prev = page->free_prev;
+    }
+    page->free_prev = NULL;
+    page->free_next = NULL;
+    objspace->empty_pages_count--;
+}
 
+static inline void
+empty_pages_local_push(rb_heap_t *heap, struct heap_page *page)
+{
+    GC_ASSERT(page->empty_next == NULL);
+    page->empty_next = heap->empty_pages;
+    heap->empty_pages = page;
+    heap->empty_pages_count++;
+}
+
+static inline struct heap_page *
+empty_pages_local_pop(rb_heap_t *heap)
+{
+    struct heap_page *page = heap->empty_pages;
+    if (page == NULL) {
+        GC_ASSERT(heap->empty_pages_count == 0);
+        return NULL;
+    }
+    GC_ASSERT(heap->empty_pages_count > 0);
+    heap->empty_pages = page->empty_next;
+    page->empty_next = NULL;
+    heap->empty_pages_count--;
+    return page;
+}
+
+static void
+empty_pages_local_unlink(rb_heap_t *heap, struct heap_page *page)
+{
+    /* O(n) — only used when a cross-heap consumer pops a page from the
+     * global pool that's still on its origin heap's local list. The local
+     * list is short in steady state and this path is rare (cross-heap reuse
+     * and heap_pages_free_unused_pages only). */
+    struct heap_page **link = &heap->empty_pages;
+    while (*link != NULL && *link != page) {
+        link = &(*link)->empty_next;
+    }
+    GC_ASSERT(*link == page);
+    *link = page->empty_next;
+    page->empty_next = NULL;
+    GC_ASSERT(heap->empty_pages_count > 0);
+    heap->empty_pages_count--;
+}
+
+static void
+heap_page_full_demote_inplace(rb_objspace_t *objspace, struct heap_page *page)
+{
+    /* Caller is responsible for removing the page from any heap-local empty
+     * list AND for ensuring it's off heap->pages already (or never was on
+     * it). Pushes onto the global pool — caller must NOT push again. */
+    GC_ASSERT(page->empty_next == NULL);
+
+    page->heap = NULL;
+    page->start = 0;
+    page->total_slots = 0;
+    page->free_slots = 0;
+    page->slot_size = 0;
+    page->slot_size_reciprocal = 0;
+
+    asan_unlock_freelist(page);
+    page->freelist = NULL;
+    asan_poison_memory_region(page->body, HEAP_PAGE_SIZE);
+    asan_lock_freelist(page);
+
+    memset(&page->wb_unprotected_bits[0], 0, HEAP_PAGE_BITMAP_SIZE);
+    memset(&page->mark_bits[0], 0, HEAP_PAGE_BITMAP_SIZE);
+    memset(&page->uncollectible_bits[0], 0, HEAP_PAGE_BITMAP_SIZE);
+    memset(&page->marking_bits[0], 0, HEAP_PAGE_BITMAP_SIZE);
+    memset(&page->remembered_bits[0], 0, HEAP_PAGE_BITMAP_SIZE);
+    memset(&page->pinned_bits[0], 0, HEAP_PAGE_BITMAP_SIZE);
+    memset(&page->age_bits[0], 0, sizeof(page->age_bits));
+}
+
+static void
+heap_page_light_demote_to_empty(rb_objspace_t *objspace, rb_heap_t *heap, struct heap_page *page)
+{
+    /* Called from gc_sweep_step's wholly-empty branch. The page is still on
+     * heap->pages (caller has not yet unlinked) and its freelist holds every
+     * slot in the page. */
+    GC_ASSERT(page->heap == heap);
+    GC_ASSERT(page->free_slots == page->total_slots);
+
+    heap_unlink_page(objspace, heap, page);
+
+    /* Clear total_slots/free_slots so heap_page_in_global_empty_pages_pool
+     * returns true. Keep heap, slot_size, slot_size_reciprocal, start,
+     * freelist, and per-slot poison intact for the fast relink path. */
+    page->total_slots = 0;
+    page->free_slots = 0;
+
+    memset(&page->wb_unprotected_bits[0], 0, HEAP_PAGE_BITMAP_SIZE);
+    memset(&page->mark_bits[0], 0, HEAP_PAGE_BITMAP_SIZE);
+    memset(&page->uncollectible_bits[0], 0, HEAP_PAGE_BITMAP_SIZE);
+    memset(&page->marking_bits[0], 0, HEAP_PAGE_BITMAP_SIZE);
+    memset(&page->remembered_bits[0], 0, HEAP_PAGE_BITMAP_SIZE);
+    memset(&page->pinned_bits[0], 0, HEAP_PAGE_BITMAP_SIZE);
+    memset(&page->age_bits[0], 0, sizeof(page->age_bits));
+
+    /* Dual membership: insert into both global and local lists. */
+    empty_pages_global_push(objspace, page);
+    empty_pages_local_push(heap, page);
+}
+
+static void
+heap_relink_empty_page(rb_heap_t *heap, struct heap_page *page)
+{
+    /* Fast path. Caller has already removed `page` from heap->empty_pages
+     * (local) and objspace->empty_pages (global). Page is light-demoted
+     * and still assigned to this heap; metadata + freelist are intact. */
+    GC_ASSERT(page->heap == heap);
+    GC_ASSERT(page->slot_size == heap->slot_size);
+    GC_ASSERT(page->start != 0);
+    GC_ASSERT(page->total_slots == 0);
+    GC_ASSERT(page->free_slots == 0);
+    GC_ASSERT(page->free_next == NULL);
+    GC_ASSERT(page->free_prev == NULL);
+    GC_ASSERT(page->empty_next == NULL);
+
+    uintptr_t start = page->start;
+    int slot_count = (int)((HEAP_PAGE_SIZE - (start - (uintptr_t)page->body)) / heap->slot_size);
+
+    page->total_slots = slot_count;
+    page->free_slots = slot_count;
+
+    heap->total_allocated_pages++;
+    ccan_list_add_tail(&heap->pages, &page->page_node);
+    heap->total_pages++;
+    heap->total_slots += page->total_slots;
+}
+
+static struct heap_page *
+heap_page_resurrect(rb_objspace_t *objspace, rb_heap_t *target_heap)
+{
+    /* Same-heap fast path: pop a light-demoted page and relink in place.
+     * No per-slot freelist walk, no body memset, no asan unpoison. */
+    if (target_heap->empty_pages != NULL) {
+        struct heap_page *page = empty_pages_local_pop(target_heap);
+        empty_pages_global_unlink(objspace, page);
+        heap_relink_empty_page(target_heap, page);
+        heap_add_freepage(target_heap, page);
+        return page;
+    }
+
+    /* Slow path: nothing in the heap-local index. Pop from global pool. */
+    if (objspace->empty_pages == NULL) {
+        GC_ASSERT(objspace->empty_pages_count == 0);
+        return NULL;
+    }
+    struct heap_page *page = objspace->empty_pages;
+    empty_pages_global_unlink(objspace, page);
+
+    if (page->heap != NULL) {
+        /* Light-demoted for a different heap. Pull it off that heap's
+         * local list and fully clear so it's safe to repurpose. */
+        empty_pages_local_unlink(page->heap, page);
+        heap_page_full_demote_inplace(objspace, page);
+    }
+
+    GC_ASSERT(heap_page_in_global_empty_pages_pool(objspace, page));
+    heap_add_page(objspace, target_heap, page);
+    heap_add_freepage(target_heap, page);
     return page;
 }
 
@@ -2182,19 +2436,19 @@ heap_page_allocate_and_initialize(rb_objspace_t *objspace, rb_heap_t *heap)
                   rb_darray_size(objspace->heap_pages.sorted), objspace->heap_pages.allocatable_bytes, heap->total_pages);
 
     bool allocated = false;
-    struct heap_page *page = heap_page_resurrect(objspace);
+    struct heap_page *page = heap_page_resurrect(objspace, heap);
 
     if (page == NULL && objspace->heap_pages.allocatable_bytes > 0) {
         page = heap_page_allocate(objspace);
         allocated = true;
 
         GC_ASSERT(page != NULL);
+
+        heap_add_page(objspace, heap, page);
+        heap_add_freepage(heap, page);
     }
 
     if (page != NULL) {
-        heap_add_page(objspace, heap, page);
-        heap_add_freepage(heap, page);
-
         if (allocated) {
             size_t page_bytes = (size_t)page->total_slots * page->slot_size;
             if (objspace->heap_pages.allocatable_bytes > page_bytes) {
@@ -3962,16 +4216,15 @@ gc_sweep_finish_heap(rb_objspace_t *objspace, rb_heap_t *heap)
     if (swept_slots < min_free_slots &&
             /* The heap is a growth heap if it freed more slots than had empty slots. */
             ((heap->empty_slots == 0 && total_slots > 0) || heap->freed_slots > heap->empty_slots)) {
-        /* If we don't have enough slots and we have pages on the tomb heap, move
-        * pages from the tomb heap to the eden heap. This may prevent page
-        * creation thrashing (frequently allocating and deallocting pages) and
-        * GC thrashing (running GC more frequently than required). */
+        /* If we don't have enough slots and we have empty pages (locally
+         * owned or in the global tomb pool), pull them back in to avoid
+         * page-create thrashing. heap_page_resurrect prefers the heap-local
+         * fast path (light-demoted, same-heap pages relink without rebuilding
+         * the freelist or unpoisoning the body) before falling back to the
+         * global pool. */
         struct heap_page *resurrected_page;
         while (swept_slots < min_free_slots &&
-                (resurrected_page = heap_page_resurrect(objspace))) {
-            heap_add_page(objspace, heap, resurrected_page);
-            heap_add_freepage(heap, resurrected_page);
-
+                (resurrected_page = heap_page_resurrect(objspace, heap))) {
             swept_slots += resurrected_page->free_slots;
         }
 
@@ -4066,24 +4319,14 @@ gc_sweep_step(rb_objspace_t *objspace, rb_heap_t *heap)
         heap->sweeping_page = ccan_list_next(&heap->pages, sweep_page, page_node);
 
         if (free_slots == sweep_page->total_slots) {
-            /* There are no living objects, so move this page to the global empty pages. */
-            heap_unlink_page(objspace, heap, sweep_page);
-
-            sweep_page->start = 0;
-            sweep_page->total_slots = 0;
-            sweep_page->slot_size = 0;
-            sweep_page->heap = NULL;
-            sweep_page->free_slots = 0;
-
-            asan_unlock_freelist(sweep_page);
-            sweep_page->freelist = NULL;
-            asan_lock_freelist(sweep_page);
-
-            asan_poison_memory_region(sweep_page->body, HEAP_PAGE_SIZE);
-
-            objspace->empty_pages_count++;
-            sweep_page->free_next = objspace->empty_pages;
-            objspace->empty_pages = sweep_page;
+            /* No living objects on this page. Light-demote in place: keep
+             * heap, slot_size, start, freelist, and per-slot poison intact,
+             * and insert into BOTH the global tomb pool and this heap's
+             * local empty index. If the same heap needs a page again
+             * later (compaction destination, gc_sweep_finish_heap shortfall,
+             * heap_page_allocate_and_initialize), the relink fast path can
+             * skip the demote+resurrect roundtrip entirely. */
+            heap_page_light_demote_to_empty(objspace, heap, sweep_page);
         }
         else if (free_slots > 0) {
             heap->freed_slots += ctx.freed_slots;
