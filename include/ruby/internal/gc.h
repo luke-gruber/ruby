@@ -415,6 +415,11 @@ void rb_gc_unregister_address(VALUE *valptr);
  */
 void rb_gc_register_mark_object(VALUE object);
 
+
+#if USE_PARALLEL_SWEEP
+bool is_sweep_thread_p(void);
+#endif
+
 RBIMPL_SYMBOL_EXPORT_END()
 
 /**

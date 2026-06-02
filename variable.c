@@ -580,6 +580,7 @@ void
 rb_free_generic_fields_tbl_(void)
 {
     st_free_table(generic_fields_tbl_);
+    generic_fields_tbl_ = NULL;
 }
 
 static struct rb_global_entry*
@@ -2646,6 +2647,48 @@ rb_mod_const_missing(VALUE klass, VALUE name)
     UNREACHABLE_RETURN(Qnil);
 }
 
+#if USE_PARALLEL_SWEEP
+rb_nativethread_lock_t autoload_free_lock = PTHREAD_MUTEX_INITIALIZER;
+pthread_t autoload_free_lock_owner;
+
+static inline void
+ASSERT_autoload_free_lock_locked(void)
+{
+    VM_ASSERT(pthread_self() == autoload_free_lock_owner);
+}
+
+static inline void
+ASSERT_autoload_free_lock_unlocked(void)
+{
+    VM_ASSERT(pthread_self() != autoload_free_lock_owner);
+}
+
+static inline void
+autoload_free_lock_lock(void)
+{
+#if VM_CHECK_MODE > 0
+    ASSERT_autoload_free_lock_unlocked();
+#endif
+    rb_native_mutex_lock(&autoload_free_lock);
+#if VM_CHECK_MODE > 0
+    autoload_free_lock_owner = pthread_self();
+#endif
+}
+
+static inline void
+autoload_free_lock_unlock(void)
+{
+#if VM_CHECK_MODE > 0
+    ASSERT_autoload_free_lock_locked();
+    autoload_free_lock_owner = 0;
+#endif
+    rb_native_mutex_unlock(&autoload_free_lock);
+}
+#else
+#define autoload_free_lock_lock() (void)0
+#define autoload_free_lock_unlock() (void)0
+#endif // USE_PARALLEL_SWEEP
+
 static void
 autoload_table_mark(void *ptr)
 {
@@ -2674,7 +2717,7 @@ autoload_table_compact(void *ptr)
 static const rb_data_type_t autoload_table_type = {
     "autoload_table",
     {autoload_table_mark, autoload_table_free, autoload_table_memsize, autoload_table_compact,},
-    0, 0, RUBY_TYPED_FREE_IMMEDIATELY | RUBY_TYPED_WB_PROTECTED
+    0, 0, RUBY_TYPED_FREE_IMMEDIATELY | RUBY_TYPED_WB_PROTECTED | RUBY_TYPED_CONCURRENT_FREE_SAFE
 };
 
 #define check_autoload_table(av) \
@@ -2767,10 +2810,14 @@ autoload_data_free(void *ptr)
 {
     struct autoload_data *p = ptr;
 
-    struct autoload_const *autoload_const, *next;
-    ccan_list_for_each_safe(&p->constants, autoload_const, next, cnode) {
-        ccan_list_del_init(&autoload_const->cnode);
+    autoload_free_lock_lock();
+    {
+        struct autoload_const *autoload_const, *next;
+        ccan_list_for_each_safe(&p->constants, autoload_const, next, cnode) {
+            ccan_list_del_init(&autoload_const->cnode);
+        }
     }
+    autoload_free_lock_unlock();
 
     SIZED_FREE(p);
 }
@@ -2784,7 +2831,7 @@ autoload_data_memsize(const void *ptr)
 static const rb_data_type_t autoload_data_type = {
     "autoload_data",
     {autoload_data_mark_and_move, autoload_data_free, autoload_data_memsize, autoload_data_mark_and_move},
-    0, 0, RUBY_TYPED_FREE_IMMEDIATELY | RUBY_TYPED_WB_PROTECTED
+    0, 0, RUBY_TYPED_FREE_IMMEDIATELY | RUBY_TYPED_WB_PROTECTED | RUBY_TYPED_CONCURRENT_FREE_SAFE
 };
 
 static void
@@ -2810,14 +2857,19 @@ autoload_const_free(void *ptr)
 {
     struct autoload_const *autoload_const = ptr;
 
-    ccan_list_del(&autoload_const->cnode);
+    autoload_free_lock_lock();
+    {
+        ccan_list_del(&autoload_const->cnode);
+    }
+    autoload_free_lock_unlock();
+
     SIZED_FREE(autoload_const);
 }
 
 static const rb_data_type_t autoload_const_type = {
     "autoload_const",
     {autoload_const_mark_and_move, autoload_const_free, autoload_const_memsize, autoload_const_mark_and_move,},
-    0, 0, RUBY_TYPED_FREE_IMMEDIATELY | RUBY_TYPED_WB_PROTECTED
+    0, 0, RUBY_TYPED_FREE_IMMEDIATELY | RUBY_TYPED_WB_PROTECTED | RUBY_TYPED_CONCURRENT_FREE_SAFE
 };
 
 static struct autoload_data *

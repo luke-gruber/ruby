@@ -188,6 +188,9 @@ void rb_objspace_set_event_hook(const rb_event_flag_t event);
 VALUE rb_objspace_gc_enable(void *objspace);
 VALUE rb_objspace_gc_disable(void *objspace);
 void ruby_gc_set_params(void);
+#if USE_PARALLEL_SWEEP
+void rb_gc_parallel_sweep_start(void);
+#endif
 void rb_gc_copy_attributes(VALUE dest, VALUE obj);
 size_t rb_size_mul_or_raise(size_t, size_t, VALUE); /* used in compile.c */
 size_t rb_size_mul_add_or_raise(size_t, size_t, size_t, VALUE); /* used in iseq.h */

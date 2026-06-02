@@ -36,6 +36,7 @@
 
 #if RBIMPL_COMPILER_IS(MSVC)
 # pragma intrinsic(_InterlockedOr)
+# pragma intrinsic(_InterlockedAnd)
 #elif defined(__sun) && defined(HAVE_ATOMIC_H)
 # include <atomic.h>
 #endif
