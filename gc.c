@@ -1734,8 +1734,10 @@ rb_gc_obj_free(void *objspace, VALUE obj)
         rb_imemo_free((VALUE)obj);
         break;
 
-      case T_ZOMBIE:
-        GC_ASSERT(FL_TEST(obj, FL_FREEZE));
+      case T_ZOMBIE: // only okay for default GC
+        if (!FL_TEST(obj, FL_FREEZE)) {
+            rb_bug("obj_free() called for broken object (T_ZOMBIE)");
+        }
         GC_ASSERT(!FL_TEST(obj, FL_FINALIZE));
         void rb_gc_impl_free_zombie(rb_objspace_t *, VALUE);
         rb_gc_impl_free_zombie(objspace, obj);
@@ -2142,9 +2144,9 @@ id2ref_tbl_memsize(const void *data)
 static void
 id2ref_tbl_free(void *data)
 {
+    id2ref_tbl = NULL; // clear global ref
     st_table *table = (st_table *)data;
     st_free_table(table);
-    RUBY_ATOMIC_PTR_SET(id2ref_tbl, NULL); // clear global ref
 }
 
 static const rb_data_type_t id2ref_tbl_type = {
@@ -2174,7 +2176,7 @@ class_object_id(VALUE klass)
         }
         else {
             if (RB_UNLIKELY(id2ref_tbl)) {
-                st_insert(id2ref_tbl, id, klass); // needs VM lock for allocation
+                st_insert(id2ref_tbl, id, klass);
             }
         }
         RB_GC_VM_UNLOCK(lock_lev);
@@ -2221,9 +2223,9 @@ object_id0(VALUE obj)
     RUBY_ASSERT(RBASIC_SHAPE_ID(obj) == object_id_shape_id);
     RUBY_ASSERT(rb_obj_shape_has_id(obj));
 
-    if (RB_UNLIKELY(RUBY_ATOMIC_PTR_LOAD(id2ref_tbl))) {
+    if (RB_UNLIKELY(id2ref_tbl)) {
         RB_VM_LOCKING() {
-            st_insert(id2ref_tbl, (st_data_t)id, (st_data_t)obj); // needs VM lock for allocation
+            st_insert(id2ref_tbl, (st_data_t)id, (st_data_t)obj);
         }
     }
     return id;
@@ -2261,8 +2263,6 @@ build_id2ref_i(VALUE obj, void *data)
 {
     st_table *id2ref_tbl = (st_table *)data;
 
-    if (rb_objspace_garbage_object_p(obj)) return;
-
     switch (BUILTIN_TYPE(obj)) {
       case T_CLASS:
       case T_MODULE:
@@ -2296,7 +2296,7 @@ object_id_to_ref(void *objspace_ptr, VALUE object_id)
 
     unsigned int lev = RB_GC_VM_LOCK();
 
-    if (!RUBY_ATOMIC_PTR_LOAD(id2ref_tbl)) {
+    if (!id2ref_tbl) {
         rb_gc_vm_barrier(); // stop other ractors but sweep thread could still be running
 
         // GC Must not trigger while we build the table, otherwise if we end
@@ -2306,21 +2306,20 @@ object_id_to_ref(void *objspace_ptr, VALUE object_id)
         VALUE tmp_id2ref_value = TypedData_Wrap_Struct(0, &id2ref_tbl_type, tmp_id2ref_tbl);
 
         // build_id2ref_i will most certainly malloc, which could trigger GC and sweep
-        // objects we just added to the table. The sweep thread could still be running so
-        // we need to handle garbage objects.
+        // objects we just added to the table.
+        // By calling rb_gc_disable() we also save having to handle potentially garbage objects.
         bool gc_disabled = RTEST(rb_gc_disable());
         {
             id2ref_value = tmp_id2ref_value;
 
             rb_gc_impl_each_object(objspace, build_id2ref_i, (void *)tmp_id2ref_tbl);
-            RUBY_ATOMIC_PTR_SET(id2ref_tbl, tmp_id2ref_tbl);
+            id2ref_tbl = tmp_id2ref_tbl;
         }
         if (!gc_disabled) rb_gc_enable();
     }
 
     VALUE obj;
-    bool found;
-    found = st_lookup(id2ref_tbl, object_id, &obj) && !rb_gc_impl_garbage_object_p(objspace, obj);
+    bool found = st_lookup(id2ref_tbl, object_id, &obj) && !rb_gc_impl_garbage_object_p(objspace, obj);
 
     RB_GC_VM_UNLOCK(lev);
 
@@ -4257,7 +4256,6 @@ vm_weak_table_gen_fields_foreach(st_data_t key, st_data_t value, st_data_t data)
     if (key != new_key || value != new_value) {
         DURING_GC_COULD_MALLOC_REGION_START();
         {
-            // We're STW, no need for gen_fields_tbl_lock
             st_insert(rb_generic_fields_tbl_get(), (st_data_t)new_key, new_value);
         }
         DURING_GC_COULD_MALLOC_REGION_END();
@@ -4343,7 +4341,7 @@ rb_gc_vm_weak_table_foreach(vm_table_foreach_callback_func callback,
         break;
       }
       case RB_GC_VM_ID2REF_TABLE: {
-        if (id2ref_tbl) { // we're STW, no need for lock
+        if (id2ref_tbl) {
             st_foreach_with_replace(
                 id2ref_tbl,
                 vm_weak_table_id2ref_foreach,
@@ -4355,7 +4353,7 @@ rb_gc_vm_weak_table_foreach(vm_table_foreach_callback_func callback,
       }
       case RB_GC_VM_GENERIC_FIELDS_TABLE: {
         st_table *generic_fields_tbl = rb_generic_fields_tbl_get();
-        if (generic_fields_tbl) { // we're STW, no need for lock
+        if (generic_fields_tbl) {
             st_foreach(
                 generic_fields_tbl,
                 vm_weak_table_gen_fields_foreach,

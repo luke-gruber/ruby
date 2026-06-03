@@ -804,7 +804,9 @@ typedef struct rb_vm_struct {
             void *data;
             void (*mark_func)(VALUE v, void *data);
         } *mark_func_data;
+#if USE_PARALLEL_SWEEP
         pthread_t sweep_thread;
+#endif
     } gc;
 
     rb_at_exit_list *at_exit;
@@ -2187,10 +2189,12 @@ rb_current_vm(void)
 static inline rb_ractor_t *
 rb_current_ractor(void)
 {
+#if VM_CHECK_MODE > 0 && USE_PARALLEL_SWEEP
     rb_vm_t *vm = GET_VM();
     if (vm) {
         VM_ASSERT(vm->gc.sweep_thread != pthread_self());
     }
+#endif
     return rb_current_ractor_raw(true);
 }
 

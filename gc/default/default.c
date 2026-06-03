@@ -3622,7 +3622,11 @@ rb_gc_impl_shutdown_free_objects(void *objspace_ptr)
         for (; p < pend; p += stride) {
             VALUE vp = (VALUE)p;
             asan_unpoisoning_object(vp) {
-                if (RB_BUILTIN_TYPE(vp) != T_NONE) {
+                enum ruby_value_type type = RB_BUILTIN_TYPE(vp);
+                if (type == T_ZOMBIE && !ZOMBIE_NEEDS_FREE_P(vp)) {
+                    // do nothing
+                }
+                else if (type != T_NONE) {
                     rb_gc_obj_free_vm_weak_references(vp);
                     if (rb_gc_obj_free(objspace, vp)) {
                         RBASIC(vp)->flags = 0;
