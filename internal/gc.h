@@ -188,9 +188,6 @@ void rb_objspace_set_event_hook(const rb_event_flag_t event);
 VALUE rb_objspace_gc_enable(void *objspace);
 VALUE rb_objspace_gc_disable(void *objspace);
 void ruby_gc_set_params(void);
-#if USE_PARALLEL_SWEEP
-void rb_gc_parallel_sweep_start(void);
-#endif
 void rb_gc_copy_attributes(VALUE dest, VALUE obj);
 size_t rb_size_mul_or_raise(size_t, size_t, VALUE); /* used in compile.c */
 size_t rb_size_mul_add_or_raise(size_t, size_t, size_t, VALUE); /* used in iseq.h */
@@ -222,6 +219,8 @@ void rb_gc_initial_stress_set(VALUE flag);
 
 void rb_gc_before_fork(void);
 void rb_gc_after_fork(rb_pid_t pid);
+
+void rb_gc_enter_vm_destruct(void *objspace);
 
 #define rb_gc_mark_and_move_ptr(ptr) do { \
     VALUE _obj = (VALUE)*(ptr); \
@@ -263,6 +262,11 @@ void rb_gc_update_set_refs(st_table *);
 #if USE_MODULAR_GC
 const char *rb_gc_active_gc_name(void);
 int rb_gc_modular_gc_loaded_p(void);
+#endif
+
+#if USE_PARALLEL_SWEEP
+void rb_gc_parallel_sweep_start(void);
+bool is_sweep_thread_p(void);
 #endif
 
 RUBY_SYMBOL_EXPORT_END

@@ -612,6 +612,7 @@ typedef struct gc_function_map {
     void (*init)(void);
     size_t *(*heap_sizes)(void *objspace_ptr);
     // Shutdown
+    void (*enter_vm_destruct)(void *objspace_ptr);
     void (*shutdown_free_objects)(void *objspace_ptr);
     void (*objspace_free)(void *objspace_ptr);
     void (*ractor_cache_free)(void *objspace_ptr, void *cache);
@@ -791,6 +792,7 @@ ruby_modular_gc_init(void)
     load_modular_gc_func(init);
     load_modular_gc_func(heap_sizes);
     // Shutdown
+    load_modular_gc_func(enter_vm_destruct);
     load_modular_gc_func(shutdown_free_objects);
     load_modular_gc_func(objspace_free);
     load_modular_gc_func(ractor_cache_free);
@@ -879,6 +881,7 @@ ruby_modular_gc_init(void)
 # define rb_gc_impl_init rb_gc_functions.init
 # define rb_gc_impl_heap_sizes rb_gc_functions.heap_sizes
 // Shutdown
+# define rb_gc_impl_enter_vm_destruct rb_gc_functions.enter_vm_destruct
 # define rb_gc_impl_shutdown_free_objects rb_gc_functions.shutdown_free_objects
 # define rb_gc_impl_objspace_free rb_gc_functions.objspace_free
 # define rb_gc_impl_ractor_cache_free rb_gc_functions.ractor_cache_free
@@ -2042,6 +2045,12 @@ void
 rb_objspace_free_objects(void *objspace)
 {
     rb_gc_impl_shutdown_free_objects(objspace);
+}
+
+void
+rb_gc_enter_vm_destruct(void *objspace)
+{
+    rb_gc_impl_enter_vm_destruct(objspace);
 }
 
 int

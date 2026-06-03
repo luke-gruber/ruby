@@ -702,6 +702,11 @@ rb_mmtk_obj_free_iter_wrapper(VALUE obj, void *data)
 static void each_object(struct objspace *objspace, int (*func)(VALUE, void *), void *data);
 
 void
+rb_gc_impl_enter_vm_destruct(void *objspace_ptr)
+{
+}
+
+void
 rb_gc_impl_shutdown_free_objects(void *objspace_ptr)
 {
     mmtk_set_gc_enabled(false);

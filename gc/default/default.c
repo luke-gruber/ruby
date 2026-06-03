@@ -3600,6 +3600,15 @@ gc_abort(void *objspace_ptr)
 }
 
 void
+rb_gc_impl_enter_vm_destruct(void *objspace_ptr)
+{
+#if USE_PARALLEL_SWEEP
+    rb_objspace_t *objspace = objspace_ptr;
+    wait_for_background_sweeping_to_finish(objspace, false, false, "vm_destruct");
+#endif
+}
+
+void
 rb_gc_impl_shutdown_free_objects(void *objspace_ptr)
 {
     rb_objspace_t *objspace = objspace_ptr;

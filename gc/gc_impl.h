@@ -40,6 +40,7 @@ GC_IMPL_FN void rb_gc_impl_set_params(void *objspace_ptr);
 GC_IMPL_FN void rb_gc_impl_init(void);
 GC_IMPL_FN size_t *rb_gc_impl_heap_sizes(void *objspace_ptr);
 // Shutdown
+GC_IMPL_FN void rb_gc_impl_enter_vm_destruct(void *objspace_ptr);
 GC_IMPL_FN void rb_gc_impl_shutdown_free_objects(void *objspace_ptr);
 GC_IMPL_FN void rb_gc_impl_objspace_free(void *objspace_ptr);
 GC_IMPL_FN void rb_gc_impl_ractor_cache_free(void *objspace_ptr, void *cache);

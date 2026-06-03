@@ -530,6 +530,12 @@ rb_gc_impl_heap_sizes(void *objspace_ptr)
 
 // Shutdown
 void
+rb_gc_impl_enter_vm_destruct(void *objspace_ptr)
+{
+    // Stub implementation
+}
+
+void
 rb_gc_impl_shutdown_free_objects(void *objspace_ptr)
 {
     // Stub implementation
