@@ -3173,4 +3173,51 @@ CODE
       4.times { GC.start } # Now the tracepoints can be GC'd because the ractors can be GC'd
     end;
   end
+
+  # A pure pass-through wrapper such as `def fwd(*args) = sink(*args)` is compiled with a
+  # hidden forwarding iseq that only materializes the `...` slot. That fast path is skipped
+  # once any iseq-level trace event has been enabled, so a TracePoint :call handler can see
+  # the wrapper's real `*args`/`**kwargs`/`&block` locals via the binding.
+  def test_call_binding_in_forwarding_wrapper
+    def sink_fwd(a, b, c) = [a, b, c]
+    def fwd_wrapper(*args) = sink_fwd(*args)
+
+    # (a) Tracing enabled before the wrapper's call cache is ever populated.
+    seen = []
+    tp = TracePoint.new(:call) do |t|
+      next if t.method_id != :fwd_wrapper
+      seen << [t.binding.eval("args"), t.binding.local_variables.sort]
+    end
+    tp.enable { fwd_wrapper(1, 2, 3) }
+    assert_equal [[[1, 2, 3], [:args]]], seen
+
+    # (b) Wrapper exercised first WITHOUT tracing (warms the optimized cc), then traced:
+    # the already-cached fast-path cc must be evicted so `args` is still visible.
+    100.times { fwd_wrapper(0, 0, 0) }
+    seen.clear
+    tp.enable { fwd_wrapper(4, 5, 6) }
+    assert_equal [[[4, 5, 6], [:args]]], seen
+  ensure
+    self.class.remove_method(:sink_fwd) if self.class.method_defined?(:sink_fwd)
+    self.class.remove_method(:fwd_wrapper) if self.class.method_defined?(:fwd_wrapper)
+  end
+
+  # The full forwarding shape: the binding sees args, kwargs and the block local too.
+  def test_call_binding_in_forwarding_wrapper_kwargs_block
+    def sink_fwd2(*a, **k, &b) = [a, k, (b&.call)]
+    def fwd_wrapper2(*args, **kwargs, &block) = sink_fwd2(*args, **kwargs, &block)
+
+    fwd_wrapper2(0, x: 0) # warm/optimize without tracing
+    seen = []
+    tp = TracePoint.new(:call) do |t|
+      next if t.method_id != :fwd_wrapper2
+      seen << [t.binding.eval("args"), t.binding.eval("kwargs"), t.binding.local_variables.sort]
+    end
+    result = tp.enable { fwd_wrapper2(7, y: 8) { :blk } }
+    assert_equal [[[7], {y: 8}, [:args, :block, :kwargs]]], seen
+    assert_equal [[7], {y: 8}, :blk], result
+  ensure
+    self.class.remove_method(:sink_fwd2) if self.class.method_defined?(:sink_fwd2)
+    self.class.remove_method(:fwd_wrapper2) if self.class.method_defined?(:fwd_wrapper2)
+  end
 end

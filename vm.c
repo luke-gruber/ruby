@@ -719,6 +719,7 @@ rb_event_flag_t ruby_vm_event_flags = 0;
 rb_event_flag_t ruby_vm_event_enabled_global_flags = 0;
 unsigned int    ruby_vm_c_events_enabled = 0;
 unsigned int    ruby_vm_iseq_events_enabled = 0;
+bool            ruby_vm_iseq_trace_events_enabled_ever = false;
 
 rb_serial_t ruby_vm_constant_cache_invalidations = 0;
 rb_serial_t ruby_vm_constant_cache_misses = 0;

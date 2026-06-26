@@ -1663,11 +1663,10 @@ get_overloaded_cme(const rb_callable_method_entry_t *cme)
 
         RB_OBJ_WRITE(me, &def->body.iseq.cref, cme->def->body.iseq.cref);
 
-        // Dispatch to whichever alternate iseq this method carries. The two are mutually
-        // exclusive: a forwarding wrapper is never a mandatory-only builtin.
         const rb_iseq_t *iseqptr = cme->def->body.iseq.iseqptr;
-        const rb_iseq_t *alt_iseq = ISEQ_BODY(iseqptr)->forwarding_iseq;
-        if (alt_iseq == NULL) alt_iseq = ISEQ_BODY(iseqptr)->mandatory_only_iseq;
+        const rb_iseq_t *alt_iseq = ISEQ_BODY(iseqptr)->mandatory_only_iseq;
+        if (alt_iseq == NULL) alt_iseq = ISEQ_BODY(iseqptr)->forwarding_iseq;
+        VM_ASSERT(alt_iseq != NULL, "iseq_overload set but no alternate iseq");
         RB_OBJ_WRITE(me, &def->body.iseq.iseqptr, alt_iseq);
 
         ASSERT_vm_locking();
@@ -1675,6 +1674,67 @@ get_overloaded_cme(const rb_callable_method_entry_t *cme)
 
         METHOD_ENTRY_VISI_SET(me, METHOD_ENTRY_VISI(cme));
         return (rb_callable_method_entry_t *)me;
+    }
+}
+
+struct invalidate_forwardable_arg {
+    const rb_callable_method_entry_t **cmes;
+    int len;
+    int capa;
+};
+
+static int
+collect_forwardable_cme_i(st_data_t key, st_data_t value, st_data_t data)
+{
+    const rb_callable_method_entry_t *cme = (const rb_callable_method_entry_t *)key;
+    struct invalidate_forwardable_arg *arg = (struct invalidate_forwardable_arg *)data;
+
+    // Check for garbage before touching ->def: the table can still hold entries whose
+    // key cme has been collected but not yet swept out.
+    if (!rb_objspace_garbage_object_p((VALUE)cme) &&
+        cme->def->type == VM_METHOD_TYPE_ISEQ) {
+        const rb_iseq_t *iseq = method_entry_iseqptr(cme);
+        if (iseq != NULL && ISEQ_BODY(iseq)->forwarding_iseq != NULL) {
+            if (arg->len == arg->capa) {
+                int new_capa = arg->capa == 0 ? 8 : arg->capa * 2;
+                SIZED_REALLOC_N(arg->cmes, const rb_callable_method_entry_t *, new_capa, arg->capa);
+                arg->capa = new_capa;
+            }
+            arg->cmes[arg->len++] = cme;
+        }
+    }
+
+    return ST_CONTINUE;
+}
+
+// Called once, the first time an iseq-level trace event is ever enabled: invalidate the
+// inline/global method caches for every pure pass-through forwarding wrapper so that any
+// already-cached swap to the optimized forwarding iseq is dropped. On the next call each
+// wrapper re-resolves through rb_check_overloaded_cme, which now keeps the canonical
+// primary iseq (so a TracePoint binding sees the real `*args`/etc.). Eviction goes through
+// rb_clear_method_cache (rather than a bare vm_cc_invalidate) because a swapped forwarding
+// cc lives in the per-class ccs table and is matched only by argc/flag -- it would
+// otherwise be handed back stale on the next lookup.
+void
+rb_clear_forwardable_ccs(void)
+{
+    ASSERT_vm_locking();
+
+    // Collect targets first: rb_clear_method_cache below can mutate overloaded_cme_table
+    // (its has-subclasses path calls lookup_overloaded_cme, which may ST_DELETE garbage
+    // entries), so it must not run from inside the st_foreach.
+    struct invalidate_forwardable_arg arg = { NULL, 0, 0 };
+    st_foreach(overloaded_cme_table(), collect_forwardable_cme_i, (st_data_t)&arg);
+
+    for (int i = 0; i < arg.len; i++) {
+        const rb_callable_method_entry_t *cme = arg.cmes[i];
+        if (!rb_objspace_garbage_object_p((VALUE)cme)) {
+            rb_clear_method_cache(cme->owner, cme->called_id);
+        }
+    }
+
+    if (arg.cmes != NULL) {
+        xfree(arg.cmes);
     }
 }
 
@@ -1687,10 +1747,7 @@ rb_check_overloaded_cme(const rb_callable_method_entry_t *cme, const struct rb_c
 
         bool swap;
         if (ISEQ_BODY(iseq)->forwarding_iseq != NULL) {
-            // Pure pass-through wrapper: the forwardable alternate accepts every call
-            // shape (it stores the caller's CallInfo into the `...` slot), so swap
-            // unconditionally.
-            swap = true;
+            swap = !ruby_vm_iseq_trace_events_enabled_ever;
         }
         else {
             // mandatory_only_iseq: only when every argument is a mandatory positional.

@@ -3733,8 +3733,8 @@ pm_forwarding_safe_receiver_p(const pm_node_t *node)
  *
  *     def foo(*args, **kwargs, &block); bar(*args, **kwargs, &block); end  // transparent, +block
  *     def foo(*args, **kwargs);         bar(*args, **kwargs);         end  // transparent, drops block
- *     def foo(*args, &block);           bar(*args, &block);           end  // reify kw, +block
- *     def foo(*args);                   bar(*args);                   end  // reify kw, drops block
+ *     def foo(*args, &block);           bar(*args, &block);           end  // reify kw in callee, +block
+ *     def foo(*args);                   bar(*args);                   end  // reify kw in callee, drops block
  *
  * The parameters may be named or anonymous, and the body must be a single call that
  * forwards each parameter to exactly the matching argument position (and nothing else). The
@@ -7430,7 +7430,7 @@ pm_compile_scope_node(rb_iseq_t *iseq, pm_scope_node_t *scope_node, const pm_nod
         // If this method is a pure pass-through wrapper, build an alternate forwardable
         // iseq selected at runtime to skip the intermediate Array/Hash allocation. The
         // primary iseq compiled above still drives all reflection.
-        if (ISEQ_BODY(iseq)->mandatory_only_iseq == NULL) {
+        if (ISEQ_BODY(iseq)->mandatory_only_iseq == NULL && !ruby_vm_iseq_trace_events_enabled_ever) {
             const pm_call_node_t *fwd_call = pm_forwarding_wrapper_call(scope_node);
             if (fwd_call != NULL) {
                 pm_compile_forwarding_wrapper(iseq, scope_node, fwd_call, node_location);

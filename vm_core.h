@@ -2090,6 +2090,7 @@ RUBY_EXTERN rb_event_flag_t ruby_vm_event_flags;
 RUBY_EXTERN rb_event_flag_t ruby_vm_event_enabled_global_flags; // only ever added to
 RUBY_EXTERN unsigned int ruby_vm_iseq_events_enabled;
 RUBY_EXTERN unsigned int ruby_vm_c_events_enabled;
+RUBY_EXTERN bool ruby_vm_iseq_trace_events_enabled_ever; // only ever set true; disables the forwarding-wrapper optimization for good
 
 #define GET_VM()     rb_current_vm()
 #define GET_RACTOR() rb_current_ractor()

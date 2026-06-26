@@ -103,6 +103,7 @@ rb_hook_list_free(rb_hook_list_t *hooks)
 
 void rb_clear_attr_ccs(void);
 void rb_clear_bf_ccs(void);
+void rb_clear_forwardable_ccs(void);
 
 static bool iseq_trace_set_all_needed(rb_event_flag_t new_events)
 {
@@ -165,6 +166,10 @@ update_global_event_hooks(rb_hook_list_t *list, rb_event_flag_t prev_events, rb_
         RUBY_ASSERT(ruby_vm_iseq_events_enabled >= (unsigned int)(-change_iseq_events));
     }
     ruby_vm_iseq_events_enabled += change_iseq_events;
+    if (ec && change_iseq_events > 0 && !ruby_vm_iseq_trace_events_enabled_ever) {
+        ruby_vm_iseq_trace_events_enabled_ever = true;
+        rb_clear_forwardable_ccs();
+    }
     if (change_c_events < 0) {
         RUBY_ASSERT(ruby_vm_c_events_enabled >= (unsigned int)(-change_iseq_events));
     }
@@ -1406,6 +1411,10 @@ rb_tracepoint_enable_for_target(VALUE tpval, VALUE target, VALUE target_line)
             rb_ractor_targeted_hooks_incr(tp->ractor);
             if (tp->events & ISEQ_TRACE_EVENTS) {
                 ruby_vm_iseq_events_enabled++;
+                if (!ruby_vm_iseq_trace_events_enabled_ever) {
+                    ruby_vm_iseq_trace_events_enabled_ever = true;
+                    rb_clear_forwardable_ccs();
+                }
             }
             if ((tp->events & RUBY_EVENT_C_CALL) || (tp->events & RUBY_EVENT_C_RETURN)) {
                 ruby_vm_c_events_enabled++;
@@ -1470,6 +1479,8 @@ rb_tracepoint_disable(VALUE tpval)
             if (tp->events & ISEQ_TRACE_EVENTS) {
                 RUBY_ASSERT(ruby_vm_iseq_events_enabled > 0);
                 ruby_vm_iseq_events_enabled--;
+                // Intentionally do NOT re-enable the forwarding-wrapper optimization here:
+                // it is a one-way latch (see ruby_vm_iseq_trace_events_enabled_ever).
             }
             if ((tp->events & RUBY_EVENT_C_CALL) || (tp->events & RUBY_EVENT_C_RETURN)) {
                 RUBY_ASSERT(ruby_vm_c_events_enabled > 0);
