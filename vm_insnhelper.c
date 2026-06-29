@@ -5276,6 +5276,7 @@ vm_yield_setup_args(rb_execution_context_t *ec, const rb_iseq_t *iseq, const int
 
 /* ruby iseq -> ruby block */
 
+__attribute__((no_stack_protector))
 static VALUE
 vm_invoke_iseq_block(rb_execution_context_t *ec, rb_control_frame_t *reg_cfp,
                      struct rb_calling_info *calling, const struct rb_callinfo *ci,
@@ -5286,7 +5287,17 @@ vm_invoke_iseq_block(rb_execution_context_t *ec, rb_control_frame_t *reg_cfp,
     const int arg_size = ISEQ_BODY(iseq)->param.size;
     VALUE * const rsp = GET_SP() - calling->argc;
     VALUE * const argv = rsp;
-    int opt_pc = vm_callee_setup_block_arg(ec, calling, ci, iseq, argv, is_lambda ? arg_setup_method : arg_setup_block);
+    int opt_pc;
+    if (LIKELY(!is_lambda &&
+               rb_simple_iseq_p(iseq) &&
+               !(vm_ci_flag(ci) & (VM_CALL_ARGS_SPLAT | VM_CALL_KWARG | VM_CALL_KW_SPLAT)) &&
+               calling->argc == ISEQ_BODY(iseq)->param.lead_num &&
+               (calling->argc != 1 || ISEQ_BODY(iseq)->param.flags.ambiguous_param0))) {
+        opt_pc = 0;
+    }
+    else {
+        opt_pc = vm_callee_setup_block_arg(ec, calling, ci, iseq, argv, is_lambda ? arg_setup_method : arg_setup_block);
+    }
     int frame_flag = VM_FRAME_MAGIC_BLOCK | (is_lambda ? VM_FRAME_FLAG_LAMBDA : 0);
 
     SET_SP(rsp);
