@@ -5257,7 +5257,7 @@ vm_callee_setup_block_arg(rb_execution_context_t *ec, struct rb_calling_info *ca
     }
 }
 
-__attribute__((no_stack_protector))
+NO_STACK_PROTECTOR
 static int
 vm_yield_setup_args(rb_execution_context_t *ec, const rb_iseq_t *iseq, const int argc, VALUE *argv, int flags, VALUE block_handler, enum arg_setup_type arg_setup_type)
 {
@@ -5285,7 +5285,7 @@ vm_yield_setup_args(rb_execution_context_t *ec, const rb_iseq_t *iseq, const int
 
 /* ruby iseq -> ruby block */
 
-__attribute__((no_stack_protector))
+NO_STACK_PROTECTOR
 static VALUE
 vm_invoke_iseq_block(rb_execution_context_t *ec, rb_control_frame_t *reg_cfp,
                      struct rb_calling_info *calling, const struct rb_callinfo *ci,
