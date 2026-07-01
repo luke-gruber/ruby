@@ -5261,11 +5261,11 @@ NO_STACK_PROTECTOR
 static int
 vm_yield_setup_args(rb_execution_context_t *ec, const rb_iseq_t *iseq, const int argc, VALUE *argv, int flags, VALUE block_handler, enum arg_setup_type arg_setup_type)
 {
-    if (LIKELY(arg_setup_type == arg_setup_block &&
-               rb_simple_iseq_p(iseq) &&
+    if (LIKELY(rb_simple_iseq_p(iseq) &&
                !(flags & (VM_CALL_ARGS_SPLAT | VM_CALL_KWARG | VM_CALL_KW_SPLAT)) &&
                argc == ISEQ_BODY(iseq)->param.lead_num &&
-               (argc != 1 || ISEQ_BODY(iseq)->param.flags.ambiguous_param0))) {
+               (arg_setup_type == arg_setup_method ||
+                argc != 1 || ISEQ_BODY(iseq)->param.flags.ambiguous_param0))) {
         return 0;
     }
 
@@ -5297,11 +5297,11 @@ vm_invoke_iseq_block(rb_execution_context_t *ec, rb_control_frame_t *reg_cfp,
     VALUE * const rsp = GET_SP() - calling->argc;
     VALUE * const argv = rsp;
     int opt_pc;
-    if (LIKELY(!is_lambda &&
-               rb_simple_iseq_p(iseq) &&
+    if (LIKELY(rb_simple_iseq_p(iseq) &&
                !(vm_ci_flag(ci) & (VM_CALL_ARGS_SPLAT | VM_CALL_KWARG | VM_CALL_KW_SPLAT)) &&
                calling->argc == ISEQ_BODY(iseq)->param.lead_num &&
-               (calling->argc != 1 || ISEQ_BODY(iseq)->param.flags.ambiguous_param0))) {
+               (is_lambda ||
+                calling->argc != 1 || ISEQ_BODY(iseq)->param.flags.ambiguous_param0))) {
         opt_pc = 0;
     }
     else {
