@@ -6032,6 +6032,7 @@ enum method_explorer_type {
     mexp_search_super,
 };
 
+NO_STACK_PROTECTOR
 static inline VALUE
 vm_sendish(
     struct rb_execution_context_struct *ec,
