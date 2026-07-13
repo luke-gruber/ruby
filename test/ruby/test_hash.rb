@@ -2460,4 +2460,183 @@ class TestHashOnly < Test::Unit::TestCase
 
     assert_equal nil, h[lookup_key]
   end
+
+  # --- 9..13-entry hashes: the "large" inline AR table ------------------------
+  #
+  # A bare hash literal with 9..13 pairs is born into the large AR layout
+  # (16-byte hint region, up to 13 pairs), still fully embedded in the object
+  # slot -- no malloc'd st_table. Growing from {} one entry at a time still
+  # spills to st at entry 9, so a genuine large-AR hash can only be born from a
+  # literal / rb_hash_new_with_size / bulk_insert / dup. These guard every path
+  # that previously assumed the AR table topped out at 8 entries.
+
+  AR_LARGE_RANGE = 9..13
+
+  # Fresh, mutable large-AR hash literal of +n+ entries (keys 1..n, vals i*100).
+  def large_ar_hash(n)
+    eval("{" + (1..n).map { |i| "#{i} => #{i * 100}" }.join(", ") + "}")
+  end
+
+  def test_large_ar_store_and_retrieve
+    AR_LARGE_RANGE.each do |n|
+      h = large_ar_hash(n)
+      assert_equal n, h.size, "n=#{n}"
+      (1..n).each { |i| assert_equal i * 100, h[i], "n=#{n} key=#{i}" }
+      assert_nil h[n + 1]
+      h[n + 1] = (n + 1) * 100
+      assert_equal (n + 1) * 100, h[n + 1], "n=#{n}"
+      assert_equal n + 1, h.size, "n=#{n}"
+    end
+  end
+
+  def test_large_ar_grow_within_and_past_cap
+    h = large_ar_hash(9)
+    (10..13).each { |i| h[i] = i * 100 }   # fill the large AR to its 13-entry cap
+    assert_equal 13, h.size
+    (1..13).each { |i| assert_equal i * 100, h[i] }
+    h[14] = 1400                           # overflow -> st_table
+    assert_equal 14, h.size
+    (1..14).each { |i| assert_equal i * 100, h[i] }
+  end
+
+  def test_large_ar_dup_and_clone_are_independent
+    AR_LARGE_RANGE.each do |n|
+      h = large_ar_hash(n)
+      [h.dup, h.clone].each do |c|
+        assert_equal h, c, "n=#{n}"
+        c[100] = -1
+        assert_nil h[100], "dup/clone aliased source (n=#{n})"
+      end
+      d = h.dup
+      h[1] = -999
+      assert_equal 100, d[1], "copy not isolated from source mutation (n=#{n})"
+    end
+  end
+
+  def test_large_ar_replace
+    # small self <- large other: self can't fit 13 AR pairs in its small slot,
+    # so the hash_copy capacity guard builds an st_table in self.
+    small = {a: 1}
+    big = large_ar_hash(13)
+    small.replace(big)
+    assert_equal big, small
+    assert_equal 13, small.size
+
+    # large self <- large other
+    a = large_ar_hash(10)
+    b = large_ar_hash(13)
+    a.replace(b)
+    assert_equal b, a
+
+    # large self <- small other
+    c = large_ar_hash(11)
+    c.replace({x: 1, y: 2})
+    assert_equal({x: 1, y: 2}, c)
+  end
+
+  def test_large_ar_rehash_keeps_all_entries
+    # rb_hash_rehash rebuilds through a tmp hash; the tmp must be able to hold
+    # all 9..13 entries (rb_hash_rehash_i ignores ar_insert's overflow return,
+    # so an undersized tmp would silently drop entries 9..13).
+    AR_LARGE_RANGE.each do |n|
+      h = large_ar_hash(n)
+      h.rehash
+      assert_equal n, h.size, "rehash dropped entries (n=#{n})"
+      (1..n).each { |i| assert_equal i * 100, h[i], "n=#{n} key=#{i}" }
+    end
+  end
+
+  def test_large_ar_merge_and_update
+    a = large_ar_hash(9)
+    merged = a.merge(10 => 1000, 11 => 1100)   # 11 entries, stays large AR
+    assert_equal 11, merged.size
+    (1..11).each { |i| assert_equal i * 100, merged[i] }
+    assert_equal 9, a.size                      # merge is non-destructive
+
+    b = large_ar_hash(11)
+    b.update(12 => 1200, 13 => 1300, 14 => 1400) # 14 -> spills to st
+    assert_equal 14, b.size
+    (1..14).each { |i| assert_equal i * 100, b[i] }
+  end
+
+  def test_large_ar_compare_by_identity
+    # Converts a large AR hash to an identity st_table, reading every pair from
+    # the large-layout offset during ar_force_convert_table / rehash.
+    AR_LARGE_RANGE.each do |n|
+      h = large_ar_hash(n)
+      h.compare_by_identity
+      assert_predicate h, :compare_by_identity?
+      assert_equal n, h.size, "compare_by_identity lost entries (n=#{n})"
+      (1..n).each { |i| assert_equal i * 100, h[i], "n=#{n} key=#{i}" }
+    end
+  end
+
+  def test_large_ar_marshal_roundtrip
+    AR_LARGE_RANGE.each do |n|
+      h = large_ar_hash(n)
+      h2 = Marshal.load(Marshal.dump(h))
+      assert_equal h, h2, "n=#{n}"
+      assert_equal n, h2.size
+    end
+  end
+
+  def test_large_ar_delete_holes_then_reinsert
+    # Deleting leaves holes up to BOUND; the next insert past BOUND triggers
+    # ar_compact_table, which must address pairs at the large-layout offset.
+    h = large_ar_hash(13)
+    holes = [2, 5, 8, 11]
+    holes.each { |k| h.delete(k) }
+    assert_equal 9, h.size
+    holes.each { |k| assert_nil h[k] }
+    # Five inserts: first compacts the holey large table, last overflows to st.
+    (100..104).each { |k| h[k] = k }
+    assert_equal 14, h.size
+    (1..13).each { |i| assert_equal i * 100, h[i], "key=#{i}" unless holes.include?(i) }
+    (100..104).each { |k| assert_equal k, h[k] }
+  end
+
+  def test_large_ar_stays_embedded
+    require 'objspace'
+    # A 9..13-entry literal is born embedded (large AR, no st_table); the same
+    # entries grown one-by-one from {} spill to a malloc'd st_table at entry 9.
+    # The embedded form must therefore use strictly less memory.
+    AR_LARGE_RANGE.each do |n|
+      lit = large_ar_hash(n)
+      grown = {}
+      (1..n).each { |i| grown[i] = i * 100 }
+      assert_equal lit, grown, "n=#{n}"
+      assert_operator ObjectSpace.memsize_of(lit), :<, ObjectSpace.memsize_of(grown),
+                      "#{n}-entry literal should stay embedded (no st_table malloc)"
+    end
+  end
+
+  def test_large_ar_frozen_literal_survives_gc_compact
+    omit "GC.compact not supported" unless GC.respond_to?(:compact)
+    # Frozen 9..13-entry literals are candidates for GC.compact right-sizing;
+    # rb_gc_obj_optimal_size must use the large (16B) hint offset or the last
+    # pair is corrupted after the object moves.
+    ns = AR_LARGE_RANGE.to_a
+    literals = ns.map { |n| large_ar_hash(n).freeze }
+    GC.compact
+    literals.each_with_index do |h, idx|
+      n = ns[idx]
+      assert_equal n, h.size, "n=#{n}"
+      (1..n).each { |i| assert_equal i * 100, h[i], "corrupted after compact (n=#{n} key=#{i})" }
+    end
+  end
+
+  def test_large_ar_under_gc_stress
+    EnvUtil.under_gc_stress do
+      AR_LARGE_RANGE.each do |n|
+        h = large_ar_hash(n)
+        assert_equal n, h.size, "n=#{n}"
+        d = h.dup
+        d[n + 1] = 0
+        assert_equal n, h.size, "dup aliased under stress (n=#{n})"
+        h.rehash
+        assert_equal n, h.size, "rehash under stress (n=#{n})"
+        (1..n).each { |i| assert_equal i * 100, h[i], "n=#{n} key=#{i}" }
+      end
+    end
+  end
 end

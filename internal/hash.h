@@ -14,7 +14,8 @@
 #include "ruby/ruby.h"          /* for struct RBasic */
 #include "ruby/st.h"            /* for struct st_table */
 
-#define RHASH_AR_TABLE_MAX_SIZE SIZEOF_VALUE
+#define RHASH_AR_TABLE_MAX_SIZE SIZEOF_VALUE /* 8: default/small AR capacity */
+#define RHASH_AR_TABLE_MAX_CAPA 13            /* ceiling: fits the 256B slot with a 16B hint region */
 
 struct ar_table_struct;
 typedef unsigned char ar_hint_t;
@@ -27,6 +28,7 @@ enum ruby_rhash_flags {
     RHASH_AR_TABLE_SIZE_SHIFT = (FL_USHIFT+4),
     RHASH_AR_TABLE_BOUND_MASK = (FL_USER8|FL_USER9|FL_USER10|FL_USER11), /* FL 8..11 */
     RHASH_AR_TABLE_BOUND_SHIFT = (FL_USHIFT+8),
+    RHASH_AR_TABLE_LARGE = FL_USER12,                                   /* FL 12: 16B hint region */
 
     // we can not put it in "enum" because it can exceed "int" range.
 #define RHASH_LEV_MASK (FL_USER13 | FL_USER14 | FL_USER15 |                /* FL 13..19 */ \
@@ -54,6 +56,14 @@ struct RHash {
     struct RBasic basic;
     const VALUE ifnone;
 };
+
+/* AR hint region: 8B holds 8 hints (small); large hashes reserve 16B so pairs stay
+ * 16B-aligned. Pairs follow the hint region, so a large table's pairs start 8B later
+ * than the ar_table struct's fixed pairs[] offset (which describes the small layout). */
+#define RHASH_AR_HINT_SIZE_SMALL ((size_t)offsetof(ar_table, pairs)) /* 8 */
+#define RHASH_AR_HINT_SIZE_LARGE ((size_t)16)
+#define RHASH_AR_LARGE_SLOT_SIZE \
+    (sizeof(struct RHash) + RHASH_AR_HINT_SIZE_LARGE + RHASH_AR_TABLE_MAX_CAPA * sizeof(ar_table_pair)) /* 248 -> 256 pool */
 
 #define RHASH(obj) ((struct RHash *)(obj))
 
@@ -203,7 +213,7 @@ RHASH_AR_TABLE_BOUND(VALUE h)
 {
     RUBY_ASSERT(RHASH_AR_TABLE_P(h));
     const unsigned int bound = RHASH_AR_TABLE_BOUND_RAW(h);
-    RUBY_ASSERT(bound <= RHASH_AR_TABLE_MAX_SIZE);
+    RUBY_ASSERT(bound <= RHASH_AR_TABLE_MAX_CAPA);
     return bound;
 }
 

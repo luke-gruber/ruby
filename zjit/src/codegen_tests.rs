@@ -3101,9 +3101,9 @@ fn test_new_hash_static_sym_keys_gc_stress() {
     "#), @"[Hash, 2, :foo, [3], nil, nil, {x: :foo, y: [3]}]");
 }
 
-// Eight pairs fills an inline embedded ar_table (the fast path); nine crosses
-// RHASH_AR_TABLE_MAX_SIZE, so it's built as a pre-sized st_table instead. Both stay
-// on the static-symbol leaf path, so this guards the ar_table and st_table routes.
+// Eight pairs fills the small inline embedded ar_table (8-cap fast path); nine crosses
+// RHASH_AR_TABLE_MAX_SIZE into the large embedded ar_table layout (still inline, cap 13,
+// no st_table). Both stay on the static-symbol leaf path, guarding both ar_table routes.
 #[test]
 fn test_new_hash_static_sym_ar_table_boundary() {
     eval("
