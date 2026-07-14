@@ -72,8 +72,12 @@ enum ruby_robject_flags {
      *
      * 3rd parties must  not be aware that  there even is more than  one way to
      * store instance variables.  Might better be hidden.
+     *
+     * Must stay just above the imemo type field: imemo_fields aliases this bit
+     * as OBJ_FIELD_HEAP (STATIC_ASSERT OBJ_FIELD_HEAP == IMEMO_FL_USER0 in
+     * internal/imemo.h), so it must equal the first imemo user flag.
      */
-    ROBJECT_HEAP = RUBY_FL_USER4
+    ROBJECT_HEAP = RUBY_FL_USER5
 };
 
 struct st_table;

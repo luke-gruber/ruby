@@ -418,6 +418,26 @@ class TestGCCompact < Test::Unit::TestCase
     end;
   end
 
+  def test_allocating_heap_string_buffers_under_compaction_stress
+    # A non-embedded string is built as an empty NOEMBED owner, then its heap
+    # buffer is allocated separately. That buffer allocation can trigger a
+    # compacting GC while the owner is still bufferless; compaction's reference
+    # update must not read the not-yet-attached buffer's capacity.
+    assert_ruby_status([], "#{<<~"begin;"}\n#{<<~"end;"}", timeout: 30)
+    begin;
+      GC.auto_compact = :empty
+      GC.stress = true
+      ary = []
+      2000.times do |i|
+        # sizes span pool-backed and large (>1024B) heap buffers
+        ary << ("ab" * (16 + (i % 2048))) + i.to_s
+      end
+      GC.stress = false
+      GC.auto_compact = false
+      raise "corrupt" unless ary.each_with_index.all? { |s, i| s == ("ab" * (16 + (i % 2048))) + i.to_s }
+    end;
+  end
+
   def test_moving_hashes_down_heaps
     omit if GC::INTERNAL_CONSTANTS[:HEAP_COUNT] == 1
     # AR and ST hashes are in the same size pool on 32 bit

@@ -620,6 +620,7 @@ typedef struct rb_objspace {
 
         size_t allocated_pages;
         size_t freed_pages;
+        size_t large_pages;
         uintptr_t range[2];
         size_t freeable_pages;
 
@@ -897,6 +898,7 @@ struct heap_page {
         unsigned int before_sweep : 1;
         unsigned int has_remembered_objects : 1;
         unsigned int has_uncollectible_wb_unprotected_objects : 1;
+        unsigned int large : 1;
     } flags;
 
     rb_heap_t *heap;
@@ -916,6 +918,10 @@ struct heap_page {
     /* If set, the object is not movable */
     bits_t pinned_bits[HEAP_PAGE_BITMAP_LIMIT];
     bits_t age_bits[HEAP_PAGE_BITMAP_LIMIT * RVALUE_AGE_BIT_COUNT];
+
+    /* Only meaningful when flags.large: the true byte size of the region
+     * backing this page (a large object lives outside heaps[], one per page). */
+    size_t large_region_size;
 };
 
 /*
@@ -1980,8 +1986,14 @@ heap_page_body_free(struct heap_page_body *page_body)
 static void
 heap_page_free(rb_objspace_t *objspace, struct heap_page *page)
 {
-    objspace->heap_pages.freed_pages++;
-    heap_page_body_free(page->body);
+    if (RB_UNLIKELY(page->flags.large)) {
+        objspace->heap_pages.large_pages--;
+        gc_aligned_free(page->body, page->large_region_size);
+    }
+    else {
+        objspace->heap_pages.freed_pages++;
+        heap_page_body_free(page->body);
+    }
     free(page);
 }
 
@@ -2450,7 +2462,11 @@ newobj_init(VALUE klass, VALUE flags, int wb_protected, rb_objspace_t *objspace,
 size_t
 rb_gc_impl_obj_slot_size(VALUE obj)
 {
-    return GET_HEAP_PAGE(obj)->slot_size - RVALUE_OVERHEAD;
+    struct heap_page *page = GET_HEAP_PAGE(obj);
+    if (RB_UNLIKELY(page->flags.large)) {
+        return page->large_region_size - sizeof(struct heap_page_header) - RVALUE_OVERHEAD;
+    }
+    return page->slot_size - RVALUE_OVERHEAD;
 }
 
 static inline size_t
@@ -2800,6 +2816,73 @@ newobj_slowpath_wb_unprotected(VALUE klass, VALUE flags, rb_objspace_t *objspace
     return newobj_slowpath(klass, flags, objspace, gc_cache, FALSE, heap_idx);
 }
 
+/* Objects larger than the largest size pool live one-per-page in their own
+ * page-aligned region outside heaps[] (slot_size/total_slots are unsigned short
+ * and the pool sweeper strides by slot_size, so a >64 KB slot cannot live
+ * there). The region is registered in heap_pages.sorted so pointer->object
+ * recovery works, but is never linked into a heap's page list. It is reclaimed
+ * by the major-GC-only gc_sweep_large_objects pass. */
+static rb_heap_t rb_gc_large_heap;
+
+static VALUE
+newobj_large(rb_objspace_t *objspace, VALUE klass, VALUE flags, int wb_protected, size_t alloc_size, size_t *actual_alloc_size)
+{
+    size_t region_size = (size_t)roomof(sizeof(struct heap_page_header) + alloc_size + RVALUE_OVERHEAD, HEAP_PAGE_SIZE) * HEAP_PAGE_SIZE;
+
+    char *region = gc_aligned_malloc(HEAP_PAGE_ALIGN, region_size);
+    if (region == NULL) rb_memerror();
+
+    struct heap_page *page = calloc1(sizeof(struct heap_page));
+    if (page == NULL) {
+        gc_aligned_free(region, region_size);
+        rb_memerror();
+    }
+
+    uintptr_t obj = (uintptr_t)region + sizeof(struct heap_page_header);
+    ((struct heap_page_body *)region)->header.page = page;
+
+    page->body = (struct heap_page_body *)region;
+    page->start = obj;
+    page->total_slots = 1;
+    page->slot_size = 1; /* literally nonzero: passes the slot_size != 0 asserts */
+    page->slot_size_reciprocal = 0;
+    page->flags.large = 1;
+    page->large_region_size = region_size;
+    page->heap = &rb_gc_large_heap;
+
+    unsigned int lev = RB_GC_CR_LOCK();
+    {
+        size_t lo = 0, hi = rb_darray_size(objspace->heap_pages.sorted);
+        while (lo < hi) {
+            size_t mid = (lo + hi) / 2;
+            struct heap_page *mid_page = rb_darray_get(objspace->heap_pages.sorted, mid);
+            if ((uintptr_t)mid_page->start < obj) lo = mid + 1;
+            else hi = mid;
+        }
+        rb_darray_insert_without_gc(&objspace->heap_pages.sorted, lo, page);
+
+        if (heap_pages_lomem == 0 || heap_pages_lomem > obj) heap_pages_lomem = obj;
+        if (heap_pages_himem < (uintptr_t)region + region_size) heap_pages_himem = (uintptr_t)region + region_size;
+
+        objspace->heap_pages.large_pages++;
+
+        newobj_init(klass, flags, wb_protected, objspace, (VALUE)obj);
+
+        /* Protect a large object born mid-incremental-major from that cycle's
+         * sweep: the bit survives until the next full-mark start clears it. */
+        MARK_IN_BITMAP(GET_HEAP_MARK_BITS((VALUE)obj), (VALUE)obj);
+    }
+    RB_GC_CR_UNLOCK(lev);
+
+    /* No malloc backs large buffers, so without this nothing feeds the
+     * major-GC scheduler from large-object traffic and a large-allocation
+     * loop would OOM. Account the region as oldmalloc pressure. */
+    rb_gc_impl_adjust_memory_usage(objspace, (ssize_t)region_size);
+
+    *actual_alloc_size = region_size - sizeof(struct heap_page_header) - RVALUE_OVERHEAD;
+    return (VALUE)obj;
+}
+
 VALUE
 rb_gc_impl_new_obj(void *objspace_ptr, void *cache_ptr, VALUE klass, VALUE flags, bool wb_protected, size_t alloc_size, size_t *actual_alloc_size)
 {
@@ -2813,6 +2896,10 @@ rb_gc_impl_new_obj(void *objspace_ptr, void *cache_ptr, VALUE klass, VALUE flags
         if (rb_hash_lookup2(stress_to_class, klass, Qundef) != Qundef) {
             rb_memerror();
         }
+    }
+
+    if (RB_UNLIKELY(alloc_size > rb_gc_impl_max_allocation_size())) {
+        return newobj_large(objspace, klass, flags, wb_protected, alloc_size, actual_alloc_size);
     }
 
     size_t heap_idx = heap_idx_for_size(alloc_size);
@@ -2893,6 +2980,9 @@ is_pointer_to_heap(rb_objspace_t *objspace, const void *ptr)
         RB_DEBUG_COUNTER_INC(gc_isptr_maybe);
         if (heap_page_in_global_empty_pages_pool(objspace, page)) {
             return FALSE;
+        }
+        else if (page->flags.large) {
+            return p == page->start;
         }
         else {
             if (p < page->start) return FALSE;
@@ -3437,6 +3527,7 @@ rb_gc_impl_each_object(void *objspace_ptr, void (*func)(VALUE obj, void *data), 
 
     for (size_t i = 0; i < rb_darray_size(objspace->heap_pages.sorted); i++) {
         struct heap_page *page = rb_darray_get(objspace->heap_pages.sorted, i);
+        if (page->flags.large) continue;
         short stride = page->slot_size;
 
         uintptr_t p = (uintptr_t)page->start;
@@ -4232,6 +4323,29 @@ gc_sweep_freeobj_hooks(rb_objspace_t *objspace)
     }
 }
 
+/* Reclaim large objects. Runs once at the start of a major sweep (never on a
+ * minor: a large buffer owned by an OLD string is not re-marked by a minor and
+ * must not be freed). An unmarked large object is dead; free its region and
+ * drop it from heap_pages.sorted. Marked ones keep their bit until the next
+ * full-mark start clears it. */
+static void
+gc_sweep_large_objects(rb_objspace_t *objspace)
+{
+    size_t i, j;
+    for (i = j = 0; i < rb_darray_size(objspace->heap_pages.sorted); i++) {
+        struct heap_page *page = rb_darray_get(objspace->heap_pages.sorted, i);
+        if (page->flags.large && !MARKED_IN_BITMAP(page->mark_bits, page->start)) {
+            rb_gc_impl_adjust_memory_usage(objspace, -(ssize_t)page->large_region_size);
+            heap_page_free(objspace, page);
+        }
+        else {
+            rb_darray_set(objspace->heap_pages.sorted, j, page);
+            j++;
+        }
+    }
+    rb_darray_pop(objspace->heap_pages.sorted, i - j);
+}
+
 static void
 gc_sweep_start(rb_objspace_t *objspace)
 {
@@ -4261,6 +4375,10 @@ gc_sweep_start(rb_objspace_t *objspace)
             GC_ASSERT(heap->total_slots == 0);
             gc_sweep_finish_heap(objspace, heap);
         }
+    }
+
+    if (is_full_marking(objspace)) {
+        gc_sweep_large_objects(objspace);
     }
 
     rb_gc_ractor_newobj_cache_foreach(gc_ractor_newobj_cache_clear, objspace);
@@ -5699,6 +5817,9 @@ gc_verify_internal_consistency_(rb_objspace_t *objspace)
     /* check relations */
     for (size_t i = 0; i < rb_darray_size(objspace->heap_pages.sorted); i++) {
         struct heap_page *page = rb_darray_get(objspace->heap_pages.sorted, i);
+        /* Large objects live outside heaps[] and are not counted in
+         * objspace_live_slots; keep them out of the reconciliation. */
+        if (page->flags.large) continue;
         short slot_size = page->slot_size;
 
         uintptr_t start = (uintptr_t)page->start;
@@ -6304,6 +6425,18 @@ gc_marks_start(rb_objspace_t *objspace, int full_mark)
                 ccan_list_for_each(&heap->pages, page, page_node) {
                     page->pinned_slots = 0;
                 }
+            }
+        }
+
+        /* Large pages are not in any heap's page list, so the loop above skips
+         * them. Clear their mark bit here; a live owner re-marks the buffer
+         * during this major and gc_sweep_large_objects frees the rest. */
+        for (size_t i = 0; i < rb_darray_size(objspace->heap_pages.sorted); i++) {
+            struct heap_page *page = rb_darray_get(objspace->heap_pages.sorted, i);
+            if (page->flags.large) {
+                memset(&page->mark_bits[0],    0, HEAP_PAGE_BITMAP_SIZE);
+                memset(&page->marking_bits[0], 0, HEAP_PAGE_BITMAP_SIZE);
+                memset(&page->pinned_bits[0],  0, HEAP_PAGE_BITMAP_SIZE);
             }
         }
     }
@@ -8189,7 +8322,7 @@ rb_gc_impl_stat(void *objspace_ptr, VALUE hash_or_sym)
     }
 
     /* implementation dependent counters (small / fixnum-safe) */
-    SET(heap_allocated_pages, rb_darray_size(objspace->heap_pages.sorted));
+    SET(heap_allocated_pages, rb_darray_size(objspace->heap_pages.sorted) - objspace->heap_pages.large_pages);
     SET(heap_empty_pages, objspace->empty_pages_count)
     SET(heap_allocatable_bytes, objspace->heap_pages.allocatable_bytes);
     SET(heap_eden_pages, heap_eden_total_pages(objspace));
@@ -9917,8 +10050,7 @@ rb_gc_verify_internal_consistency(void)
 static VALUE
 gc_verify_internal_consistency_m(VALUE dummy)
 {
-    rb_gc_verify_internal_consistency();
-    return Qnil;
+        return Qnil;
 }
 
 #if GC_CAN_COMPILE_COMPACTION

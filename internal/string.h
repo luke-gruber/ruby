@@ -19,6 +19,7 @@
 #define STR_SHARED                  FL_USER0 /* = ELTS_SHARED */
 #define STR_NOEMBED                 FL_USER1
 #define STR_CHILLED         FL_USER2
+#define STR_NOFREE                  FL_USER18
 #define STR_FAKESTR                 FL_USER19
 
 enum ruby_rstring_private_flags {
@@ -159,6 +160,16 @@ static inline bool
 STR_SHARED_P(VALUE str)
 {
     return FL_ALL_RAW(str, STR_NOEMBED | STR_SHARED);
+}
+
+/* True when str owns a GC-managed imemo_str buffer (in as.heap.aux.shared).
+ * With no malloc'd buffers, an owner is structurally any non-embedded string
+ * that is neither a sharer (STR_SHARED) nor a borrower of foreign memory
+ * (STR_NOFREE); those two cases repurpose as.heap.aux otherwise. */
+static inline bool
+STR_IMEMO_BUF_P(VALUE str)
+{
+    return FL_TEST_RAW(str, STR_NOEMBED | STR_SHARED | STR_NOFREE) == STR_NOEMBED;
 }
 
 static inline bool

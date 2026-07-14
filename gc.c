@@ -1047,7 +1047,11 @@ rb_newobj(rb_execution_context_t *ec, VALUE klass, VALUE flags, shape_id_t shape
     VALUE obj = rb_gc_impl_new_obj(rb_gc_get_objspace(), cr->newobj_cache, klass, flags, wb_protected, size, &actual_alloc_size);
 
     GC_ASSERT(actual_alloc_size >= size);
-    shape_id = rb_shape_transition_slot_size(shape_id, actual_alloc_size);
+    /* Large objects live outside the size pools; slot-size shapes only describe
+     * pool capacities (rb_shape_capacity_for_slot_size asserts a small bound). */
+    if (rb_gc_size_allocatable_p(size)) {
+        shape_id = rb_shape_transition_slot_size(shape_id, actual_alloc_size);
+    }
 
 #if RACTOR_CHECK_MODE
     void rb_ractor_setup_belonging(VALUE obj);
@@ -1373,6 +1377,7 @@ rb_gc_imemo_needs_cleanup_p(VALUE obj)
       case imemo_callcache:
       case imemo_throw_data:
       case imemo_cvar_entry:
+      case imemo_str:
         return false;
 
       case imemo_env:
@@ -3266,6 +3271,12 @@ rb_gc_mark_children(void *objspace, VALUE obj)
                 gc_mark_internal(RSTRING(obj)->as.heap.aux.shared);
             }
         }
+        else if (STR_IMEMO_BUF_P(obj)) {
+            /* The heap buffer is a GC-managed imemo_str. Pin it: heap.ptr (this
+             * owner's and any sharers' offset ptrs into it) must stay valid, and
+             * this string is the sole reference keeping it alive. */
+            gc_mark_and_pin_internal(RSTRING(obj)->as.heap.aux.shared);
+        }
         break;
 
       case T_DATA: {
@@ -4179,13 +4190,21 @@ rb_gc_update_object_references(void *objspace, VALUE obj)
 
       case T_STRING:
         {
-            if (STR_SHARED_P(obj)) {
+            /* aux.shared holds a VALUE for both shared strings (the root) and
+             * imemo-buffer owners (the imemo). Both are pinned today, so this is
+             * a no-op, but keep it correct for when buffers become movable. */
+            if (STR_SHARED_P(obj) || STR_IMEMO_BUF_P(obj)) {
                 UPDATE_IF_MOVED(objspace, RSTRING(obj)->as.heap.aux.shared);
             }
 
+            /* A str_alloc_heap'd owner is NOEMBED with no buffer attached yet
+             * (aux.shared == 0) across the imemo allocation that follows; its
+             * capacity is unreadable, so skip re-embedding until it exists. */
+            bool buffer_pending = STR_IMEMO_BUF_P(obj) && RSTRING(obj)->as.heap.aux.shared == 0;
+
             /* If, after move the string is not embedded, and can fit in the
              * slot it's been placed in, then re-embed it. */
-            if (rb_gc_obj_slot_size(obj) >= rb_str_size_as_embedded(obj)) {
+            if (!buffer_pending && rb_gc_obj_slot_size(obj) >= rb_str_size_as_embedded(obj)) {
                 if (!STR_EMBED_P(obj) && rb_str_reembeddable_p(obj)) {
                     rb_str_make_embedded(obj);
                 }

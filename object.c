@@ -46,7 +46,7 @@
 
 /* Flags of RObject
  *
- * 4:    ROBJECT_HEAP
+ * 5:    ROBJECT_HEAP
  *           The object has its instance variables in a separately allocated buffer.
  *           This can be either a flat buffer of reference, or an st_table for complex objects.
  */
