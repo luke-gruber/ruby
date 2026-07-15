@@ -8063,6 +8063,7 @@ enum gc_stat_sym {
     gc_stat_sym_total_freed_pages,
     gc_stat_sym_total_allocated_objects,
     gc_stat_sym_total_freed_objects,
+    gc_stat_sym_fstrings_swept,
     gc_stat_sym_total_malloc_bytes,
     gc_stat_sym_total_free_bytes,
     gc_stat_sym_malloc_increase_bytes,
@@ -8115,6 +8116,7 @@ setup_gc_stat_symbols(void)
         S(total_freed_pages);
         S(total_allocated_objects);
         S(total_freed_objects);
+        S(fstrings_swept);
         S(total_malloc_bytes);
         S(total_free_bytes);
         S(malloc_increase_bytes);
@@ -8222,6 +8224,7 @@ rb_gc_impl_stat(void *objspace_ptr, VALUE hash_or_sym)
     ractor_cache_flush_count(objspace, rb_gc_get_ractor_newobj_cache());
     SET(total_allocated_objects, total_allocated_objects(objspace));
     SET(total_freed_objects, total_freed_objects(objspace));
+    SET(fstrings_swept, rb_gc_fstrings_swept_count());
     SET(heap_available_slots, objspace_available_slots(objspace));
     SET(heap_live_slots, objspace_live_slots(objspace));
     SET(heap_free_slots, objspace_free_slots(objspace));
