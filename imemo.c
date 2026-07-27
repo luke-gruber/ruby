@@ -190,16 +190,16 @@ rb_imemo_fields_clone(VALUE fields_obj)
     if (rb_shape_complex_p(shape_id)) {
         st_table *src_table = rb_imemo_fields_complex_tbl(fields_obj);
 
-        // We start with ROOT_SHAPE_ID so that if GC trigger in `st_replace` it won't try
+        // We start with ROOT_SHAPE_ID so that if GC is triggered in `st_replace` it won't try
         // to mark an uninitialized table.
-        clone = imemo_fields_new(owner, ROOT_SHAPE_ID, sizeof(struct rb_fields), false /* TODO: check */);
+        clone = imemo_fields_new(owner, ROOT_SHAPE_ID, sizeof(struct rb_fields), FL_TEST_RAW(owner, FL_SHAREABLE));
         st_table *dest_table = rb_imemo_fields_complex_tbl(clone);
         st_replace(dest_table, src_table);
         st_foreach(dest_table, imemo_fields_complex_wb_i, (st_data_t)clone);
         RBASIC_SET_FULL_SHAPE_ID(clone, shape_id);
     }
     else {
-        clone = rb_imemo_fields_new(owner, shape_id, false /* TODO: check */);
+        clone = rb_imemo_fields_new(owner, shape_id, FL_TEST_RAW(owner, FL_SHAREABLE));
         VALUE *fields = rb_imemo_fields_ptr(clone);
         attr_index_t fields_count = RSHAPE_LEN(shape_id);
         MEMCPY(fields, rb_imemo_fields_ptr(fields_obj), VALUE, fields_count);
