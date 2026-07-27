@@ -1193,6 +1193,7 @@ module Test
     end
 
     module OutputOption # :nodoc: all
+      attr_accessor :failed_output
       def setup_options(parser, options)
         super
         parser.separator "output options:"
@@ -1718,14 +1719,22 @@ module Test
                 old_skips = self.skips
                 old_assertion_count = self.assertion_count
                 old_test_count = self.test_count
+                old_failed_output = self.failed_output
+                old_output = self.instance_variable_get(:@output)
+                old_options = self.options
                 self.report = []
                 self.failures = 0
                 self.errors = 0
                 self.skips = 0
                 self.assertion_count = 0
                 self.test_count = 0
+                self.failed_output = nil
+                self.options = nil
+                self.instance_variable_set(:@output, nil)
+
                 rs = run_tests_inside_ractors_num.times.map do
                   Ractor.new(inst, self) do |instance, runner|
+                    runner.failed_output = $stderr
                     res = instance.run runner
                     testcase_copyable_ivars = TESTCASE_COPYABLE_IVARS
                     runner_copyable_ivars = RUNNER_COPYABLE_IVARS
@@ -1749,6 +1758,7 @@ module Test
                   ractor_results << [res, inst, runner]
                   rs.delete(r)
                 end
+                GC.enable # ObjectSpace.each_object() can race across ractors and disable global GC
                 # ractors done
                 self.report = old_report
                 self.failures = old_failures
@@ -1756,6 +1766,9 @@ module Test
                 self.skips = old_skips
                 self.assertion_count = old_assertion_count
                 self.test_count = old_test_count
+                self.failed_output = old_failed_output
+                self.instance_variable_set(:@output, old_output)
+                self.options = old_options
                 res = +""
                 ractor_results.each do |(res0, inst, runner)|
                   res << res0

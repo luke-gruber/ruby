@@ -1,4 +1,5 @@
 # frozen_string_literal: true
+require_relative "envutil"
 
 module GCDisabledChecker
   def before_setup
@@ -32,5 +33,5 @@ module GCCompactChecker
   end
 end
 
-Test::Unit::TestCase.include GCDisabledChecker
+Test::Unit::TestCase.include GCDisabledChecker unless EnvUtil.multiple_ractors?
 Test::Unit::TestCase.include GCCompactChecker if ENV['RUBY_TEST_GC_COMPACT']
