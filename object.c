@@ -339,7 +339,7 @@ rb_obj_copy_ivar(VALUE dest, VALUE obj)
 
     shape_id_t dest_shape_id = rb_shape_rebuild(initial_shape_id, src_shape_id);
     if (UNLIKELY(rb_shape_complex_p(dest_shape_id))) {
-        rb_obj_replace_fields(dest, rb_obj_complex_fields_build(obj));
+        rb_obj_replace_fields(dest, rb_obj_complex_fields_build(dest, obj));
         return;
     }
 

@@ -156,6 +156,28 @@ class TestRactor < Test::Unit::TestCase
     RUBY
   end
 
+  def test_ractor_copy_complex_generic_fields_owner
+    assert_ractor(<<~'RUBY')
+      9.times { |i| t = +"x"; t.instance_variable_set(:"@v#{i}", 1) }
+      payloads = 10.times.map do |i|
+        s = +"payload#{i}"
+        6.times { |j| s.instance_variable_set(:"@f#{j}", "val#{j}") }
+        s
+      end
+      r = Ractor.new(payloads) do |copies|
+        Ractor.receive
+        copies.map { |c| c.instance_variable_get(:@f0) }
+      end
+      5.times do
+        GC.start                    # global GC
+        GC.start(full_mark: false)  # local GC
+        GC.start                    # global GC
+      end
+      r.send(:go)
+      assert_equal Array.new(10, "val0"), r.value
+    RUBY
+  end
+
   def test_default_thread_group
     assert_separately([], "#{<<~"begin;"}\n#{<<~'end;'}")
     begin;

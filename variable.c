@@ -1865,9 +1865,9 @@ imemo_fields_evacutate_to_complex(VALUE owner, VALUE source, shape_id_t shape_id
 }
 
 VALUE
-rb_obj_complex_fields_build(VALUE obj)
+rb_obj_complex_fields_build(VALUE owner, VALUE source)
 {
-    return imemo_fields_complex_from_obj(obj, obj, ROOT_COMPLEX_SHAPE_ID, true, 0);
+    return imemo_fields_complex_from_obj(owner, source, ROOT_COMPLEX_SHAPE_ID, true, 0);
 }
 
 static VALUE
@@ -2326,7 +2326,7 @@ rb_copy_generic_ivar(VALUE dest, VALUE obj)
         shape_id_t dest_shape_id = rb_shape_rebuild(initial_shape_id, src_shape_id);
 
         if (UNLIKELY(rb_shape_complex_p(dest_shape_id))) {
-            rb_obj_replace_fields(dest, rb_obj_complex_fields_build(obj));
+            rb_obj_replace_fields(dest, rb_obj_complex_fields_build(dest, obj));
             return;
         }
 

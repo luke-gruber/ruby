@@ -5397,6 +5397,8 @@ gc_mark(rb_objspace_t *objspace, VALUE obj)
         return;
     }
 
+    gc_mark_check_t_none(objspace, obj);
+
     if (RB_UNLIKELY(objspace->during_global_gc)) {
         /* shareable -> unshareable のエッジすべてで shref を再計算する（同一/cross-objspace
          * とも）。clear パスが全 shref bit を消し、以降は write barrier が維持する。 */
@@ -5418,8 +5420,6 @@ gc_mark(rb_objspace_t *objspace, VALUE obj)
                         (void *)obj, obj_type_name(obj),
                         (void *)objspace->rgengc.parent_object, obj_type_name(objspace->rgengc.parent_object));
     }
-
-    gc_mark_check_t_none(objspace, obj);
 
     gc_aging(objspace, obj);
     gc_grey(objspace, obj);
