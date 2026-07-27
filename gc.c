@@ -1910,8 +1910,8 @@ os_obj_of(VALUE of)
         ocs.of = of;
         ocs.buffer = rb_ary_new();
 
-        int gc_was_disabled = RTEST(rb_gc_disable());
         RB_VM_LOCKING() {
+            int gc_was_disabled = RTEST(rb_gc_disable());
             rb_vm_barrier();
 
             void *self = rb_gc_get_objspace();
@@ -1922,8 +1922,8 @@ os_obj_of(VALUE of)
                     rb_gc_impl_each_objects_shareable(r->objspace, os_shareable_collect_i, &ocs);
                 }
             }
+            if (!gc_was_disabled) rb_gc_enable();
         }
-        if (!gc_was_disabled) rb_gc_enable();
 
         long len = RARRAY_LEN(ocs.buffer);
         for (long i = 0; i < len; i++) {
