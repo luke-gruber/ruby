@@ -1111,6 +1111,12 @@ fiber_ptr(VALUE obj)
     return fiber;
 }
 
+rb_fiber_t *
+rb_fiber_ptr(VALUE obj)
+{
+    return fiber_ptr(obj);
+}
+
 NOINLINE(static VALUE cont_capture(volatile int *volatile stat));
 
 #define THREAD_MUST_BE_RUNNING(th) do { \

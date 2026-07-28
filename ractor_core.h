@@ -135,6 +135,7 @@ enum ractor_wakeup_status {
 struct ractor_waiter {
     enum ractor_wakeup_status wakeup_status;
     rb_thread_t *th;
+    struct rb_fiber_struct *fiber; // non-NULL: waiting on a fiber scheduler, not a native wait
     struct ccan_list_node node;
     rb_atomic_t event_serial;
 };

@@ -854,14 +854,14 @@ ractor_basket_accept(struct ractor_basket *b)
 
 #if VM_CHECK_MODE > 0
 static bool
-ractor_waiter_included(rb_ractor_t *cr, rb_thread_t *th)
+ractor_waiter_included(rb_ractor_t *cr, rb_thread_t *th, struct rb_fiber_struct *fiber)
 {
     ASSERT_ractor_locking(cr);
 
     struct ractor_waiter *w;
 
     ccan_list_for_each(&cr->sync.waiters, w, node) {
-        if (w->th == th) {
+        if (w->th == th && w->fiber == fiber) {
             return true;
         }
     }
@@ -957,6 +957,21 @@ rb_ractor_sched_wakeup(rb_ractor_t *r, rb_thread_t *th)
 }
 #endif
 
+// Runs in a fresh thread in the waiter's ractor
+static VALUE
+ractor_wakeup_scheduler_fiber(void *ptr)
+{
+    VALUE fiber = (VALUE)ptr;
+    rb_thread_t *th = rb_fiber_threadptr(rb_fiber_ptr(fiber));
+    VALUE scheduler = th->scheduler;
+
+    if (scheduler != Qnil) {
+        rb_fiber_scheduler_unblock(scheduler, GET_RACTOR()->pub.self, fiber);
+    }
+
+    return Qnil;
+}
+
 static bool
 ractor_wakeup_all(rb_ractor_t *r, enum ractor_wakeup_status wakeup_status)
 {
@@ -965,24 +980,56 @@ ractor_wakeup_all(rb_ractor_t *r, enum ractor_wakeup_status wakeup_status)
     RUBY_DEBUG_LOG("r:%u wakeup:%s", rb_ractor_id(r), wakeup_status_str(wakeup_status));
 
     bool wakeup_p = false;
+    bool more_p = true;
 
-    RACTOR_LOCK(r);
-    while (1) {
-        struct ractor_waiter *waiter = ccan_list_pop(&r->sync.waiters, struct ractor_waiter, node);
+    while (more_p) {
+        struct { VALUE th_self; VALUE fiber; } scheduler_waiters[16];
+        int n = 0;
+        more_p = false;
 
-        if (waiter) {
-            VM_ASSERT(waiter->wakeup_status == wakeup_none);
+        RACTOR_LOCK(r);
+        while (1) {
+            struct ractor_waiter *waiter = ccan_list_pop(&r->sync.waiters, struct ractor_waiter, node);
 
-            waiter->wakeup_status = wakeup_status;
-            rb_ractor_sched_wakeup(r, waiter->th);
+            if (waiter) {
+                VM_ASSERT(waiter->wakeup_status == wakeup_none);
 
-            wakeup_p = true;
+                waiter->wakeup_status = wakeup_status;
+                wakeup_p = true;
+
+                if (waiter->fiber) {
+                    scheduler_waiters[n].th_self = waiter->th->self;
+                    scheduler_waiters[n].fiber = rb_fiberptr_self(waiter->fiber);
+                    if (++n == (int)(sizeof(scheduler_waiters) / sizeof(scheduler_waiters[0]))) {
+                        more_p = true;
+                        break;
+                    }
+                }
+                else {
+                    rb_ractor_sched_wakeup(r, waiter->th);
+                }
+            }
+            else {
+                break;
+            }
         }
-        else {
-            break;
+        RACTOR_UNLOCK(r);
+
+        for (int i = 0; i < n; i++) {
+            VALUE fiber = scheduler_waiters[i].fiber;
+            rb_thread_t *wth = rb_thread_ptr(scheduler_waiters[i].th_self);
+
+            if (wth->ractor == GET_RACTOR()) {
+                if (wth->scheduler != Qnil) {
+                    rb_fiber_scheduler_unblock(wth->scheduler, r->pub.self, fiber);
+                }
+            }
+            else {
+                rb_threadptr_interrupt_exec(wth, ractor_wakeup_scheduler_fiber, (void *)fiber,
+                                            rb_interrupt_exec_flag_value_data | rb_interrupt_exec_flag_new_thread);
+            }
         }
     }
-    RACTOR_UNLOCK(r);
 
     return wakeup_p;
 }
@@ -1018,10 +1065,92 @@ ubf_ractor_wait(void *ptr)
     rb_native_mutex_lock(&th->interrupt_lock);
 }
 
+struct ractor_wait_scheduler_data {
+    rb_ractor_t *cr;
+    VALUE scheduler;
+    struct ractor_waiter *waiter;
+};
+
+static VALUE
+ractor_wait_scheduler_block(VALUE p)
+{
+    struct ractor_wait_scheduler_data *data = (struct ractor_wait_scheduler_data *)p;
+
+    rb_fiber_scheduler_block(data->scheduler, data->cr->pub.self, Qnil);
+
+    return Qundef;
+}
+
+static VALUE
+ractor_wait_scheduler_done(VALUE p)
+{
+    struct ractor_wait_scheduler_data *data = (struct ractor_wait_scheduler_data *)p;
+    rb_ractor_t *cr = data->cr;
+
+    RACTOR_LOCK_SELF(cr);
+    {
+        if (data->waiter->wakeup_status == wakeup_none) {
+            ccan_list_del(&data->waiter->node);
+        }
+    }
+    RACTOR_UNLOCK_SELF(cr);
+
+    return Qundef;
+}
+
+// Suspend only the current fiber via the fiber scheduler, instead of parking
+// the whole thread. Same contract as the native path of ractor_wait: enter
+// and leave with cr locked, may raise while unlocked, may wake up spuriously.
+static enum ractor_wakeup_status
+ractor_wait_scheduler(rb_execution_context_t *ec, rb_ractor_t *cr, VALUE scheduler)
+{
+    rb_thread_t *th = rb_ec_thread_ptr(ec);
+
+    struct ractor_waiter waiter = {
+        .wakeup_status = wakeup_none,
+        .th = th,
+        .fiber = ec->fiber_ptr,
+    };
+
+    RUBY_DEBUG_LOG("scheduler wait%s", "");
+
+    ASSERT_ractor_locking(cr);
+
+    VM_ASSERT(GET_RACTOR() == cr);
+    VM_ASSERT(!ractor_waiter_included(cr, th, waiter.fiber));
+
+    ccan_list_add_tail(&cr->sync.waiters, &waiter.node);
+
+    struct ractor_wait_scheduler_data data = {
+        .cr = cr,
+        .scheduler = scheduler,
+        .waiter = &waiter,
+    };
+
+    RACTOR_UNLOCK_SELF(cr);
+    {
+        rb_ensure(ractor_wait_scheduler_block, (VALUE)&data,
+                  ractor_wait_scheduler_done, (VALUE)&data);
+
+        rb_ec_check_ints(ec);
+    }
+    RACTOR_LOCK_SELF(cr);
+
+    RUBY_DEBUG_LOG("wakeup_status:%s", wakeup_status_str(waiter.wakeup_status));
+
+    VM_ASSERT(!ractor_waiter_included(cr, th, waiter.fiber));
+    return waiter.wakeup_status;
+}
+
 static enum ractor_wakeup_status
 ractor_wait(rb_execution_context_t *ec, rb_ractor_t *cr)
 {
     rb_thread_t *th = rb_ec_thread_ptr(ec);
+
+    VALUE scheduler = rb_fiber_scheduler_current_for_threadptr(th);
+    if (scheduler != Qnil) {
+        return ractor_wait_scheduler(ec, cr, scheduler);
+    }
 
     struct ractor_waiter waiter = {
         .wakeup_status = wakeup_none,
@@ -1033,7 +1162,7 @@ ractor_wait(rb_execution_context_t *ec, rb_ractor_t *cr)
     ASSERT_ractor_locking(cr);
 
     VM_ASSERT(GET_RACTOR() == cr);
-    VM_ASSERT(!ractor_waiter_included(cr, th));
+    VM_ASSERT(!ractor_waiter_included(cr, th, NULL));
 
     ccan_list_add_tail(&cr->sync.waiters, &waiter.node);
 
@@ -1052,7 +1181,7 @@ ractor_wait(rb_execution_context_t *ec, rb_ractor_t *cr)
     }
     RACTOR_LOCK_SELF(cr);
 
-    VM_ASSERT(!ractor_waiter_included(cr, th));
+    VM_ASSERT(!ractor_waiter_included(cr, th, NULL));
     return waiter.wakeup_status;
 }
 
