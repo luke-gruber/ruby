@@ -74,6 +74,36 @@ class TestObjSpaceRactor < Test::Unit::TestCase
     RUBY
   end
 
+  # A joined-but-not-valued Ractor keeps its objspace as a zombie (until the
+  # wrapper is collected or #value absorbs it); dump_all must still walk it.
+  # The child allocates a frozen, non-interned Object and sends it by reference
+  # through a port, so it stays in the child's objspace and becomes part of the
+  # zombie after #join.  We locate it by the address ObjectSpace.dump reports
+  # and check that address appears in dump_all.  A substring match on a marker
+  # string would be a false positive: the expected string lives in the dumper's
+  # own (always-walked) objspace.  Red without the rb_objspace_each_objects
+  # zombie walk; green with it.
+  def test_dump_all_covers_zombie_objspace
+    assert_ractor(<<~'RUBY', require: ['objspace', 'json'])
+      port = Ractor::Port.new
+      ch = Ractor.new(port) do |port|
+        port << Object.new.freeze
+        Ractor.receive
+      end
+      obj = port.receive
+      ch.send(:go)
+      ch.join
+      loop until ch.inspect =~ /terminated/
+
+      needle = JSON.parse(ObjectSpace.dump(obj))["address"]
+      found = ObjectSpace.dump_all(output: :string).each_line.any? do |line|
+        json = JSON.parse(line) rescue nil
+        json && json["address"] == needle
+      end
+      assert found, "zombie objspace object missing from dump_all"
+    RUBY
+  end
+
   def test_trace_object_allocations_with_ractor_tracepoint
     # Test that ObjectSpace.trace_object_allocations works globally across all Ractors
     assert_ractor(<<~'RUBY', require: 'objspace')
