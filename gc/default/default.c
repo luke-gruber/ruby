@@ -8860,7 +8860,6 @@ gc_start_global(rb_objspace_t *driver, bool compact, enum global_gc_trigger trig
 
     global_objspace->global_gc.count++;
     global_objspace->global_gc.trigger_counts[trigger]++;
-    global_objspace->global_gc.time_ns += elapsed_hrtime_from(global_gc_start);
 
     /* step 10 */
     for (size_t i = 0; i < global_objspace->global_gc.n_objspaces; i++) {
@@ -8884,7 +8883,10 @@ gc_start_global(rb_objspace_t *driver, bool compact, enum global_gc_trigger trig
      * zombie_objspaces entry and posted the merge to main as a postponed job; the objspace
      * stays enumerable until main absorbs it at its next safepoint. */
 
+    global_objspace->global_gc.time_ns += elapsed_hrtime_from(global_gc_start);
+
     gc_exit(driver, gc_enter_event_global, &lock_lev);
+
 }
 
 static int
