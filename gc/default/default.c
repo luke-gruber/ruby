@@ -6199,6 +6199,7 @@ gc_slot_live_object_p(rb_objspace_t *objspace, VALUE obj)
 static bool
 verify_pointer_in_any_heap_p(const void *ptr)
 {
+    ASSERT_vm_locking_with_barrier();
     return gc_global_pointer_to_heap_p(ptr);
 }
 
