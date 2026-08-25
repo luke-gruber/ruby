@@ -24,6 +24,8 @@ void rb_jit_cont_finish(void);
 
 /* vm.c */
 void rb_free_shared_fiber_pool(void);
+/* thread.c */
+void rb_fiber_pool_lock_atfork(void);
 
 // Copy locals from the current execution to the specified fiber.
 VALUE rb_fiber_inherit_storage(struct rb_execution_context_struct *ec, struct rb_fiber_struct *fiber);
