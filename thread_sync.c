@@ -124,7 +124,10 @@ mutex_memsize(const void *ptr)
 static const rb_data_type_t mutex_data_type = {
     "mutex",
     {NULL, mutex_free, mutex_memsize,},
-    0, 0, RUBY_TYPED_FREE_IMMEDIATELY
+    // Mutexes aren't shareable across Ractors, so they can't be freed
+    // by multiple local GCs at once. Therefore, local GCs can free them
+    // concurrently.
+    0, 0, RUBY_TYPED_THREAD_SAFE_FREE
 };
 
 static rb_mutex_t *
