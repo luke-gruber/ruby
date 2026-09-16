@@ -8331,7 +8331,7 @@ gc_need_global_p(rb_objspace_t *objspace)
 }
 
 static int
-garbage_collect(rb_objspace_t *objspace, unsigned int reason)
+garbage_collect_body(rb_objspace_t *objspace, unsigned int reason, bool allow_global)
 {
     int ret;
 
@@ -8345,9 +8345,15 @@ garbage_collect(rb_objspace_t *objspace, unsigned int reason)
     objspace->profile.prepare_time = getrusage_time() - objspace->profile.prepare_time;
 #endif
 
-    ret = gc_start(objspace, reason);
+    ret = gc_start_body(objspace, reason, allow_global);
 
     return ret;
+}
+
+static int
+garbage_collect(rb_objspace_t *objspace, unsigned int reason)
+{
+    return garbage_collect_body(objspace, reason, true);
 }
 
 static int
@@ -9659,7 +9665,7 @@ rb_gc_impl_objspace_absorb(void *dst_ptr, void *src_ptr)
 }
 
 void
-rb_gc_impl_start(void *objspace_ptr, bool full_mark, bool immediate_mark, bool immediate_sweep, bool compact)
+rb_gc_impl_start(void *objspace_ptr, bool full_mark, bool immediate_mark, bool immediate_sweep, bool compact, bool global)
 {
     rb_objspace_t *objspace = objspace_ptr;
     unsigned int reason = (GPR_FLAG_FULL_MARK |
@@ -9688,12 +9694,17 @@ rb_gc_impl_start(void *objspace_ptr, bool full_mark, bool immediate_mark, bool i
 
     /* An explicit full GC.start with multiple objspaces runs a global GC, the only
      * collector that reclaims shareable and cross-objspace garbage.  It stops the world,
-     * so auto_compact is honoured here too (mirroring full mark x autocompact locally). */
-    if (!rb_gc_single_objspace_p() && (reason & GPR_FLAG_FULL_MARK)) {
+     * so auto_compact is honoured here too (mirroring full mark x autocompact locally).
+     *
+     * global=false asks for this objspace only: a local major when full_mark is set, a
+     * local minor otherwise, and gc_start_body is told not to promote it either.
+     * Compaction still needs the global barrier for relocation and the two-phase
+     * reference update, so it overrides global=false. */
+    if ((global || compact) && !rb_gc_single_objspace_p() && (reason & GPR_FLAG_FULL_MARK)) {
         gc_start_global(objspace, reason, compact || ruby_enable_autocompact, false);
     }
     else {
-        garbage_collect(objspace, reason);
+        garbage_collect_body(objspace, reason, global);
     }
 
     gc_finalize_deferred(objspace);
@@ -9710,7 +9721,7 @@ rb_gc_impl_prepare_heap(void *objspace_ptr)
     double orig_max_free_slots = gc_params.heap_free_slots_max_ratio;
     /* Ensure that all empty pages are moved onto empty_pages. */
     gc_params.heap_free_slots_max_ratio = 0.0;
-    rb_gc_impl_start(objspace, true, true, true, true);
+    rb_gc_impl_start(objspace, true, true, true, true, true);
     gc_params.heap_free_slots_max_ratio = orig_max_free_slots;
 
     objspace->heap_pages.allocatable_bytes = 0;
@@ -12375,7 +12386,7 @@ gc_compact(VALUE self)
     gc_config_full_mark_set(TRUE);
 
     /* Run GC with compaction enabled */
-    rb_gc_impl_start(rb_gc_get_objspace(), true, true, true, true);
+    rb_gc_impl_start(rb_gc_get_objspace(), true, true, true, true, true);
     gc_config_full_mark_set(full_marking_p);
 
     return gc_compact_stats(self);
@@ -12452,12 +12463,12 @@ gc_verify_compaction_references(int argc, VALUE* argv, VALUE self)
      * moved-reference walk) is built for a single objspace, so with several demote it
      * to a plain full GC.  Plain GC.compact does compact them via the global GC. */
     if (!rb_gc_single_objspace_p()) {
-        rb_gc_impl_start(objspace, true, true, true, false);
+        rb_gc_impl_start(objspace, true, true, true, false, true);
         return gc_compact_stats(self);
     }
 
     /* Clear the heap. */
-    rb_gc_impl_start(objspace, true, true, true, false);
+    rb_gc_impl_start(objspace, true, true, true, false, true);
 
     unsigned int lev = RB_GC_VM_LOCK();
     {
@@ -12517,7 +12528,7 @@ gc_verify_compaction_references(int argc, VALUE* argv, VALUE self)
     }
     RB_GC_VM_UNLOCK(lev);
 
-    rb_gc_impl_start(rb_gc_get_objspace(), true, true, true, true);
+    rb_gc_impl_start(rb_gc_get_objspace(), true, true, true, true, true);
 
     rb_objspace_reachable_objects_from_root(root_obj_check_moved_i, objspace);
     objspace_each_objects(objspace, heap_check_moved_i, objspace, TRUE);

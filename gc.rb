@@ -37,16 +37,30 @@ module GC
   #     interleaved with program execution both before the method returns and afterward;
   #     therefore sweeping may not be completed before the return.
   #
+  # - +global+:
+  #   a boolean value specifying the scope of the collection
+  #   when more than one Ractor is running,
+  #   each of which has its own heap:
+  #
+  #   - +true+: every heap is collected, with all Ractors stopped.
+  #     Only such a collection can reclaim shareable objects
+  #     and objects referenced from another Ractor's heap.
+  #   - +false+: only the calling Ractor's own heap is collected,
+  #     concurrently with the other Ractors.
+  #     Garbage that is or may be shared is left for a later global collection.
+  #
+  #   With one Ractor there is only one heap, so this has no effect.
+  #
   # Note that these keyword arguments are implementation- and version-dependent,
   # are not guaranteed to be future-compatible,
   # and may be ignored in some implementations.
-  def self.start full_mark: true, immediate_mark: true, immediate_sweep: true
-    Primitive.gc_start_internal full_mark, immediate_mark, immediate_sweep, false
+  def self.start full_mark: true, immediate_mark: true, immediate_sweep: true, global: true
+    Primitive.gc_start_internal full_mark, immediate_mark, immediate_sweep, false, global
   end
 
   # Alias of GC.start
-  def garbage_collect full_mark: true, immediate_mark: true, immediate_sweep: true
-    Primitive.gc_start_internal full_mark, immediate_mark, immediate_sweep, false
+  def garbage_collect full_mark: true, immediate_mark: true, immediate_sweep: true, global: true
+    Primitive.gc_start_internal full_mark, immediate_mark, immediate_sweep, false, global
   end
 
   # call-seq:
@@ -610,8 +624,8 @@ end
 
 module ObjectSpace
   # Alias of GC.start
-  def garbage_collect full_mark: true, immediate_mark: true, immediate_sweep: true
-    Primitive.gc_start_internal full_mark, immediate_mark, immediate_sweep, false
+  def garbage_collect full_mark: true, immediate_mark: true, immediate_sweep: true, global: true
+    Primitive.gc_start_internal full_mark, immediate_mark, immediate_sweep, false, global
   end
 
   module_function :garbage_collect

@@ -139,6 +139,34 @@ class TestGc < Test::Unit::TestCase
     assert_not_nil GC.latest_gc_info(:major_by)
   end
 
+  def test_start_global_false_is_local
+    omit 'stress' if GC.stress
+
+    # With one objspace there is nothing to scope a GC to, so global: false still behaves
+    # like a plain GC.start.
+    count = GC.count
+    GC.start(global: false)
+    assert_operator count, :<, GC.count
+
+    # With several objspaces, global: false must collect only the caller's. A global GC
+    # writes latest_gc_info into every objspace it stops, and only an explicit GC.start
+    # reports :method, so a bystander Ractor that never calls GC.start itself can tell the
+    # two apart.
+    assert_ractor(<<~'RUBY', timeout: 60)
+      def work = 20_000.times { [+"x", {a: 1}] }
+
+      watcher = Ractor.new { Ractor.receive; GC.latest_gc_info(:gc_by) }
+      Ractor.new { 5.times { work; GC.start(global: false) } }.join
+      watcher.send(nil)
+      refute_equal :method, watcher.value, "global: false collected another objspace"
+
+      watcher = Ractor.new { Ractor.receive; GC.latest_gc_info(:gc_by) }
+      Ractor.new { work; GC.start }.join
+      watcher.send(nil)
+      assert_equal :method, watcher.value, "plain GC.start did not collect every objspace"
+    RUBY
+  end
+
   def test_start_immediate_sweep
     omit 'stress' if GC.stress
 
