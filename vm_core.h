@@ -96,9 +96,31 @@ If `rb_vm_check_ints()` is called between the `RUBY_ASSERT_CRITICAL_SECTION_ENTE
 */
 #define RUBY_ASSERT_CRITICAL_SECTION_ENTER() do{GET_EC()->assert_critical_section_entered += 1;}while(false)
 #define RUBY_ASSERT_CRITICAL_SECTION_LEAVE() do{rb_execution_context_t *ec__ = GET_EC();VM_ASSERT(ec__->assert_critical_section_entered > 0);ec__->assert_critical_section_entered -= 1;}while(false)
+
+/*
+# No-Barrier-Join Assertions
+
+A region that mutates state a stop-the-world global GC also reads is safe without the VM
+lock only while it cannot reach a barrier-join point: the barrier then cannot complete,
+so the world stays as this thread left it.  A local GC and an objspace absorb both rely
+on this.  Blocking on the VM lock inside such a region is the failure: either the thread
+joins the pending barrier and exposes a half-mutated heap, or it waits on a mutex the
+barrier's driver holds while the driver waits for it to join.
+
+Wrap the region in these and both mistakes assert instead of deadlocking or corrupting.
+*/
+#define RUBY_ASSERT_NO_BARRIER_JOIN_ENTER() do{GET_EC()->assert_no_barrier_join += 1;}while(false)
+#define RUBY_ASSERT_NO_BARRIER_JOIN_LEAVE() do{rb_execution_context_t *ec__ = GET_EC();VM_ASSERT(ec__->assert_no_barrier_join > 0);ec__->assert_no_barrier_join -= 1;}while(false)
+#define RUBY_ASSERT_BARRIER_JOINABLE() do{ \
+    const rb_execution_context_t *ec__ = rb_current_execution_context(false); \
+    VM_ASSERT(ec__ == NULL || ec__->assert_no_barrier_join == 0); \
+}while(false)
 #else
 #define RUBY_ASSERT_CRITICAL_SECTION_ENTER()
 #define RUBY_ASSERT_CRITICAL_SECTION_LEAVE()
+#define RUBY_ASSERT_NO_BARRIER_JOIN_ENTER()
+#define RUBY_ASSERT_NO_BARRIER_JOIN_LEAVE()
+#define RUBY_ASSERT_BARRIER_JOINABLE()
 #endif
 
 #if defined(__wasm__) && !defined(__EMSCRIPTEN__)
@@ -1149,6 +1171,7 @@ struct rb_execution_context_struct {
 
 #ifdef RUBY_ASSERT_CRITICAL_SECTION
     int assert_critical_section_entered;
+    int assert_no_barrier_join;
 #endif
 };
 

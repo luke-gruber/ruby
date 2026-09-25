@@ -4243,20 +4243,21 @@ rb_gc_rest(void)
     }
 }
 
-/* True while a zombie is being absorbed.  The zombie's count is decremented before the
- * merge (see absorb below), so in that window its live objects still exist even though
- * the process looks single-objspace. */
-static int gc_absorbing_zombie = 0;
+/* Count of zombies being absorbed right now.  The zombie's count is decremented before
+ * the merge (see absorb below), so in that window its live objects still exist even
+ * though the process looks single-objspace.  Atomic and a count, not a flag: absorbs run
+ * outside the VM lock and two Ractors can inherit two zombies at once. */
+static rb_atomic_t gc_absorbing_zombie = 0;
 
 /* True once a zombie objspace was absorbed since the last global GC: until the unified
  * mark runs, a single-objspace local mark can miss absorbed shareable objects (a cc in
  * a class's cc_table, say), so stop treating the process as single until then. */
-static bool gc_absorbed_since_global_gc = false;
+static rb_atomic_t gc_absorbed_since_global_gc = 0;
 
 void
 rb_gc_reset_absorbed_since_global_gc(void)
 {
-    gc_absorbed_since_global_gc = false;
+    RUBY_ATOMIC_SET(gc_absorbed_since_global_gc, 0);
 }
 
 /* True when the process holds exactly one objspace (one live Ractor, no zombies) and
@@ -4290,21 +4291,57 @@ rb_gc_single_objspace_p(void)
     /* One Ractor is not one objspace: a forked child re-enters single-Ractor mode while
      * the pre-fork Ractors' objspaces are still parked in zombie_objspaces. */
     return (ruby_single_main_ractor != NULL || vm->ractor.cnt == 1) &&
-           vm->gc.zombie_objspaces_count == 0 && gc_absorbing_zombie == 0 &&
-           !gc_absorbed_since_global_gc &&
+           vm->gc.zombie_objspaces_count == 0 &&
+           RUBY_ATOMIC_LOAD(gc_absorbing_zombie) == 0 &&
+           !RUBY_ATOMIC_LOAD(gc_absorbed_since_global_gc) &&
            (vm->ractor.main_ractor == NULL ||
             vm->ractor.main_ractor->creating_child_objspace == NULL);
 }
 
-/* Inherit a dead Ractor's objspace into the calling Ractor.  Going through the owner
- * slot clears it and releases the objspace in one VM-lock section; the merge runs with
- * the inheritor's GC disabled (moving the finalizer st table could trigger it). */
-static void
-objspace_absorb_merge(void *dst, void *src)
+/* Inherit a dead Ractor's objspace into the calling Ractor.  This runs in two parts: a
+ * short VM-locked claim that takes src out of the VM's bookkeeping so nobody else can
+ * inherit it, and the merge itself, which runs unlocked.
+ *
+ * The merge is safe outside the VM lock for the same reason a local GC is (see the note
+ * in the default impl's gc_enter): it reaches no barrier-join point, so
+ * rb_ractor_sched_barrier_start cannot complete while it runs and no global GC can
+ * observe the half-merged heap.  After the claim src is invisible to
+ * rb_gc_vm_each_objspace, and that window is only sound because of it.
+ *
+ * Nothing reached from gc_absorb_merge may take the VM lock, check interrupts or release
+ * the GVL. */
+static void *
+gc_absorb_claim(void **objspace_slot)
 {
-    ASSERT_vm_locking();
-    rb_gc_impl_objspace_absorb(dst, src);
-    gc_absorbed_since_global_gc = true;
+    void *src = NULL;
+
+    RB_VM_LOCKING() {
+        src = *objspace_slot;
+        if (src != NULL) {
+            *objspace_slot = NULL;
+            RUBY_ATOMIC_INC(gc_absorbing_zombie);
+            RUBY_ATOMIC_SET(gc_absorbed_since_global_gc, 1);
+            rb_gc_vm_forget_zombie(src);
+        }
+    }
+
+    return src;
+}
+
+/* The merge runs with the inheritor's GC disabled (moving the finalizer st table could
+ * trigger it); see rb_gc_impl_objspace_absorb. */
+static void
+gc_absorb_merge(void *src)
+{
+    ASSERT_vm_unlocking();
+
+    RUBY_ASSERT_CRITICAL_SECTION_ENTER();
+    RUBY_ASSERT_NO_BARRIER_JOIN_ENTER();
+    rb_gc_impl_objspace_absorb(rb_gc_get_objspace(), src);
+    RUBY_ASSERT_NO_BARRIER_JOIN_LEAVE();
+    RUBY_ASSERT_CRITICAL_SECTION_LEAVE();
+
+    RUBY_ATOMIC_DEC(gc_absorbing_zombie);
 }
 
 /* The dying thread's last collection of its own objspace, GVL still held; with
@@ -4318,6 +4355,16 @@ rb_gc_objspace_postmortem_self(void)
     rb_gc_impl_objspace_retire_gc(rb_gc_get_objspace());
 }
 
+/* Settle the inheritor before the claim below.  Finishing its lazy sweep or incremental
+ * mark can be a whole collection, and if it is mid-compaction gc_enter takes the VM lock
+ * *and* a barrier; neither belongs inside the merge's critical section.  objspace_absorb
+ * settles it again, which is a no-op unless a barrier ran in between. */
+static void
+gc_absorb_settle_inheritor(void)
+{
+    rb_gc_impl_gc_rest(rb_gc_get_objspace());
+}
+
 void
 rb_gc_objspace_absorb_into_current(void **objspace_slot)
 {
@@ -4325,16 +4372,12 @@ rb_gc_objspace_absorb_into_current(void **objspace_slot)
         *objspace_slot = NULL;
         return;
     }
-    RB_VM_LOCKING() {
-        void *objspace = *objspace_slot;
-        if (objspace != NULL) {
-            *objspace_slot = NULL;
-            gc_absorbing_zombie++;
-            rb_gc_vm_forget_zombie(objspace);
-            objspace_absorb_merge(rb_gc_get_objspace(), objspace);
-            gc_absorbing_zombie--;
-        }
-    }
+    /* An unlocked peek: the slot is only ever cleared, never re-filled, so a non-NULL
+     * one means the merge below is worth settling for and the claim's re-check decides. */
+    if (RUBY_ATOMIC_PTR_LOAD(*objspace_slot) != NULL) gc_absorb_settle_inheritor();
+
+    void *src = gc_absorb_claim(objspace_slot);
+    if (src != NULL) gc_absorb_merge(src);
 }
 
 /* Merge every ownerless zombie objspace (no owner slot, i.e. the Ractor object was
@@ -4345,23 +4388,30 @@ objspace_absorb_disowned_zombies(void)
 {
     rb_vm_t *vm = GET_VM();
 
-    RB_VM_LOCKING() {
-        size_t i = 0;
-        while (i < vm->gc.zombie_objspaces_count) {
-            if (vm->gc.zombie_objspaces[i].owner_slot == NULL) {
-                void *zombie = vm->gc.zombie_objspaces[i].objspace;
-                /* Remove via forget, which also subtracts the entry's pages from
-                 * zombie_total_pages; a hand-written swap-remove would leave a phantom
-                 * total that keeps starting stop-the-world global cycles. */
-                gc_absorbing_zombie++;
-                rb_gc_vm_forget_zombie(zombie);
-                objspace_absorb_merge(rb_gc_get_objspace(), zombie);
-                gc_absorbing_zombie--;
-            }
-            else {
-                i++;
+    if (vm->gc.zombie_objspaces_count > 0) gc_absorb_settle_inheritor();
+
+    /* One claim per merge rather than one lock around the whole loop: the lock is
+     * released between zombies, and nothing is claimed-but-unmerged across it. */
+    for (;;) {
+        void *zombie = NULL;
+
+        RB_VM_LOCKING() {
+            for (size_t i = 0; i < vm->gc.zombie_objspaces_count; i++) {
+                if (vm->gc.zombie_objspaces[i].owner_slot == NULL) {
+                    zombie = vm->gc.zombie_objspaces[i].objspace;
+                    RUBY_ATOMIC_INC(gc_absorbing_zombie);
+                    RUBY_ATOMIC_SET(gc_absorbed_since_global_gc, 1);
+                    /* Remove via forget, which also subtracts the entry's pages from
+                     * zombie_total_pages; a hand-written swap-remove would leave a phantom
+                     * total that keeps starting stop-the-world global cycles. */
+                    rb_gc_vm_forget_zombie(zombie);
+                    break;
+                }
             }
         }
+
+        if (zombie == NULL) break;
+        gc_absorb_merge(zombie);
     }
 }
 

@@ -1668,6 +1668,8 @@ ractor_sched_barrier_join_wait_locked(rb_vm_t *vm, rb_thread_t *th)
 void
 rb_ractor_sched_barrier_join(rb_vm_t *vm, rb_ractor_t *cr)
 {
+    RUBY_ASSERT_BARRIER_JOINABLE();
+
     VM_ASSERT(cr->threads.sched.running != NULL); // running ractor
     VM_ASSERT(cr == GET_RACTOR());
     VM_ASSERT(vm->ractor.sync.lock_owner == NULL); // VM is locked, but owner == NULL

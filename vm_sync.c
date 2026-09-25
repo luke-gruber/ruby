@@ -87,6 +87,11 @@ vm_lock_enter(rb_ractor_t *cr, rb_vm_t *vm, bool locked, bool no_barrier, unsign
         // locking ractor and acquire VM lock will cause deadlock
         VM_ASSERT(cr->sync.locked_by != rb_ractor_self(cr));
 #endif
+        // A region that runs unlocked precisely because it cannot join a barrier must
+        // not block here: it would either join the pending barrier half-done, or wait
+        // on a mutex the barrier's driver holds while the driver waits for it to join.
+        RUBY_ASSERT_BARRIER_JOINABLE();
+
         // lock
         rb_native_mutex_lock(&vm->ractor.sync.lock);
         VM_ASSERT(vm->ractor.sync.lock_owner == NULL);

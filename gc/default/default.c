@@ -836,10 +836,10 @@ typedef struct rb_global_objspace {
      * under the barrier; readers (gc_need_global_p) may be racy. */
     size_t zombie_pages_survivors;
 
-    /* An objspace merge (objspace_absorb) is running: suppress the cross-objspace
-     * verifier while the graph is in flux.  Written by the absorbing thread, read by
-     * verification with the world stopped. */
-    bool during_absorb;
+    /* Number of objspace merges (objspace_absorb) running: suppress the cross-objspace
+     * verifier while the graph is in flux.  A count, not a flag, because an absorb runs
+     * outside the VM lock and two Ractors can inherit two zombies at once. */
+    rb_atomic_t during_absorb;
 
     /* main's objspace, for gc_enter's locking policy.  main_ractor->objspace is swapped
      * during Ractor creation; this stable pointer decides the same way at both ends of a
@@ -6931,7 +6931,7 @@ check_children_i(const VALUE child, void *ptr)
     if (!verify_pointer_in_any_heap_p((void *)child)) {
         /* The graph is in flux mid-merge, so a transient non-heap edge is expected; it
          * is re-checked after the merge. */
-        if (global_objspace->during_absorb) return;
+        if (RUBY_ATOMIC_LOAD(global_objspace->during_absorb)) return;
         fprintf(stderr, "VERIFY-NOTE: non-heap child %p (from %s)\n",
                 (void *)child, rb_obj_info(data->parent));
         return;
@@ -6951,7 +6951,7 @@ check_children_i(const VALUE child, void *ptr)
             !MARKED_IN_BITMAP(GET_HEAP_SHAREABLE_BITS(child), child) &&
             !MARKED_IN_BITMAP(GET_HEAP_SHREF_BITS(child), child) &&
             !rb_gc_impl_during_global_gc_p(data->objspace) &&
-            !global_objspace->during_absorb) {
+            !RUBY_ATOMIC_LOAD(global_objspace->during_absorb)) {
             fprintf(stderr, "check_children_i: containment violation: "
                     "unshareable %s (objspace %p) -> foreign unshareable %s (objspace %p)\n",
                     rb_obj_info(data->parent), (void *)data->objspace,
@@ -7004,7 +7004,7 @@ root_scope_check_i(const char *category, VALUE obj, void *ptr)
     if (!data->world_stopped) return;
     /* Mid-merge the VM-global root tables still point at the unmerged source (transient
      * non-heap or foreign roots); re-checked after the merge. */
-    if (global_objspace->during_absorb) return;
+    if (RUBY_ATOMIC_LOAD(global_objspace->during_absorb)) return;
     if (strcmp(category, "machine_context") == 0 ||
         strcmp(category, "vm_registered_objects") == 0 ||
         strcmp(category, "end_proc") == 0 ||
@@ -7365,7 +7365,10 @@ gc_verify_internal_consistency(void *objspace_ptr)
      * the global GC sweep the heap this mark is walking.  The barrier is unnecessary
      * anyway; the objspace is single-writer, this verify runs on its owner thread, and
      * the global driver that sets during_gc everywhere already holds both. */
-    if (during_gc) {
+    /* An absorb is in the same position: it runs unlocked precisely because it cannot
+     * join a barrier (see gc_absorb_merge in gc.c), and the heap it is splicing is
+     * deliberately mid-flight. */
+    if (during_gc || RUBY_ATOMIC_LOAD(global_objspace->during_absorb)) {
         /* The world is stopped only when the global GC's driver runs this while holding
          * the barrier; a non-main Ractor's local GC does not stop other Ractors. */
         gc_verify_internal_consistency_body(objspace, rb_gc_impl_during_global_gc_p(objspace));
@@ -9834,20 +9837,25 @@ gc_make_mid_mark_objspace_absorbable(rb_objspace_t *src)
     objspace->marked_slots = 0;
 }
 
-/* Merge a dead Ractor's objspace into dst under the VM lock.  src has no owner thread and
- * dst is the calling thread's own objspace (join/value) or main with everyone stopped
- * (global GC), so single-writer holds throughout.  Pages move whole (their bits describe
- * objects, not the objspace), and dst's next collection is forced full to rebuild the
+/* Merge a dead Ractor's objspace into dst.  src has no owner thread and dst is the
+ * calling thread's own objspace, so single-writer holds throughout.  This runs outside
+ * the VM lock and must not reach a barrier-join point; gc.c's gc_absorb_merge wraps it
+ * in the assertions that enforce that.  Pages move whole (their bits describe objects,
+ * not the objspace), and dst's next collection is forced full to rebuild the
  * generational state. */
 static void
 objspace_absorb(rb_objspace_t *dst, rb_objspace_t *src)
 {
     GC_ASSERT(dst != src);
+    /* Neither settle below may take gc_enter's compacting path, which stops the world:
+     * the merge runs unlocked and must not join a barrier (see gc_absorb_merge in gc.c).
+     * dst was settled before the claim and a global GC clears the flag everywhere. */
+    GC_ASSERT(!dst->flags.during_compacting);
+    GC_ASSERT(!src->flags.during_compacting);
 
     /* Suppress the cross-objspace verifier checks while the graph is in flux (see
      * global_objspace->during_absorb). */
-    const bool prev_absorb = global_objspace->during_absorb;
-    global_objspace->during_absorb = true;
+    RUBY_ATOMIC_INC(global_objspace->during_absorb);
 
     /* Settle dst first: adding pages under a walking lazy-sweep cursor, or into a
      * half-marked incremental heap, would sweep the merged pages with src's stale mark
@@ -9929,35 +9937,56 @@ objspace_absorb(rb_objspace_t *dst, rb_objspace_t *src)
     /* The objspace-wide page bookkeeping. */
     {
         rb_objspace_t *objspace = dst; /* for the heap_pages_* macros */
-        struct heap_page *page = NULL;
+
+        /* Residents of the empty pool (no live objects) are returned to page_pool rather
+         * than inherited; dst's allocation demand is cheaply met from the shared pool's
+         * free list.  Compact the survivors to the front of src's array, keeping its
+         * body order. */
+        struct heap_page *to_free = NULL;
         size_t srcn = rb_darray_size(src->heap_pages.sorted);
+        size_t keep = 0;
         for (size_t i = 0; i < srcn; i++) {
-            page = rb_darray_get(src->heap_pages.sorted, i);
-            /* Residents of the empty pool (no live objects) are returned to page_pool rather
-             * than inherited; dst's allocation demand is cheaply met from the shared pool's
-             * free list. */
+            struct heap_page *page = rb_darray_get(src->heap_pages.sorted, i);
             if (heap_page_in_global_empty_pages_pool(src, page)) {
-                heap_page_free(src, page);
+                page->free_next = to_free;
+                to_free = page;
                 continue;
             }
-            uintptr_t body = (uintptr_t)page->body;
-            uintptr_t start = body + sizeof(struct heap_page_header);
-            uintptr_t end = body + HEAP_PAGE_SIZE;
+            rb_darray_set(src->heap_pages.sorted, keep, page);
+            keep++;
+        }
+        if (to_free != NULL) heap_pages_free_batch(src, to_free);
 
-            /* Keep the array ordered by page BODY address: heap_page_for_ptr bsearches
-             * body ranges, and a detached empty page has start == 0, so ordering by
-             * page->start would miss live pages (a global GC would then fail to mark a
-             * registered root and sweep it). */
-            size_t lo = 0;
-            size_t hi = rb_darray_size(objspace->heap_pages.sorted);
-            while (lo < hi) {
-                size_t mid = (lo + hi) / 2;
-                struct heap_page *mid_page = rb_darray_get(objspace->heap_pages.sorted, mid);
-                if ((uintptr_t)mid_page->body < body) lo = mid + 1;
-                else hi = mid;
+        /* Both arrays are ordered by page BODY address (heap_page_for_ptr bsearches body
+         * ranges, and a detached empty page has start == 0, so ordering by page->start
+         * would miss live pages), so merge them in one backward pass.  Inserting page by
+         * page is quadratic in the two page counts.  The write cursor never overtakes
+         * dst's own read cursor, and src's pages are read from their own array. */
+        if (keep > 0) {
+            size_t dstn = rb_darray_size(objspace->heap_pages.sorted);
+            rb_darray_resize_capa_without_gc(&objspace->heap_pages.sorted, dstn + keep);
+            for (size_t i = 0; i < keep; i++) {
+                rb_darray_append_without_gc(&objspace->heap_pages.sorted, NULL);
             }
-            rb_darray_insert_without_gc(&objspace->heap_pages.sorted, hi, page);
 
+            size_t a = dstn, b = keep, w = dstn + keep;
+            while (b > 0) {
+                struct heap_page *sp = rb_darray_get(src->heap_pages.sorted, b - 1);
+                struct heap_page *dp = a > 0 ? rb_darray_get(objspace->heap_pages.sorted, a - 1) : NULL;
+                if (dp != NULL && (uintptr_t)dp->body > (uintptr_t)sp->body) {
+                    rb_darray_set(objspace->heap_pages.sorted, --w, dp);
+                    a--;
+                }
+                else {
+                    rb_darray_set(objspace->heap_pages.sorted, --w, sp);
+                    b--;
+                }
+            }
+
+            uintptr_t start = (uintptr_t)rb_darray_get(src->heap_pages.sorted, 0)->body +
+                              sizeof(struct heap_page_header);
+            uintptr_t end = (uintptr_t)rb_darray_get(src->heap_pages.sorted, keep - 1)->body +
+                            HEAP_PAGE_SIZE;
             if (heap_pages_lomem == 0 || heap_pages_lomem > start) heap_pages_lomem = start;
             if (heap_pages_himem < end) heap_pages_himem = end;
         }
@@ -9965,7 +9994,7 @@ objspace_absorb(rb_objspace_t *dst, rb_objspace_t *src)
         objspace->heap_pages.freed_pages += src->heap_pages.freed_pages;
         rb_darray_free_without_gc(src->heap_pages.sorted);
         src->heap_pages.sorted = NULL;
-        /* The empty_pages chain's structs were freed in the loop above. */
+        /* The empty_pages chain's structs were freed in the batch above. */
         src->empty_pages = NULL;
         src->empty_pages_count = 0;
     }
@@ -10069,7 +10098,7 @@ objspace_absorb(rb_objspace_t *dst, rb_objspace_t *src)
         heap_pages_free_unused_pages(objspace);
     }
 
-    global_objspace->during_absorb = prev_absorb;
+    RUBY_ATOMIC_DEC(global_objspace->during_absorb);
 }
 
 void
