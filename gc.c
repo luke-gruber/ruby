@@ -355,8 +355,10 @@ rb_gc_trigger_finalize_deferred(void *objspace, rb_postponed_job_handle_t pjob)
 {
     rb_ractor_t *const cr = rb_current_ractor_raw(false);
     if (cr == NULL || cr->objspace != objspace) {
-        /* Only a global GC (stop-the-world) or an absorb settle (under the VM lock)
-         * defers another objspace's finalizers, so ractor.set is stable here. */
+        /* Only a global GC (stop-the-world) defers another objspace's finalizers, so
+         * ractor.set is stable here.  An absorb's settle of the zombie it is merging
+         * also runs off-owner, but it holds no VM lock: gc_finalize_deferred_register
+         * returns before reaching this. */
         ASSERT_vm_locking();
         rb_vm_t *vm = GET_VM();
         rb_ractor_t *r;

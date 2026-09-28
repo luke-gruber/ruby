@@ -643,6 +643,8 @@ typedef struct rb_objspace {
         unsigned int during_minor_gc : 1;
         unsigned int during_incremental_marking : 1;
         unsigned int during_postmortem : 1;
+        /* Set on the src of an objspace_absorb, never cleared (src is freed). */
+        unsigned int being_absorbed : 1;
         unsigned int measure_gc : 1;
     } flags;
 
@@ -4234,6 +4236,12 @@ gc_finalize_deferred(void *dmy)
 static void
 gc_finalize_deferred_register(rb_objspace_t *objspace)
 {
+    /* The absorb's settle of src has nobody to enqueue on: src's owner Ractor is gone,
+     * and the merge runs without the VM lock, so it may not walk ractor.set looking for
+     * one.  objspace_absorb hands the whole deferred list to the inheritor and triggers
+     * there once the settle is done. */
+    if (objspace->flags.being_absorbed) return;
+
     /* Enqueue gc_finalize_deferred on this objspace's owning Ractor.  A global GC can
      * defer a foreign objspace's finalizers, and those must run on their owner rather
      * than on the driver. */
@@ -9856,6 +9864,7 @@ objspace_absorb(rb_objspace_t *dst, rb_objspace_t *src)
     /* Suppress the cross-objspace verifier checks while the graph is in flux (see
      * global_objspace->during_absorb). */
     RUBY_ATOMIC_INC(global_objspace->during_absorb);
+    src->flags.being_absorbed = 1;
 
     /* Settle dst first: adding pages under a walking lazy-sweep cursor, or into a
      * half-marked incremental heap, would sweep the merged pages with src's stale mark
