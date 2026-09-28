@@ -4376,7 +4376,7 @@ rb_gc_objspace_absorb_into_current(void **objspace_slot)
     }
     /* An unlocked peek: the slot is only ever cleared, never re-filled, so a non-NULL
      * one means the merge below is worth settling for and the claim's re-check decides. */
-    if (RUBY_ATOMIC_PTR_LOAD(*objspace_slot) != NULL) gc_absorb_settle_inheritor();
+    if (*objspace_slot != NULL) gc_absorb_settle_inheritor();
 
     void *src = gc_absorb_claim(objspace_slot);
     if (src != NULL) gc_absorb_merge(src);
