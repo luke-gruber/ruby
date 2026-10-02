@@ -2928,14 +2928,111 @@ gc_mark_func_data_slotp_of(rb_ractor_t *const cr)
 }
 #define GC_MARK_FUNC_DATA_SLOTP()  gc_mark_func_data_slotp_of(rb_current_ractor_raw(false))
 
-/* Marking pays this block per marked reference, so the current Ractor is
- * resolved once and both the redirect slot and the objspace derive from it. */
+/* Resolving the current Ractor costs an out-of-line rb_current_ec() call wherever
+ * RB_THREAD_CURRENT_EC_NOINLINE is set (arm64) plus the ec -> thread -> Ractor chain,
+ * and marking would otherwise pay it per reference.  A marking step resolves it once
+ * and parks the result here; the thread pointer itself is loop-invariant, so a
+ * function marking many references reaches the thread-local once and the rest of its
+ * references are plain loads.
+ *
+ * A NULL objspace means nothing is installed and the reference resolves its own
+ * Ractor.  gc_current_objspace_of() never returns NULL, so this is unambiguous, and it
+ * is the only path a build without a TLS specifier takes. */
+struct gc_mark_ctx {
+    void *objspace;
+    struct gc_mark_func_data_struct **mfdp;
+};
+
+#ifdef RB_THREAD_LOCAL_SPECIFIER
+static RB_THREAD_LOCAL_SPECIFIER struct gc_mark_ctx ruby_gc_mark_ctx;
+#endif
+
+static inline struct gc_mark_ctx
+gc_mark_ctx_make(void)
+{
+    rb_ractor_t *const cr = rb_current_ractor_raw(false);
+
+    return (struct gc_mark_ctx){
+        .objspace = gc_current_objspace_of(cr),
+        .mfdp = gc_mark_func_data_slotp_of(cr),
+    };
+}
+
+/* Out of line to keep the uninstalled arm out of RB_GC_MARK_OR_TRAVERSE's expansions. */
+NOINLINE(static struct gc_mark_ctx gc_mark_ctx_resolve(void));
+
+static struct gc_mark_ctx
+gc_mark_ctx_resolve(void)
+{
+    return gc_mark_ctx_make();
+}
+
+static inline struct gc_mark_ctx
+gc_mark_ctx_current(void)
+{
+#ifdef RB_THREAD_LOCAL_SPECIFIER
+    const struct gc_mark_ctx ctx = ruby_gc_mark_ctx;
+
+    if (RB_LIKELY(ctx.objspace != NULL)) return ctx;
+#endif
+    return gc_mark_ctx_resolve();
+}
+
+/* Save and restore, for the traversal walks below: one can be entered from inside a
+ * marking step (the GC's own verifier does it). */
+static inline struct gc_mark_ctx
+gc_mark_ctx_begin(void)
+{
+#ifdef RB_THREAD_LOCAL_SPECIFIER
+    const struct gc_mark_ctx prev = ruby_gc_mark_ctx;
+
+    ruby_gc_mark_ctx = gc_mark_ctx_make();
+
+    return prev;
+#else
+    return (struct gc_mark_ctx){0};
+#endif
+}
+
+static inline void
+gc_mark_ctx_end(const struct gc_mark_ctx prev)
+{
+#ifdef RB_THREAD_LOCAL_SPECIFIER
+    ruby_gc_mark_ctx = prev;
+#else
+    (void)prev;
+#endif
+}
+
+/* What a GC impl brackets a marking step with.  Steps do not nest, so these clear
+ * rather than restore.  The context is always the current Ractor's and never the
+ * step's own objspace -- a global GC updates every member objspace's references from
+ * the driver's thread, and marking there resolved the driver's objspace before this
+ * context existed too. */
+void
+rb_gc_mark_ctx_begin(void)
+{
+#ifdef RB_THREAD_LOCAL_SPECIFIER
+    GC_ASSERT(ruby_gc_mark_ctx.objspace == NULL);
+
+    ruby_gc_mark_ctx = gc_mark_ctx_make();
+#endif
+}
+
+void
+rb_gc_mark_ctx_end(void)
+{
+#ifdef RB_THREAD_LOCAL_SPECIFIER
+    ruby_gc_mark_ctx = (struct gc_mark_ctx){0};
+#endif
+}
+
 #define RB_GC_MARK_OR_TRAVERSE(func, obj_or_ptr, obj, check_obj) do { \
     if (!RB_SPECIAL_CONST_P(obj)) { \
-        rb_ractor_t *const mark_cr = rb_current_ractor_raw(false); \
-        struct gc_mark_func_data_struct **mfdp = gc_mark_func_data_slotp_of(mark_cr); \
+        const struct gc_mark_ctx mark_ctx = gc_mark_ctx_current(); \
+        struct gc_mark_func_data_struct **mfdp = mark_ctx.mfdp; \
         struct gc_mark_func_data_struct *mark_func_data = *mfdp; \
-        void *objspace = gc_current_objspace_of(mark_cr); \
+        void *objspace = mark_ctx.objspace; \
         if (LIKELY(mark_func_data == NULL)) { \
             GC_ASSERT(rb_gc_impl_during_gc_p(objspace)); \
             (func)(objspace, (obj_or_ptr)); \
@@ -3192,7 +3289,7 @@ gc_location_internal(void *objspace, VALUE value)
 VALUE
 rb_gc_location(VALUE value)
 {
-    return gc_location_internal(rb_gc_get_objspace(), value);
+    return gc_location_internal(gc_mark_ctx_current().objspace, value);
 }
 
 void
@@ -5697,7 +5794,9 @@ rb_objspace_reachable_objects_from(VALUE obj, void (func)(VALUE, void *), void *
             };
 
             *mfdp = &mfd;
+            const struct gc_mark_ctx prev_ctx = gc_mark_ctx_begin();
             rb_gc_mark_children(rb_gc_get_objspace(), obj);
+            gc_mark_ctx_end(prev_ctx);
             *mfdp = prev_mfd;
         }
     }
@@ -5734,8 +5833,10 @@ rb_objspace_reachable_objects_from_root(void (func)(const char *category, VALUE,
     };
 
     *mfdp = &mfd;
+    const struct gc_mark_ctx prev_ctx = gc_mark_ctx_begin();
     rb_gc_save_machine_context();
     rb_gc_mark_roots(rb_gc_get_objspace(), &data.category);
+    gc_mark_ctx_end(prev_ctx);
     *mfdp = prev_mfd;
 }
 
@@ -6730,7 +6831,9 @@ rb_gc_verify_shareable(VALUE obj)
         };
 
         *mfdp = &mfd;
+        const struct gc_mark_ctx prev_ctx = gc_mark_ctx_begin();
         rb_gc_mark_children(rb_gc_get_objspace(), obj);
+        gc_mark_ctx_end(prev_ctx);
         *mfdp = prev_mfd;
     }
 
@@ -6742,7 +6845,7 @@ rb_gc_verify_shareable(VALUE obj)
 bool
 rb_gc_checking_shareable(void)
 {
-    const struct gc_mark_func_data_struct *mfd = *GC_MARK_FUNC_DATA_SLOTP();
+    const struct gc_mark_func_data_struct *mfd = *gc_mark_ctx_current().mfdp;
     return mfd && mfd->checking_shareable;
 }
 

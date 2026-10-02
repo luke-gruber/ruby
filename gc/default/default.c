@@ -9349,12 +9349,15 @@ gc_marking_enter(rb_objspace_t *objspace)
     }
 
     rb_gc_initialize_vm_context(&objspace->vm_context);
+    rb_gc_mark_ctx_begin();
 }
 
 static void
 gc_marking_exit(rb_objspace_t *objspace)
 {
     GC_ASSERT(during_gc != 0);
+
+    rb_gc_mark_ctx_end();
 
     if (MEASURE_GC) {
         objspace->profile.marking_time_ns += gc_clock_end(&objspace->profile.marking_start_time);
@@ -10612,6 +10615,8 @@ gc_update_references_heap(rb_objspace_t *objspace)
 {
     struct heap_page *page = NULL;
 
+    rb_gc_mark_ctx_begin();
+
     for (int i = 0; i < HEAP_COUNT; i++) {
         bool should_set_mark_bits = TRUE;
         rb_heap_t *heap = &heaps[i];
@@ -10629,6 +10634,8 @@ gc_update_references_heap(rb_objspace_t *objspace)
             }
         }
     }
+
+    rb_gc_mark_ctx_end();
 }
 
 /* The VM-global side of the reference update (finalizer table, every Ractor's VM roots,
@@ -10637,6 +10644,8 @@ gc_update_references_heap(rb_objspace_t *objspace)
 static void
 gc_update_references_global(rb_objspace_t *objspace)
 {
+    rb_gc_mark_ctx_begin();
+
     gc_update_table_refs(finalizer_table);
 
     rb_gc_update_vm_references((void *)objspace);
@@ -10650,6 +10659,8 @@ gc_update_references_global(rb_objspace_t *objspace)
             table
         );
     }
+
+    rb_gc_mark_ctx_end();
 }
 
 static void
