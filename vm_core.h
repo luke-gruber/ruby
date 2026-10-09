@@ -700,6 +700,11 @@ typedef const struct rb_builtin_function *RB_BUILTIN;
 struct gc_mark_func_data_struct {
     void *data;
     void (*mark_func)(VALUE v, void *data);
+    /* The slot this redirect was installed in.  A walk caches the redirect itself rather
+     * than the slot, so the slot has to be recoverable from it to be cleared across a
+     * callback; it cannot be re-resolved from the walk, whose objspace may be shared by
+     * several Ractors or belong to none. */
+    struct gc_mark_func_data_struct **slotp;
     /* Marker set while a shareable-verification walk runs (read by
      * rb_gc_checking_shareable).  The slot is per-Ractor, so it only affects the
      * walk of the Ractor doing the verification. */

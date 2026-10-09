@@ -2942,18 +2942,32 @@ static inline struct rb_gc_mark_ctx
 gc_current_mark_ctx(void)
 {
     rb_ractor_t *const cr = rb_current_ractor_raw(false);
-    struct gc_mark_func_data_struct **const mfdp = gc_mark_func_data_slotp_of(cr);
-
     return (struct rb_gc_mark_ctx){
         .objspace = gc_current_objspace_of(cr),
-        .mfdp = mfdp,
+        .mfd = *gc_mark_func_data_slotp_of(cr),
     };
+}
+
+/* The redirect is cleared across the callback so that marking done by the callback itself
+ * takes the real mark path instead of recursing back into the traversal.
+ *
+ * Kept out of line: inlined, its slot load and stores land in the per-reference mark path
+ * and stop the redirect test from being hoisted out of the mark loops. */
+NOINLINE(static void gc_traverse_one(struct gc_mark_func_data_struct *mfd, VALUE obj));
+COLDFUNC static void
+gc_traverse_one(struct gc_mark_func_data_struct *mfd, VALUE obj)
+{
+    struct gc_mark_func_data_struct **mfdp = mfd->slotp;
+
+    RUBY_ASSERT(mfdp != NULL);
+    *mfdp = NULL;
+    mfd->mark_func(obj, mfd->data);
+    *mfdp = mfd;
 }
 
 #define RB_GC_MARK_OR_TRAVERSE(ctx, func, obj_or_ptr, obj, check_obj) do { \
     if (!RB_SPECIAL_CONST_P(obj)) { \
-        struct gc_mark_func_data_struct **mfdp = (ctx).mfdp; \
-        struct gc_mark_func_data_struct *mark_func_data = *mfdp; \
+        struct gc_mark_func_data_struct *mark_func_data = (ctx).mfd; \
         void *objspace = (ctx).objspace; \
         if (LIKELY(mark_func_data == NULL)) { \
             GC_ASSERT(rb_gc_impl_during_gc_p(objspace)); \
@@ -2964,9 +2978,7 @@ gc_current_mark_ctx(void)
                     !rb_gc_impl_garbage_object_p(objspace, obj) : \
                 true) { \
             GC_ASSERT(!rb_gc_impl_during_gc_p(objspace)); \
-            *mfdp = NULL; \
-            mark_func_data->mark_func((obj), mark_func_data->data); \
-            *mfdp = mark_func_data; \
+            gc_traverse_one(mark_func_data, (obj)); \
         } \
     } \
 } while (0)
@@ -2978,11 +2990,7 @@ static inline bool
 gc_checking_shareable_ctx(struct rb_gc_mark_ctx ctx)
 {
 #if RUBY_DEBUG
-    /* A walk's mfd is installed before it starts and restored after, so the flag cannot
-     * change under us -- unlike *mfdp, which RB_GC_MARK_OR_TRAVERSE clears and restores
-     * around each mark_func call, and which is never read from inside one. */
-    const struct gc_mark_func_data_struct *mfd = *ctx.mfdp;
-    return mfd != NULL && mfd->checking_shareable;
+    return ctx.mfd != NULL && ctx.mfd->checking_shareable;
 #else
     return false;
 #endif
@@ -5916,6 +5924,7 @@ reachable_objects_from_body(VALUE obj, void (func)(VALUE, void *), void *data, b
         struct gc_mark_func_data_struct mfd = {
             .mark_func = func,
             .data = data,
+            .slotp = mfdp,
         };
 
         *mfdp = &mfd;
@@ -6015,6 +6024,7 @@ rb_objspace_reachable_objects_from_root(void (func)(const char *category, VALUE,
     struct gc_mark_func_data_struct **mfdp = GC_MARK_FUNC_DATA_SLOTP();
     struct gc_mark_func_data_struct *prev_mfd = *mfdp;
     struct gc_mark_func_data_struct mfd = {
+        .slotp = mfdp,
         .mark_func = root_objects_from,
         .data = &data,
     };
@@ -7011,6 +7021,7 @@ rb_gc_verify_shareable(VALUE obj)
         struct gc_mark_func_data_struct **mfdp = GC_MARK_FUNC_DATA_SLOTP();
         struct gc_mark_func_data_struct *prev_mfd = *mfdp;
         struct gc_mark_func_data_struct mfd = {
+            .slotp = mfdp,
             .mark_func = check_shareable_i,
             .data = &data,
             .checking_shareable = true,

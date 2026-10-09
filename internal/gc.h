@@ -216,17 +216,20 @@ size_t rb_gc_max_allocation_size(void);
 
 void rb_gc_mark_and_move(VALUE *ptr);
 
-/* The objspace a marking walk marks into, plus the per-Ractor traversal redirect slot
- * (vm_core.h's gc_mark_func_data_struct).  Resolving the current Ractor costs an
- * out-of-line rb_current_ec() call on arm64, so a walk resolves it once into a ctx and
- * threads that down instead of repeating it per reference.  Kept to two pointers and
- * passed by value: AAPCS64 and SysV both hand a 16-byte struct over in registers, while
- * anything larger goes through memory.  Only gc.c builds one. */
+/* The objspace a marking walk marks into, plus the traversal redirect (vm_core.h's
+ * gc_mark_func_data_struct) in force when the walk started.  Resolving the current Ractor
+ * costs an out-of-line rb_current_ec() call on arm64, so a walk resolves it once into a
+ * ctx and threads that down instead of repeating it per reference.
+ *
+ * mfd is the redirect itself, not the Ractor slot holding it, so the per-reference test
+ * for "is this walk a traversal" is a register compare rather than a load.  Only a
+ * traversal rewrites the slot mid-walk, and it restores it around each callback, so a
+ * walk's view of it cannot change under us.  Only gc.c builds one. */
 struct gc_mark_func_data_struct;
 
 struct rb_gc_mark_ctx {
     void *objspace;
-    struct gc_mark_func_data_struct **mfdp;
+    struct gc_mark_func_data_struct *mfd;
 };
 
 void rb_gc_mark_and_pin_ctx(struct rb_gc_mark_ctx ctx, VALUE obj);

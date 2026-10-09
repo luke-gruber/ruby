@@ -6772,6 +6772,7 @@ objspace_allrefs(rb_objspace_t *objspace)
     data.references = st_init_numtable();
     init_mark_stack(&data.mark_stack);
 
+    mfd.slotp = &GET_VM()->gc.mark_func_data;
     mfd.mark_func = allrefs_roots_i;
     mfd.data = &data;
 
