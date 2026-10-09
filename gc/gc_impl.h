@@ -151,6 +151,8 @@ GC_IMPL_FN bool rb_gc_impl_during_postmortem_p(void *objspace_ptr);
 /* Whether obj is owned by an objspace other than objspace_ptr.  Always false for a single
  * objspace impl. */
 GC_IMPL_FN bool rb_gc_impl_obj_foreign_p(void *objspace_ptr, VALUE obj);
+/* Only the shareable verifier asks, so this has no caller outside a RUBY_DEBUG build. */
+RBIMPL_ATTR_MAYBE_UNUSED()
 GC_IMPL_FN bool rb_gc_impl_shref_marked_p(void *objspace_ptr, VALUE obj);
 GC_IMPL_FN size_t rb_gc_impl_heap_page_count(void *objspace_ptr);
 GC_IMPL_FN void rb_gc_impl_objspace_absorb(void *dst_ptr, void *src_ptr);

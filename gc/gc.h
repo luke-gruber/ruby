@@ -66,7 +66,11 @@ const char *rb_obj_info(VALUE obj);
 size_t rb_obj_memsize_of(VALUE obj);
 bool ruby_free_at_exit_p(void);
 void rb_objspace_reachable_objects_from_root(void (func)(const char *category, VALUE, void *), void *passing_data);
+#if RUBY_DEBUG
 void rb_gc_verify_shareable(VALUE);
+#else
+# define rb_gc_verify_shareable(obj) ((void)0)
+#endif
 
 typedef void (*rb_gc_registered_addr_cb)(VALUE *slot, VALUE initial_value, void *owner_objspace, void *data);
 
@@ -124,6 +128,9 @@ MODULAR_GC_FN bool rb_obj_id_p(VALUE);
 MODULAR_GC_FN void rb_gc_before_updating_jit_code(void);
 MODULAR_GC_FN void rb_gc_after_updating_jit_code(void);
 MODULAR_GC_FN bool rb_gc_obj_shareable_p(VALUE);
+/* An lldb/printf helper with no in-tree caller once the shareable verifier is
+ * compiled out, and MODULAR_GC_FN is static in a non-modular build. */
+RBIMPL_ATTR_MAYBE_UNUSED()
 MODULAR_GC_FN void rb_gc_rp(VALUE);
 MODULAR_GC_FN void rb_gc_handle_weak_references(VALUE obj);
 MODULAR_GC_FN bool rb_gc_obj_needs_cleanup_p(VALUE obj);

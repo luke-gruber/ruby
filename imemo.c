@@ -8,7 +8,7 @@
 #include "vm_callinfo.h"
 
 size_t rb_iseq_memsize(const rb_iseq_t *iseq);
-void rb_iseq_mark_and_move(const struct rb_gc_mark_ctx *ctx, rb_iseq_t *iseq, bool reference_updating);
+void rb_iseq_mark_and_move(struct rb_gc_mark_ctx ctx, rb_iseq_t *iseq, bool reference_updating);
 void rb_iseq_free(const rb_iseq_t *iseq);
 
 ID
@@ -341,7 +341,7 @@ rb_imemo_memsize(VALUE obj)
  * ========================================================================= */
 
 static void
-mark_and_move_method_entry(const struct rb_gc_mark_ctx *ctx, rb_method_entry_t *ment, bool reference_updating)
+mark_and_move_method_entry(struct rb_gc_mark_ctx ctx, rb_method_entry_t *ment, bool reference_updating)
 {
     rb_method_definition_t *def = ment->def;
 
@@ -391,7 +391,7 @@ mark_and_move_method_entry(const struct rb_gc_mark_ctx *ctx, rb_method_entry_t *
 }
 
 void
-rb_imemo_mark_and_move(const struct rb_gc_mark_ctx *ctx, VALUE obj, bool reference_updating)
+rb_imemo_mark_and_move(struct rb_gc_mark_ctx ctx, VALUE obj, bool reference_updating)
 {
     switch (imemo_type(obj)) {
       case imemo_callcache: {

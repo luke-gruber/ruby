@@ -295,7 +295,7 @@ rb_iseq_flip_cnt_increment(const rb_iseq_t *iseq)
 typedef VALUE iseq_value_itr_t(void *ctx, VALUE obj);
 
 static inline void
-iseq_scan_bits(const struct rb_gc_mark_ctx *ctx, unsigned int page, iseq_bits_t bits, VALUE *code, VALUE *original_iseq)
+iseq_scan_bits(struct rb_gc_mark_ctx ctx, unsigned int page, iseq_bits_t bits, VALUE *code, VALUE *original_iseq)
 {
     unsigned int offset;
     unsigned int page_offset = (page * ISEQ_MBITS_BITLENGTH);
@@ -318,7 +318,7 @@ iseq_scan_bits(const struct rb_gc_mark_ctx *ctx, unsigned int page, iseq_bits_t 
 }
 
 static void
-rb_iseq_mark_and_move_each_compile_data_value(const struct rb_gc_mark_ctx *ctx, const rb_iseq_t *iseq, VALUE *original_iseq)
+rb_iseq_mark_and_move_each_compile_data_value(struct rb_gc_mark_ctx ctx, const rb_iseq_t *iseq, VALUE *original_iseq)
 {
     unsigned int size;
     VALUE *code;
@@ -341,7 +341,7 @@ rb_iseq_mark_and_move_each_compile_data_value(const struct rb_gc_mark_ctx *ctx, 
     }
 }
 static void
-rb_iseq_mark_and_move_each_body_value(const struct rb_gc_mark_ctx *ctx, const rb_iseq_t *iseq, VALUE *original_iseq)
+rb_iseq_mark_and_move_each_body_value(struct rb_gc_mark_ctx ctx, const rb_iseq_t *iseq, VALUE *original_iseq)
 {
     unsigned int size;
     VALUE *code;
@@ -405,7 +405,7 @@ cc_is_active(const struct rb_callcache *cc)
 }
 
 void
-rb_iseq_mark_and_move(const struct rb_gc_mark_ctx *ctx, rb_iseq_t *iseq, bool reference_updating)
+rb_iseq_mark_and_move(struct rb_gc_mark_ctx ctx, rb_iseq_t *iseq, bool reference_updating)
 {
     RUBY_MARK_ENTER("iseq");
 

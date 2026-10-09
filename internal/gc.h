@@ -217,33 +217,35 @@ size_t rb_gc_max_allocation_size(void);
 void rb_gc_mark_and_move(VALUE *ptr);
 
 /* The objspace a marking walk marks into, plus the per-Ractor traversal redirect slot
- * (vm_core.h's gc_mark_func_data_struct) and the shareable-check flag cached from it.
- * Resolving the current Ractor costs an out-of-line rb_current_ec() call on arm64, so a
- * walk resolves it once into a ctx and threads that down instead of repeating it per
- * reference.  Only gc.c builds one; everyone else just passes the pointer along. */
+ * (vm_core.h's gc_mark_func_data_struct).  Resolving the current Ractor costs an
+ * out-of-line rb_current_ec() call on arm64, so a walk resolves it once into a ctx and
+ * threads that down instead of repeating it per reference.  Kept to two pointers and
+ * passed by value: AAPCS64 and SysV both hand a 16-byte struct over in registers, while
+ * anything larger goes through memory.  Only gc.c builds one. */
 struct gc_mark_func_data_struct;
 
 struct rb_gc_mark_ctx {
     void *objspace;
     struct gc_mark_func_data_struct **mfdp;
-    bool checking_shareable;
 };
 
-void rb_gc_mark_and_pin_ctx(const struct rb_gc_mark_ctx *ctx, VALUE obj);
-void rb_gc_mark_movable_ctx(const struct rb_gc_mark_ctx *ctx, VALUE obj);
-void rb_gc_mark_maybe_ctx(const struct rb_gc_mark_ctx *ctx, VALUE obj);
-void rb_gc_mark_and_move_ctx(const struct rb_gc_mark_ctx *ctx, VALUE *ptr);
-void rb_gc_mark_locations_ctx(const struct rb_gc_mark_ctx *ctx, const VALUE *start, const VALUE *end);
-void rb_mark_tbl_no_pin_ctx(const struct rb_gc_mark_ctx *ctx, st_table *tbl);
-void rb_gc_mark_set_no_pin_ctx(const struct rb_gc_mark_ctx *ctx, st_table *tbl);
-VALUE rb_gc_location_ctx(const struct rb_gc_mark_ctx *ctx, VALUE value);
-void rb_gc_update_moved_ctx(const struct rb_gc_mark_ctx *ctx, VALUE *ptr);
+void rb_gc_mark_and_pin_ctx(struct rb_gc_mark_ctx ctx, VALUE obj);
+void rb_gc_mark_movable_ctx(struct rb_gc_mark_ctx ctx, VALUE obj);
+void rb_gc_mark_maybe_ctx(struct rb_gc_mark_ctx ctx, VALUE obj);
+void rb_gc_mark_and_move_ctx(struct rb_gc_mark_ctx ctx, VALUE *ptr);
+void rb_gc_mark_locations_ctx(struct rb_gc_mark_ctx ctx, const VALUE *start, const VALUE *end);
+void rb_mark_tbl_no_pin_ctx(struct rb_gc_mark_ctx ctx, st_table *tbl);
+void rb_gc_mark_set_no_pin_ctx(struct rb_gc_mark_ctx ctx, st_table *tbl);
+VALUE rb_gc_location_ctx(struct rb_gc_mark_ctx ctx, VALUE value);
+void rb_gc_update_moved_ctx(struct rb_gc_mark_ctx ctx, VALUE *ptr);
 
-static inline bool
-rb_gc_checking_shareable_ctx(const struct rb_gc_mark_ctx *ctx)
-{
-    return ctx->checking_shareable;
-}
+/* Only a shareable-verification walk sets the flag, and nothing starts one outside a
+ * RUBY_DEBUG build, so the mark path drops these branches entirely elsewhere. */
+#if RUBY_DEBUG
+bool rb_gc_checking_shareable_ctx(struct rb_gc_mark_ctx ctx);
+#else
+# define rb_gc_checking_shareable_ctx(ctx) false
+#endif
 
 void rb_gc_ref_update_table_values_only(st_table *tbl);
 
@@ -402,7 +404,12 @@ ruby_sized_realloc_n(void *ptr, size_t new_count, size_t element_size, size_t ol
     return ruby_xrealloc2_sized(ptr, new_count, element_size, old_count);
 }
 
+#if RUBY_DEBUG
 void rb_gc_verify_shareable(VALUE);
 bool rb_gc_checking_shareable(void);
+#else
+# define rb_gc_verify_shareable(obj) ((void)0)
+# define rb_gc_checking_shareable() false
+#endif
 
 #endif /* INTERNAL_GC_H */

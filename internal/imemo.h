@@ -157,7 +157,7 @@ static inline void MEMO_V1_SET(struct MEMO *m, VALUE v);
 static inline void MEMO_V2_SET(struct MEMO *m, VALUE v);
 
 size_t rb_imemo_memsize(VALUE obj);
-void rb_imemo_mark_and_move(const struct rb_gc_mark_ctx *ctx, VALUE obj, bool reference_updating);
+void rb_imemo_mark_and_move(struct rb_gc_mark_ctx ctx, VALUE obj, bool reference_updating);
 void rb_imemo_free(VALUE obj);
 
 RUBY_SYMBOL_EXPORT_BEGIN
