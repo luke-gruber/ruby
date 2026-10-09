@@ -6323,18 +6323,28 @@ gc_grey(rb_objspace_t *objspace, VALUE obj)
     push_mark_stack(&objspace->mark_stack, obj);
 }
 
+/* Out of line and never returning: the report buffers are half a kilobyte of stack, and
+ * inlined here they give every gc_mark() call that frame plus a stack-protector cookie,
+ * and push gc_mark past the inliner's threshold. */
+NORETURN(static void gc_mark_bug_t_none(rb_objspace_t *objspace, VALUE obj));
+COLDFUNC static void
+gc_mark_bug_t_none(rb_objspace_t *objspace, VALUE obj)
+{
+    enum {info_size = 256};
+    char obj_info_buf[info_size];
+    rb_raw_obj_info(obj_info_buf, info_size, obj);
+
+    char parent_obj_info_buf[info_size];
+    rb_raw_obj_info(parent_obj_info_buf, info_size, objspace->rgengc.parent_object);
+
+    rb_bug("try to mark T_NONE object (obj: %s, parent: %s)", obj_info_buf, parent_obj_info_buf);
+}
+
 static inline void
 gc_mark_check_t_none(rb_objspace_t *objspace, VALUE obj)
 {
     if (RB_UNLIKELY(BUILTIN_TYPE(obj) == T_NONE)) {
-        enum {info_size = 256};
-        char obj_info_buf[info_size];
-        rb_raw_obj_info(obj_info_buf, info_size, obj);
-
-        char parent_obj_info_buf[info_size];
-        rb_raw_obj_info(parent_obj_info_buf, info_size, objspace->rgengc.parent_object);
-
-        rb_bug("try to mark T_NONE object (obj: %s, parent: %s)", obj_info_buf, parent_obj_info_buf);
+        gc_mark_bug_t_none(objspace, obj);
     }
 }
 
