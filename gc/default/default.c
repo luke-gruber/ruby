@@ -882,7 +882,11 @@ typedef struct rb_global_objspace {
         size_t os_page_size;             /* sysconf(_SC_PAGE_SIZE), cached at init */
         /* List of mmap'd memory regions (arenas) for page bodies.  struct page_arena is
          * defined with the rest of the pool code, since its size needs HEAP_PAGE_SIZE. */
-        struct page_arena *arenas;        /* every arena, newest first */
+        struct page_arena *arenas;        /* every arena, newest created first */
+        struct page_arena *mru_arenas;    /* the arenas with a free body, most recently
+                                           * released first; page_pool_acquire takes its
+                                           * head, so it is also the order Step A spends
+                                           * the warm floor in */
         char *arena_cursor;               /* first body not yet carved out of the newest arena */
         char *arena_end;                  /* end of current arena */
         struct page_arena *arena_current; /* arena that arena_cursor carves from */
@@ -1047,6 +1051,7 @@ global_objspace_init(void)
         page_pool_lock_initialize(&g->page_pool.lock);
         g->page_pool.free_count_total = 0;
         g->page_pool.arenas = NULL;
+        g->page_pool.mru_arenas = NULL;
         g->page_pool.arena_cursor = NULL;
         g->page_pool.arena_end = NULL;
         g->page_pool.arena_current = NULL;
@@ -2717,7 +2722,14 @@ struct page_pool_body_info {
 };
 
 struct page_arena {
+    /* Two lists.  next/prev thread every arena in creation order (page_pool_map_arena
+     * hints off the newest, Step B unlinks in O(1)); mru_next/mru_prev thread only the
+     * arenas with a free body, most recently released first.  Membership of the second
+     * is exactly free_count > 0 -- see page_pool_check_mru. */
     struct page_arena *next;
+    struct page_arena *prev;
+    struct page_arena *mru_next;
+    struct page_arena *mru_prev;
     char *start;                  /* usable area, HEAP_PAGE_ALIGN aligned */
     size_t size;                  /* usable bytes (a multiple of HEAP_PAGE_SIZE) */
     int8_t cold_freelist;         /* head of the free body list, or PAGE_POOL_BODY_NIL */
@@ -2750,6 +2762,73 @@ page_pool_body_at(const struct page_arena *arena, int i)
     GC_ASSERT(i >= 0 && i < PAGE_POOL_ARENA_BODIES);
     return (struct heap_page_body *)(arena->start + (size_t)i * HEAP_PAGE_SIZE);
 }
+
+/* The MRU list.  All three run under page_pool.lock, and all are O(1): the order is
+ * maintained by moving an arena to the front as it releases, never by comparing
+ * timestamps, which stays in step with newest_free_since because page_pool_now is
+ * monotonic. */
+static void
+page_pool_mru_insert(rb_global_objspace_t *g, struct page_arena *a)
+{
+    GC_ASSERT(a->mru_next == NULL && a->mru_prev == NULL);
+    a->mru_next = g->page_pool.mru_arenas;
+    if (a->mru_next) a->mru_next->mru_prev = a;
+    g->page_pool.mru_arenas = a;
+}
+
+static void
+page_pool_mru_remove(rb_global_objspace_t *g, struct page_arena *a)
+{
+    if (a->mru_prev) a->mru_prev->mru_next = a->mru_next;
+    else g->page_pool.mru_arenas = a->mru_next;
+    if (a->mru_next) a->mru_next->mru_prev = a->mru_prev;
+    a->mru_next = a->mru_prev = NULL;
+}
+
+/* Called for every release, so the already-at-front case is the one to keep cheap. */
+static void
+page_pool_mru_promote(rb_global_objspace_t *g, struct page_arena *a)
+{
+    if (g->page_pool.mru_arenas == a) return;
+    page_pool_mru_remove(g, a);
+    page_pool_mru_insert(g, a);
+}
+
+static void
+page_pool_arena_list_remove(rb_global_objspace_t *g, struct page_arena *a)
+{
+    if (a->prev) a->prev->next = a->next;
+    else g->page_pool.arenas = a->next;
+    if (a->next) a->next->prev = a->prev;
+    a->next = a->prev = NULL;
+}
+
+#if RGENGC_CHECK_MODE
+/* The MRU list holds exactly the arenas with a free body, ordered by newest_free_since
+ * descending, and both lists' links agree in each direction. */
+static void
+page_pool_check_mru(rb_global_objspace_t *g)
+{
+    int with_free = 0;
+    for (struct page_arena *a = g->page_pool.arenas; a; a = a->next) {
+        GC_ASSERT(a->next == NULL || a->next->prev == a);
+        GC_ASSERT(a->prev == NULL ? g->page_pool.arenas == a : a->prev->next == a);
+        if (a->free_count > 0) with_free++;
+    }
+
+    int in_mru = 0;
+    rb_hrtime_t prev_released = RB_HRTIME_MAX;
+    for (struct page_arena *a = g->page_pool.mru_arenas; a; a = a->mru_next) {
+        GC_ASSERT(a->free_count > 0);
+        GC_ASSERT(a->mru_next == NULL || a->mru_next->mru_prev == a);
+        GC_ASSERT(a->mru_prev == NULL ? g->page_pool.mru_arenas == a : a->mru_prev->mru_next == a);
+        GC_ASSERT(a->newest_free_since <= prev_released);
+        prev_released = a->newest_free_since;
+        in_mru++;
+    }
+    GC_ASSERT(in_mru == with_free);
+}
+#endif
 #endif
 
 /* page_pool_reclaim advises a free body once it has been idle this long, and munmaps an
@@ -2939,7 +3018,13 @@ page_pool_add_arena(rb_global_objspace_t *g)
     arena->has_warm = false;
     arena->newest_free_since = 0;
     arena->oldest_free_since = 0;
+    /* No free bodies yet -- they go out through arena_cursor -- so the arena joins the
+     * MRU list on its first release, not here. */
+    arena->mru_next = NULL;
+    arena->mru_prev = NULL;
+    arena->prev = NULL;
     arena->next = g->page_pool.arenas;
+    if (arena->next) arena->next->prev = arena;
     g->page_pool.arenas = arena;
     g->page_pool.arena_count++;
     g->page_pool.arena_current = arena;
@@ -3053,26 +3138,31 @@ page_pool_acquire(struct page_arena **arena_out)
         rb_global_objspace_t *g = global_objspace;
 
         rb_native_mutex_lock(&g->page_pool.lock);
-        // find cold page body (madvised reusable)
-        for (struct page_arena *a = g->page_pool.arenas; a; a = a->next) {
-            if (a->free_count > 0) {
-                int i = a->cold_freelist;
-                GC_ASSERT(i != PAGE_POOL_BODY_NIL);
-                struct page_pool_body_info *info = &a->bodies[i];
-                body = page_pool_body_at(a, i);
-                a->cold_freelist = info->next;
-                a->free_count--;
-                GC_ASSERT(g->page_pool.free_count_total > 0);
-                g->page_pool.free_count_total--;
-                *arena_out = a;
-                need_reuse = info->advised;
-                if (need_reuse) {
-                    info->advised = false;
-                    a->advised_count--;
-                    g->page_pool.advised_count--;
-                    g->page_pool.reuse_calls++;
-                }
-                break;
+        /* The most recently released body in the pool: the head of the head arena.  It is
+         * the one least likely to have been advised and the warmest in cache, and taking
+         * it leaves the other arenas' bodies to go on ageing toward Step B. */
+        struct page_arena *a = g->page_pool.mru_arenas;
+        if (a != NULL) {
+            GC_ASSERT(a->free_count > 0);
+            int i = a->cold_freelist;
+            GC_ASSERT(i != PAGE_POOL_BODY_NIL);
+            struct page_pool_body_info *info = &a->bodies[i];
+            body = page_pool_body_at(a, i);
+            a->cold_freelist = info->next;
+            a->free_count--;
+            GC_ASSERT(g->page_pool.free_count_total > 0);
+            g->page_pool.free_count_total--;
+            *arena_out = a;
+            need_reuse = info->advised;
+            if (need_reuse) {
+                info->advised = false;
+                a->advised_count--;
+                g->page_pool.advised_count--;
+                g->page_pool.reuse_calls++;
+            }
+            if (a->free_count == 0) {
+                GC_ASSERT(a->cold_freelist == PAGE_POOL_BODY_NIL);
+                page_pool_mru_remove(g, a);
             }
         }
         if (body == NULL &&
@@ -3119,6 +3209,10 @@ page_pool_release_locked(struct heap_page_body *body, struct page_arena *arena, 
 
     if (arena->free_count == 0) {
         arena->oldest_free_since = now;
+        page_pool_mru_insert(g, arena);
+    }
+    else {
+        page_pool_mru_promote(g, arena);
     }
     arena->free_count++;
     g->page_pool.free_count_total++;
@@ -3209,6 +3303,10 @@ page_pool_reclaim(rb_global_objspace_t *g, size_t budget)
 
     rb_native_mutex_lock(&g->page_pool.lock);
 
+#if RGENGC_CHECK_MODE
+    page_pool_check_mru(g);
+#endif
+
     /* Advising covers whole bodies, so a body has to be a whole number of OS pages:
      * rounding a partial one up would reach into the neighbouring body, which may be in
      * use.  A platform reporting a larger page size than HEAP_PAGE_SIZE therefore
@@ -3244,12 +3342,10 @@ page_pool_reclaim(rb_global_objspace_t *g, size_t budget)
         return;
     }
 
-    for (struct page_arena *a = g->page_pool.arenas; a; a = a->next) {
+    for (struct page_arena *a = g->page_pool.mru_arenas; a; a = a->mru_next) {
         uint32_t advise_mask = 0;
 
-        /* Step B reads has_warm only once free_count is the whole arena, so an arena
-         * with nothing free needs neither the reset nor the walk. */
-        if (a->free_count == 0) continue;
+        GC_ASSERT(a->free_count > 0);
         a->has_warm = false;
 
         if (warm_left == 0) {
@@ -3339,35 +3435,37 @@ page_pool_reclaim(rb_global_objspace_t *g, size_t budget)
 #endif
 
     bool retained_one = false;
-    struct page_arena **pp = &g->page_pool.arenas;
-    // munmap fully free arenas
-    while (*pp) {
-        struct page_arena *a = *pp;
+    /* A fully-free arena has every body on its freelist, so it is in the MRU list: that
+     * is the only list Step B has to walk. */
+    struct page_arena *a = g->page_pool.mru_arenas;
+    while (a) {
+        struct page_arena *mru_next = a->mru_next;
         if (a->free_count != PAGE_POOL_ARENA_BODIES || a->has_warm) {
-            pp = &a->next;
+            a = mru_next;
             continue;
         }
         rb_hrtime_t unmap_due = rb_hrtime_add(a->newest_free_since, page_pool_unmap_idle);
         if (now < unmap_due) {
             if (unmap_due < next_due) next_due = unmap_due;
-            pp = &a->next;
+            a = mru_next;
             continue;
         }
         if (budget == 0) {
             deferred = true;
-            pp = &a->next;
+            a = mru_next;
             continue;
         }
 
         int free_elsewhere = total_free - PAGE_POOL_ARENA_BODIES;
         if (free_elsewhere < PAGE_POOL_ARENA_KEEP_HALF && !retained_one) {
             retained_one = true;
-            pp = &a->next;
+            a = mru_next;
             continue;
         }
 
         budget--;
-        *pp = a->next;
+        page_pool_mru_remove(g, a);
+        page_pool_arena_list_remove(g, a);
         if (munmap(a->start, a->size)) {
             rb_bug("page_pool_reclaim: munmap failed");
         }
@@ -3386,6 +3484,7 @@ page_pool_reclaim(rb_global_objspace_t *g, size_t budget)
             g->page_pool.arena_end = NULL;
         }
         free(a);
+        a = mru_next;
     }
 
     /* Bodies held by the warm floor become reclaimable as it decays; look again then. */
