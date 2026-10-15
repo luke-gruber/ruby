@@ -703,6 +703,15 @@ typedef struct rb_objspace {
         VALUE deferred_final;
     } heap_pages;
 
+    /* RUBY_GC_CONSERVATIVE_STATS only: reject-chain funnel for conservatively scanned
+     * words.  Written only by this objspace's marker, so no atomics. */
+    struct {
+        size_t scanned;
+        size_t in_range;
+        size_t searched;
+        size_t confirmed;
+    } conservative_stats;
+
     st_table *finalizer_table;
 
     struct {
@@ -1119,6 +1128,16 @@ static const bool HEAP_PAGE_ALLOC_USE_MMAP = false;
 
 static bool heap_page_alloc_use_mmap;
 #endif
+
+/* Experiment knob (RUBY_GC_PAGE_POOL=0): carve page bodies out of the arena pool, or
+ * fall back to one gc_aligned_malloc per body.  Kept separate from
+ * HEAP_PAGE_ALLOC_USE_MMAP, which also gates GC_COMPACTION_SUPPORTED. */
+static bool page_pool_enabled = true;
+#define PAGE_POOL_ENABLED (page_pool_enabled && HEAP_PAGE_ALLOC_USE_MMAP)
+
+/* Experiment knob (RUBY_GC_CONSERVATIVE_STATS=1): count how far each conservatively
+ * scanned word gets down the is_pointer_to_heap reject chain. */
+static bool gc_conservative_stats = false;
 
 #define RVALUE_AGE_BIT_COUNT 2
 #define RVALUE_AGE_BIT_MASK (((bits_t)1 << RVALUE_AGE_BIT_COUNT) - 1)
@@ -2479,7 +2498,7 @@ heap_pages_free_batch(rb_objspace_t *objspace, struct heap_page *pages)
     rb_native_mutex_lock(&g->page_pool.lock);
     for (struct heap_page *page = pages; page != NULL; page = page->free_next) {
         global_page_index_remove_locked(page);
-        if (HEAP_PAGE_ALLOC_USE_MMAP) {
+        if (page->arena != NULL) {
 #ifdef HAVE_MMAP
             page_pool_release_locked(page->body, page->arena);
 #endif
@@ -2487,9 +2506,9 @@ heap_pages_free_batch(rb_objspace_t *objspace, struct heap_page *pages)
     }
     rb_native_mutex_unlock(&g->page_pool.lock);
 
-    if (!HEAP_PAGE_ALLOC_USE_MMAP) {
-        /* gc_aligned_free does not need the pool lock. */
-        for (struct heap_page *page = pages; page != NULL; page = page->free_next) {
+    /* gc_aligned_free does not need the pool lock. */
+    for (struct heap_page *page = pages; page != NULL; page = page->free_next) {
+        if (page->arena == NULL) {
             heap_page_body_free(page->body, page->arena);
         }
     }
@@ -2685,7 +2704,7 @@ page_pool_acquire(struct page_arena **arena_out)
 {
     struct heap_page_body *body = NULL;
 
-    if (HEAP_PAGE_ALLOC_USE_MMAP) {
+    if (PAGE_POOL_ENABLED) {
 #ifdef HAVE_MMAP
         bool need_reuse = false;
         rb_global_objspace_t *g = global_objspace;
@@ -2758,7 +2777,7 @@ page_pool_release_locked(struct heap_page_body *body, struct page_arena *arena)
 static void
 page_pool_release(struct heap_page_body *body, struct page_arena *arena)
 {
-    if (HEAP_PAGE_ALLOC_USE_MMAP) {
+    if (arena != NULL) {
 #ifdef HAVE_MMAP
         rb_global_objspace_t *g = global_objspace;
 
@@ -2784,7 +2803,7 @@ page_pool_release(struct heap_page_body *body, struct page_arena *arena)
 static void
 page_pool_reclaim(rb_global_objspace_t *g)
 {
-    if (!HEAP_PAGE_ALLOC_USE_MMAP) return;
+    if (!PAGE_POOL_ENABLED) return;
 #ifdef HAVE_MMAP
     size_t os_page_size = g->page_pool.os_page_size;
 
@@ -3623,7 +3642,8 @@ heap_page_for_ptr(rb_objspace_t *objspace, uintptr_t ptr)
     }
 }
 
-PUREFUNC(static inline bool is_pointer_to_heap(rb_objspace_t *objspace, const void *ptr);)
+/* Not PUREFUNC: the RUBY_GC_CONSERVATIVE_STATS counters make it side-effecting, and the
+ * compiler would be free to fold repeated calls away. */
 static inline bool
 is_pointer_to_heap(rb_objspace_t *objspace, const void *ptr)
 {
@@ -3631,13 +3651,16 @@ is_pointer_to_heap(rb_objspace_t *objspace, const void *ptr)
     register struct heap_page *page;
 
     RB_DEBUG_COUNTER_INC(gc_isptr_trial);
+    if (RB_UNLIKELY(gc_conservative_stats)) objspace->conservative_stats.scanned++;
 
     if (p < heap_pages_lomem || p > heap_pages_himem) return FALSE;
     RB_DEBUG_COUNTER_INC(gc_isptr_range);
+    if (RB_UNLIKELY(gc_conservative_stats)) objspace->conservative_stats.in_range++;
 
     if (p % sizeof(VALUE) != 0) return FALSE;
     RB_DEBUG_COUNTER_INC(gc_isptr_align);
 
+    if (RB_UNLIKELY(gc_conservative_stats)) objspace->conservative_stats.searched++;
     page = heap_page_for_ptr(objspace, (uintptr_t)ptr);
     if (page) {
         RB_DEBUG_COUNTER_INC(gc_isptr_maybe);
@@ -3649,6 +3672,7 @@ is_pointer_to_heap(rb_objspace_t *objspace, const void *ptr)
             if (p >= page->start + (page->total_slots * page->slot_size)) return FALSE;
             if ((p - page->start) % page->slot_size != 0) return FALSE;
 
+            if (RB_UNLIKELY(gc_conservative_stats)) objspace->conservative_stats.confirmed++;
             return TRUE;
         }
     }
@@ -5876,7 +5900,7 @@ gc_sweep_step_for_malloc(rb_objspace_t *objspace)
     gc_exit(objspace, gc_enter_event_continue, &lock_lev);
 }
 
-static bool gc_global_pointer_to_heap_p(const void *ptr);
+static bool gc_global_pointer_to_heap_p(rb_objspace_t *objspace, const void *ptr);
 
 VALUE
 rb_gc_impl_location(void *objspace_ptr, VALUE value)
@@ -5888,7 +5912,7 @@ rb_gc_impl_location(void *objspace_ptr, VALUE value)
      * leave foreign references alone.  A compacting global GC moves objects everywhere
      * under the barrier, so there every objspace's heap is searched for forwarding. */
     if (RB_UNLIKELY(objspace->flags.during_global_gc)
-            ? !gc_global_pointer_to_heap_p((void *)value)
+            ? !gc_global_pointer_to_heap_p(objspace, (void *)value)
             : !is_pointer_to_heap(objspace_ptr, (void *)value)) {
         return value;
     }
@@ -6451,14 +6475,20 @@ rb_gc_impl_mark_and_pin(void *objspace_ptr, VALUE obj)
  * is decided against the driver's snapshot of every objspace (the bits then land on the
  * owner's page through gc_mark and gc_pin). */
 static bool
-gc_global_pointer_to_heap_p(const void *ptr)
+gc_global_pointer_to_heap_p(rb_objspace_t *objspace, const void *ptr)
 {
     const rb_global_objspace_t *g = global_objspace;
     uintptr_t p = (uintptr_t)ptr;
+    const bool count = RB_UNLIKELY(gc_conservative_stats) && objspace != NULL;
+
+    if (count) objspace->conservative_stats.scanned++;
 
     if (p < g->page_index.lomem || p > g->page_index.himem) return false;
+    if (count) objspace->conservative_stats.in_range++;
+
     if (p % sizeof(VALUE) != 0) return false;
 
+    if (count) objspace->conservative_stats.searched++;
     struct heap_page **res = bsearch(ptr, g->page_index.pages, g->page_index.n_pages,
                                      sizeof(struct heap_page *), ptr_in_page_body_p);
     if (res == NULL) return false;
@@ -6468,6 +6498,8 @@ gc_global_pointer_to_heap_p(const void *ptr)
     if (p < page->start) return false;
     if (p >= page->start + (page->total_slots * page->slot_size)) return false;
     if ((p - page->start) % page->slot_size != 0) return false;
+
+    if (count) objspace->conservative_stats.confirmed++;
     return true;
 }
 
@@ -6479,7 +6511,7 @@ rb_gc_impl_mark_maybe(void *objspace_ptr, VALUE obj)
     (void)VALGRIND_MAKE_MEM_DEFINED(&obj, sizeof(obj));
 
     if (RB_UNLIKELY(objspace->flags.during_global_gc)
-            ? gc_global_pointer_to_heap_p((void *)obj)
+            ? gc_global_pointer_to_heap_p(objspace, (void *)obj)
             : is_pointer_to_heap(objspace, (void *)obj)) {
         asan_unpoisoning_object(obj) {
             /* Garbage can live on the stack, so do not mark or pin */
@@ -7069,7 +7101,7 @@ gc_slot_live_object_p(rb_objspace_t *objspace, VALUE obj)
 static bool
 verify_pointer_in_any_heap_p(const void *ptr)
 {
-    return gc_global_pointer_to_heap_p(ptr);
+    return gc_global_pointer_to_heap_p(NULL, ptr);
 }
 
 /* An exact root of the calling Ractor may only point at a shareable object, its own
@@ -10988,6 +11020,12 @@ enum gc_stat_sym {
     gc_stat_sym_page_pool_total_pages,
     gc_stat_sym_page_pool_discarded_pages,
     gc_stat_sym_page_pool_free_pages,
+    gc_stat_sym_page_index_pages,
+    gc_stat_sym_page_index_span_bytes,
+    gc_stat_sym_conservative_scanned,
+    gc_stat_sym_conservative_in_range,
+    gc_stat_sym_conservative_searched,
+    gc_stat_sym_conservative_confirmed,
     gc_stat_sym_last
 };
 
@@ -11045,6 +11083,12 @@ setup_gc_stat_symbols(void)
     S(page_pool_total_pages);
     S(page_pool_discarded_pages);
     S(page_pool_free_pages);
+    S(page_index_pages);
+    S(page_index_span_bytes);
+    S(conservative_scanned);
+    S(conservative_in_range);
+    S(conservative_searched);
+    S(conservative_confirmed);
 #undef S
 }
 
@@ -11205,6 +11249,14 @@ rb_gc_impl_stat(void *objspace_ptr, VALUE hash_or_sym)
     SET(page_pool_total_pages, (size_t)global_objspace->page_pool.arena_count * PAGE_POOL_ARENA_BODIES);
     SET(page_pool_discarded_pages, global_objspace->page_pool.advised_count);
     SET(page_pool_free_pages, global_objspace->page_pool.free_count_total);
+    SET(page_index_pages, global_objspace->page_index.n_pages);
+    SET(page_index_span_bytes, global_objspace->page_index.himem > global_objspace->page_index.lomem
+                               ? global_objspace->page_index.himem - global_objspace->page_index.lomem
+                               : 0);
+    SET(conservative_scanned, objspace->conservative_stats.scanned);
+    SET(conservative_in_range, objspace->conservative_stats.in_range);
+    SET(conservative_searched, objspace->conservative_stats.searched);
+    SET(conservative_confirmed, objspace->conservative_stats.confirmed);
 
 #if RGENGC_PROFILE
     SET(total_generated_normal_object_count, objspace->profile.total_generated_normal_object_count);
@@ -13412,6 +13464,14 @@ rb_gc_impl_objspace_init(void *objspace_ptr)
         /* Need to determine if we can use mmap at runtime. */
         heap_page_alloc_use_mmap = INIT_HEAP_PAGE_ALLOC_USE_MMAP;
 #endif
+        const char *page_pool_env = getenv("RUBY_GC_PAGE_POOL");
+        if (page_pool_env && strcmp(page_pool_env, "0") == 0) {
+            page_pool_enabled = false;
+        }
+        const char *conservative_stats_env = getenv("RUBY_GC_CONSERVATIVE_STATS");
+        if (conservative_stats_env && strcmp(conservative_stats_env, "0") != 0) {
+            gc_conservative_stats = true;
+        }
         gc_params.heap_init_bytes = GC_HEAP_INIT_BYTES;
         gc_params.ractor_heap_init_bytes = GC_RACTOR_HEAP_INIT_BYTES ? GC_RACTOR_HEAP_INIT_BYTES
                                                                      : heap_init_bytes_min();
