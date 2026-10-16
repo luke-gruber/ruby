@@ -386,6 +386,17 @@ int ruby_rgengc_debug;
 # define GC_DEBUG_STRESS_TO_CLASS RUBY_DEBUG
 #endif
 
+/* GC_CONSERVATIVE_STATS
+ * Count how far each conservatively scanned word gets down the is_pointer_to_heap
+ * reject chain, and expose the counters through GC.stat.  Adds a branch to the
+ * hottest part of conservative marking, so off unless built in.
+ * 0: disable.
+ * 1: enable, runtime-gated by RUBY_GC_CONSERVATIVE_STATS=1.
+ */
+#ifndef GC_CONSERVATIVE_STATS
+# define GC_CONSERVATIVE_STATS 0
+#endif
+
 typedef enum {
     GPR_FLAG_NONE               = 0x000,
     /* major reason */
@@ -703,6 +714,7 @@ typedef struct rb_objspace {
         VALUE deferred_final;
     } heap_pages;
 
+#if GC_CONSERVATIVE_STATS
     /* RUBY_GC_CONSERVATIVE_STATS only: reject-chain funnel for conservatively scanned
      * words.  Written only by this objspace's marker, so no atomics. */
     struct {
@@ -711,6 +723,7 @@ typedef struct rb_objspace {
         size_t searched;
         size_t confirmed;
     } conservative_stats;
+#endif
 
     st_table *finalizer_table;
 
@@ -1129,15 +1142,23 @@ static const bool HEAP_PAGE_ALLOC_USE_MMAP = false;
 static bool heap_page_alloc_use_mmap;
 #endif
 
-/* Experiment knob (RUBY_GC_PAGE_POOL=0): carve page bodies out of the arena pool, or
- * fall back to one gc_aligned_malloc per body.  Kept separate from
+/* Experiment knob (RUBY_GC_PAGE_POOL=1): carve page bodies out of the arena pool
+ * instead of one gc_aligned_malloc per body.  Kept separate from
  * HEAP_PAGE_ALLOC_USE_MMAP, which also gates GC_COMPACTION_SUPPORTED. */
-static bool page_pool_enabled = true;
+static bool page_pool_enabled = false;
 #define PAGE_POOL_ENABLED (page_pool_enabled && HEAP_PAGE_ALLOC_USE_MMAP)
 
+#if GC_CONSERVATIVE_STATS
 /* Experiment knob (RUBY_GC_CONSERVATIVE_STATS=1): count how far each conservatively
  * scanned word gets down the is_pointer_to_heap reject chain. */
 static bool gc_conservative_stats = false;
+# define CONSERVATIVE_STAT_INC(objspace, field) do { \
+    rb_objspace_t *cs_os_ = (objspace); \
+    if (RB_UNLIKELY(gc_conservative_stats) && cs_os_) cs_os_->conservative_stats.field++; \
+} while (0)
+#else
+# define CONSERVATIVE_STAT_INC(objspace, field) ((void)(objspace))
+#endif
 
 #define RVALUE_AGE_BIT_COUNT 2
 #define RVALUE_AGE_BIT_MASK (((bits_t)1 << RVALUE_AGE_BIT_COUNT) - 1)
@@ -3642,8 +3663,11 @@ heap_page_for_ptr(rb_objspace_t *objspace, uintptr_t ptr)
     }
 }
 
-/* Not PUREFUNC: the RUBY_GC_CONSERVATIVE_STATS counters make it side-effecting, and the
- * compiler would be free to fold repeated calls away. */
+#if !GC_CONSERVATIVE_STATS
+/* Only pure without the counters: with them the compiler would be free to fold repeated
+ * calls away. */
+PUREFUNC(static inline bool is_pointer_to_heap(rb_objspace_t *objspace, const void *ptr);)
+#endif
 static inline bool
 is_pointer_to_heap(rb_objspace_t *objspace, const void *ptr)
 {
@@ -3651,16 +3675,16 @@ is_pointer_to_heap(rb_objspace_t *objspace, const void *ptr)
     register struct heap_page *page;
 
     RB_DEBUG_COUNTER_INC(gc_isptr_trial);
-    if (RB_UNLIKELY(gc_conservative_stats)) objspace->conservative_stats.scanned++;
+    CONSERVATIVE_STAT_INC(objspace, scanned);
 
     if (p < heap_pages_lomem || p > heap_pages_himem) return FALSE;
     RB_DEBUG_COUNTER_INC(gc_isptr_range);
-    if (RB_UNLIKELY(gc_conservative_stats)) objspace->conservative_stats.in_range++;
+    CONSERVATIVE_STAT_INC(objspace, in_range);
 
     if (p % sizeof(VALUE) != 0) return FALSE;
     RB_DEBUG_COUNTER_INC(gc_isptr_align);
 
-    if (RB_UNLIKELY(gc_conservative_stats)) objspace->conservative_stats.searched++;
+    CONSERVATIVE_STAT_INC(objspace, searched);
     page = heap_page_for_ptr(objspace, (uintptr_t)ptr);
     if (page) {
         RB_DEBUG_COUNTER_INC(gc_isptr_maybe);
@@ -3672,7 +3696,7 @@ is_pointer_to_heap(rb_objspace_t *objspace, const void *ptr)
             if (p >= page->start + (page->total_slots * page->slot_size)) return FALSE;
             if ((p - page->start) % page->slot_size != 0) return FALSE;
 
-            if (RB_UNLIKELY(gc_conservative_stats)) objspace->conservative_stats.confirmed++;
+            CONSERVATIVE_STAT_INC(objspace, confirmed);
             return TRUE;
         }
     }
@@ -6479,16 +6503,15 @@ gc_global_pointer_to_heap_p(rb_objspace_t *objspace, const void *ptr)
 {
     const rb_global_objspace_t *g = global_objspace;
     uintptr_t p = (uintptr_t)ptr;
-    const bool count = RB_UNLIKELY(gc_conservative_stats) && objspace != NULL;
 
-    if (count) objspace->conservative_stats.scanned++;
+    CONSERVATIVE_STAT_INC(objspace, scanned);
 
     if (p < g->page_index.lomem || p > g->page_index.himem) return false;
-    if (count) objspace->conservative_stats.in_range++;
+    CONSERVATIVE_STAT_INC(objspace, in_range);
 
     if (p % sizeof(VALUE) != 0) return false;
 
-    if (count) objspace->conservative_stats.searched++;
+    CONSERVATIVE_STAT_INC(objspace, searched);
     struct heap_page **res = bsearch(ptr, g->page_index.pages, g->page_index.n_pages,
                                      sizeof(struct heap_page *), ptr_in_page_body_p);
     if (res == NULL) return false;
@@ -6499,7 +6522,7 @@ gc_global_pointer_to_heap_p(rb_objspace_t *objspace, const void *ptr)
     if (p >= page->start + (page->total_slots * page->slot_size)) return false;
     if ((p - page->start) % page->slot_size != 0) return false;
 
-    if (count) objspace->conservative_stats.confirmed++;
+    CONSERVATIVE_STAT_INC(objspace, confirmed);
     return true;
 }
 
@@ -11022,10 +11045,12 @@ enum gc_stat_sym {
     gc_stat_sym_page_pool_free_pages,
     gc_stat_sym_page_index_pages,
     gc_stat_sym_page_index_span_bytes,
+#if GC_CONSERVATIVE_STATS
     gc_stat_sym_conservative_scanned,
     gc_stat_sym_conservative_in_range,
     gc_stat_sym_conservative_searched,
     gc_stat_sym_conservative_confirmed,
+#endif
     gc_stat_sym_last
 };
 
@@ -11085,10 +11110,12 @@ setup_gc_stat_symbols(void)
     S(page_pool_free_pages);
     S(page_index_pages);
     S(page_index_span_bytes);
+#if GC_CONSERVATIVE_STATS
     S(conservative_scanned);
     S(conservative_in_range);
     S(conservative_searched);
     S(conservative_confirmed);
+#endif
 #undef S
 }
 
@@ -11253,10 +11280,12 @@ rb_gc_impl_stat(void *objspace_ptr, VALUE hash_or_sym)
     SET(page_index_span_bytes, global_objspace->page_index.himem > global_objspace->page_index.lomem
                                ? global_objspace->page_index.himem - global_objspace->page_index.lomem
                                : 0);
+#if GC_CONSERVATIVE_STATS
     SET(conservative_scanned, objspace->conservative_stats.scanned);
     SET(conservative_in_range, objspace->conservative_stats.in_range);
     SET(conservative_searched, objspace->conservative_stats.searched);
     SET(conservative_confirmed, objspace->conservative_stats.confirmed);
+#endif
 
 #if RGENGC_PROFILE
     SET(total_generated_normal_object_count, objspace->profile.total_generated_normal_object_count);
@@ -13465,13 +13494,15 @@ rb_gc_impl_objspace_init(void *objspace_ptr)
         heap_page_alloc_use_mmap = INIT_HEAP_PAGE_ALLOC_USE_MMAP;
 #endif
         const char *page_pool_env = getenv("RUBY_GC_PAGE_POOL");
-        if (page_pool_env && strcmp(page_pool_env, "0") == 0) {
-            page_pool_enabled = false;
+        if (page_pool_env && strcmp(page_pool_env, "0") != 0) {
+            page_pool_enabled = true;
         }
+#if GC_CONSERVATIVE_STATS
         const char *conservative_stats_env = getenv("RUBY_GC_CONSERVATIVE_STATS");
         if (conservative_stats_env && strcmp(conservative_stats_env, "0") != 0) {
             gc_conservative_stats = true;
         }
+#endif
         gc_params.heap_init_bytes = GC_HEAP_INIT_BYTES;
         gc_params.ractor_heap_init_bytes = GC_RACTOR_HEAP_INIT_BYTES ? GC_RACTOR_HEAP_INIT_BYTES
                                                                      : heap_init_bytes_min();
