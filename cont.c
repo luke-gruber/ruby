@@ -110,12 +110,20 @@ struct fiber_pool_stack {
     struct fiber_pool_allocation * allocation;
 };
 
+// How many of the newest vacant stacks keep the page their VM stack is alloca'd from.
+// Reclaiming that page costs more than it saves for a stack that is about to be reused,
+// and the vacancy list is LIFO, so the newest entries are the ones reused first.
+#define FIBER_POOL_WARM_COUNT 10
+
 // Identifies a vacant (unused) stack. These live in the pool's vacancy array rather than
 // in the stack itself, so that a vacant stack can be reclaimed in full.
 // @sa fiber_pool_stack_at
 struct fiber_pool_vacancy {
     struct fiber_pool_allocation * allocation;
     uint32_t index;
+
+    // Whether this stack's top page escaped the reclaim, so cooling it can be skipped.
+    bool top_page_warm;
 };
 
 // Manages singly linked list of mapped regions of memory which contains 1 more more stack:
@@ -544,7 +552,7 @@ fiber_pool_vacancies_reserve(struct fiber_pool * pool, size_t additional)
 }
 
 inline static void
-fiber_pool_vacancy_push(struct fiber_pool * pool, struct fiber_pool_allocation * allocation, size_t index)
+fiber_pool_vacancy_push(struct fiber_pool * pool, struct fiber_pool_allocation * allocation, size_t index, bool top_page_warm)
 {
     ASSERT_fiber_pool_locked(pool);
     VM_ASSERT(pool->vacancies_count < pool->vacancies_capa);
@@ -552,6 +560,7 @@ fiber_pool_vacancy_push(struct fiber_pool * pool, struct fiber_pool_allocation *
     pool->vacancies[pool->vacancies_count++] = (struct fiber_pool_vacancy){
         .allocation = allocation,
         .index = (uint32_t)index,
+        .top_page_warm = top_page_warm,
     };
 }
 
@@ -728,7 +737,7 @@ fiber_pool_expand(struct fiber_pool * fiber_pool, size_t count, bool needs_lock,
     // Publish the new stacks. The capacity reserved above makes this infallible, so no
     // vacancy is left pointing into the mapping if the loop above unwound:
     for (size_t i = 0; i < count; i += 1) {
-        fiber_pool_vacancy_push(fiber_pool, allocation, i);
+        fiber_pool_vacancy_push(fiber_pool, allocation, i, false);
     }
 
     // Insert the allocation into the head of the pool:
@@ -978,6 +987,23 @@ fiber_pool_stack_free(struct fiber_pool_stack * stack)
 #endif
 }
 
+// Reclaim the one page fiber_pool_stack_release kept behind, for a stack that has since
+// aged out of the warm set.
+static void
+fiber_pool_stack_free_warm_page(struct fiber_pool_vacancy * vacancy)
+{
+    STACK_GROW_DIR_DETECTION;
+
+    struct fiber_pool_stack stack = fiber_pool_stack_at(vacancy->allocation, vacancy->index);
+    void * page = (char*)stack.base + STACK_DIR_UPPER(0, stack.size - RB_PAGE_SIZE);
+
+    if (DEBUG) fprintf(stderr, "fiber_pool_stack_free_warm_page: %p\n", page);
+
+    rb_vm_map_reusable_lazy(page, RB_PAGE_SIZE, stack.pool->free_stacks >> 1);
+
+    vacancy->top_page_warm = false;
+}
+
 // Release and return a stack to the vacancy list.
 static void
 fiber_pool_stack_release(struct fiber_pool_stack * stack)
@@ -992,7 +1018,7 @@ fiber_pool_stack_release(struct fiber_pool_stack * stack)
     // Nothing lives in the stack any more, so this spans all of it:
     struct fiber_pool_stack vacant = fiber_pool_stack_at(allocation, index);
 
-    fiber_pool_vacancy_push(pool, allocation, index);
+    fiber_pool_vacancy_push(pool, allocation, index, pool->free_stacks != 0);
     pool->used -= 1;
 
 #ifdef FIBER_POOL_ALLOCATION_FREE
@@ -1001,17 +1027,27 @@ fiber_pool_stack_release(struct fiber_pool_stack * stack)
     // Release address space and/or dirty memory:
     if (allocation->used == 0) {
         fiber_pool_allocation_free(allocation);
+        return;
     }
-    else if (pool->free_stacks) {
-        fiber_pool_stack_free(&vacant);
-    }
-#else
+#endif
+
     // This is entirely optional, but clears the dirty flag from the stack
     // memory, so it won't get swapped to disk when there is memory pressure:
     if (pool->free_stacks) {
+        // Keep the page the VM stack is alloca'd from: this stack is the newest vacancy,
+        // so it is the next one acquired, and that page is the first it touches again.
+        fiber_pool_stack_alloca(&vacant, RB_PAGE_SIZE);
         fiber_pool_stack_free(&vacant);
+
+        // Reclaim the page of whichever stack this push pushed out of the warm set:
+        if (pool->vacancies_count > FIBER_POOL_WARM_COUNT) {
+            struct fiber_pool_vacancy * cooled = &pool->vacancies[pool->vacancies_count - 1 - FIBER_POOL_WARM_COUNT];
+
+            if (cooled->top_page_warm) {
+                fiber_pool_stack_free_warm_page(cooled);
+            }
+        }
     }
-#endif
 }
 
 static inline void
