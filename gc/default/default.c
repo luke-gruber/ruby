@@ -1133,6 +1133,22 @@ static bool heap_page_alloc_use_mmap;
 #define RVALUE_AGE_BIT_MASK (((bits_t)1 << RVALUE_AGE_BIT_COUNT) - 1)
 #define RVALUE_OLD_AGE   3
 
+/* The bit-planes that a mark or sweep pass reads for the same object, interleaved into
+ * one group per BITS_BITLENGTH slots.  See struct heap_page. */
+struct slot_bits {
+    bits_t mark;
+    bits_t wb_unprotected;
+    bits_t age_lo;
+    bits_t age_hi;
+};
+
+/* A power of two, so a group aligned to it never straddles a cache line.  Spelled with
+ * SIZEOF_VALUE instead of sizeof so it stays usable by RUBY_ALIGNAS on every compiler. */
+#define SLOT_BITS_PLANE_COUNT 4
+#define SLOT_BITS_ALIGN (SLOT_BITS_PLANE_COUNT * SIZEOF_VALUE)
+STATIC_ASSERT(slot_bits_align, sizeof(struct slot_bits) == SLOT_BITS_ALIGN);
+STATIC_ASSERT(slot_bits_age_planes, RVALUE_AGE_BIT_COUNT == 2);
+
 struct free_region {
     VALUE flags;		/* always 0 for freed obj */
     uintptr_t end;		/* exclusive end address of the run */
@@ -1171,9 +1187,14 @@ struct heap_page {
     struct page_arena *arena;
     struct ccan_list_node page_node;
 
-    bits_t wb_unprotected_bits[HEAP_PAGE_BITMAP_LIMIT];
-    /* the following three bitmaps are cleared at the beginning of full GC */
-    bits_t mark_bits[HEAP_PAGE_BITMAP_LIMIT];
+    /* mark, wb_unprotected and the two age planes, interleaved one group per
+     * BITS_BITLENGTH slots so a single object's four bits share a cache line:
+     * gc_mark_set and gc_aging touch all four per object, and gc_sweep_page reads all
+     * four at the same index.  Aligned to the group size so a group never straddles a
+     * line, which is why heap_page_allocate uses gc_aligned_malloc. */
+    RUBY_ALIGNAS(SLOT_BITS_ALIGN) struct slot_bits bits[HEAP_PAGE_BITMAP_LIMIT];
+
+    /* bits[].mark and the following two bitmaps are cleared at the beginning of full GC */
     bits_t uncollectible_bits[HEAP_PAGE_BITMAP_LIMIT];
     bits_t marking_bits[HEAP_PAGE_BITMAP_LIMIT];
 
@@ -1188,7 +1209,6 @@ struct heap_page {
 
     /* If set, the object is not movable */
     bits_t pinned_bits[HEAP_PAGE_BITMAP_LIMIT];
-    bits_t age_bits[HEAP_PAGE_BITMAP_LIMIT * RVALUE_AGE_BIT_COUNT];
 };
 
 /*
@@ -1255,10 +1275,18 @@ slot_index_for_offset(size_t offset, uint64_t reciprocal)
 #define MARK_IN_BITMAP(bits, p)      _MARK_IN_BITMAP(bits, GET_HEAP_PAGE(p), p)
 #define CLEAR_IN_BITMAP(bits, p)     _CLEAR_IN_BITMAP(bits, GET_HEAP_PAGE(p), p)
 
-#define GET_HEAP_MARK_BITS(x)           (&GET_HEAP_PAGE(x)->mark_bits[0])
+/* Interleaved planes are reached by field name instead of by a bits_t *, so a flat
+ * plane can never be passed where a grouped one is meant. */
+#define SLOT_BITS(page, p)             (&(page)->bits[SLOT_BITMAP_INDEX(page, p)])
+#define _SLOT_BIT_TEST(page, p, name)  (SLOT_BITS(page, p)->name & SLOT_BITMAP_BIT(page, p))
+#define _SLOT_BIT_SET(page, p, name)   (SLOT_BITS(page, p)->name |= SLOT_BITMAP_BIT(page, p))
+#define _SLOT_BIT_CLEAR(page, p, name) (SLOT_BITS(page, p)->name &= ~SLOT_BITMAP_BIT(page, p))
+#define SLOT_BIT_TEST(p, name)         _SLOT_BIT_TEST(GET_HEAP_PAGE(p), p, name)
+#define SLOT_BIT_SET(p, name)          _SLOT_BIT_SET(GET_HEAP_PAGE(p), p, name)
+#define SLOT_BIT_CLEAR(p, name)        _SLOT_BIT_CLEAR(GET_HEAP_PAGE(p), p, name)
+
 #define GET_HEAP_PINNED_BITS(x)         (&GET_HEAP_PAGE(x)->pinned_bits[0])
 #define GET_HEAP_UNCOLLECTIBLE_BITS(x)  (&GET_HEAP_PAGE(x)->uncollectible_bits[0])
-#define GET_HEAP_WB_UNPROTECTED_BITS(x) (&GET_HEAP_PAGE(x)->wb_unprotected_bits[0])
 #define GET_HEAP_MARKING_BITS(x)        (&GET_HEAP_PAGE(x)->marking_bits[0])
 #define GET_HEAP_SHAREABLE_BITS(x)      (&GET_HEAP_PAGE(x)->shareable_bits[0])
 #define GET_HEAP_SHREF_BITS(x)          (&GET_HEAP_PAGE(x)->shref_bits[0])
@@ -1297,12 +1325,11 @@ static int
 RVALUE_AGE_GET(VALUE obj)
 {
     struct heap_page *page = GET_HEAP_PAGE(obj);
-    bits_t *age_bits = page->age_bits;
     size_t slot_idx = SLOT_INDEX(page, obj);
-    size_t idx = (slot_idx / BITS_BITLENGTH) * 2;
+    const struct slot_bits *group = &page->bits[slot_idx / BITS_BITLENGTH];
     int shift = (int)(slot_idx & (BITS_BITLENGTH - 1));
-    int lo = (age_bits[idx] >> shift) & 1;
-    int hi = (age_bits[idx + 1] >> shift) & 1;
+    int lo = (group->age_lo >> shift) & 1;
+    int hi = (group->age_hi >> shift) & 1;
     return lo | (hi << 1);
 }
 
@@ -1311,14 +1338,13 @@ RVALUE_AGE_SET_BITMAP(VALUE obj, int age)
 {
     RUBY_ASSERT(age <= RVALUE_OLD_AGE);
     struct heap_page *page = GET_HEAP_PAGE(obj);
-    bits_t *age_bits = page->age_bits;
     size_t slot_idx = SLOT_INDEX(page, obj);
-    size_t idx = (slot_idx / BITS_BITLENGTH) * 2;
+    struct slot_bits *group = &page->bits[slot_idx / BITS_BITLENGTH];
     int shift = (int)(slot_idx & (BITS_BITLENGTH - 1));
     bits_t mask = (bits_t)1 << shift;
 
-    age_bits[idx]     = (age_bits[idx]     & ~mask) | ((bits_t)(age & 1) << shift);
-    age_bits[idx + 1] = (age_bits[idx + 1] & ~mask) | ((bits_t)((age >> 1) & 1) << shift);
+    group->age_lo = (group->age_lo & ~mask) | ((bits_t)(age & 1) << shift);
+    group->age_hi = (group->age_hi & ~mask) | ((bits_t)((age >> 1) & 1) << shift);
 }
 
 static void
@@ -1745,8 +1771,8 @@ tick(void)
 
 static inline VALUE check_rvalue_consistency(rb_objspace_t *objspace, const VALUE obj);
 
-#define RVALUE_MARKED_BITMAP(obj)         MARKED_IN_BITMAP(GET_HEAP_MARK_BITS(obj), (obj))
-#define RVALUE_WB_UNPROTECTED_BITMAP(obj) MARKED_IN_BITMAP(GET_HEAP_WB_UNPROTECTED_BITS(obj), (obj))
+#define RVALUE_MARKED_BITMAP(obj)         SLOT_BIT_TEST((obj), mark)
+#define RVALUE_WB_UNPROTECTED_BITMAP(obj) SLOT_BIT_TEST((obj), wb_unprotected)
 #define RVALUE_MARKING_BITMAP(obj)        MARKED_IN_BITMAP(GET_HEAP_MARKING_BITS(obj), (obj))
 #define RVALUE_UNCOLLECTIBLE_BITMAP(obj)  MARKED_IN_BITMAP(GET_HEAP_UNCOLLECTIBLE_BITS(obj), (obj))
 #define RVALUE_PINNED_BITMAP(obj)         MARKED_IN_BITMAP(GET_HEAP_PINNED_BITS(obj), (obj))
@@ -1793,7 +1819,7 @@ RVALUE_UNCOLLECTIBLE(rb_objspace_t *objspace, VALUE obj)
     return RVALUE_UNCOLLECTIBLE_BITMAP(obj) != 0;
 }
 
-#define RVALUE_PAGE_WB_UNPROTECTED(page, obj) MARKED_IN_BITMAP((page)->wb_unprotected_bits, (obj))
+#define RVALUE_PAGE_WB_UNPROTECTED(page, obj) _SLOT_BIT_TEST((page), (obj), wb_unprotected)
 #define RVALUE_PAGE_UNCOLLECTIBLE(page, obj)  MARKED_IN_BITMAP((page)->uncollectible_bits, (obj))
 #define RVALUE_PAGE_MARKING(page, obj)        MARKED_IN_BITMAP((page)->marking_bits, (obj))
 
@@ -2489,7 +2515,7 @@ heap_page_free(rb_objspace_t *objspace, struct heap_page *page)
     global_page_index_remove(page);
     objspace->heap_pages.freed_pages++;
     heap_page_body_free(page->body, page->arena);
-    free(page);
+    gc_aligned_free(page, sizeof(struct heap_page));
 }
 
 static void
@@ -2976,11 +3002,15 @@ heap_page_allocate(rb_objspace_t *objspace)
         rb_memerror();
     }
 
-    struct heap_page *page = calloc1(sizeof(struct heap_page));
+    /* Aligned, not calloc'd: page->bits is RUBY_ALIGNAS(SLOT_BITS_ALIGN) so that no
+     * group straddles a cache line, and malloc only promises 16 bytes. */
+    struct heap_page *page = gc_aligned_malloc(SLOT_BITS_ALIGN, sizeof(struct heap_page));
     if (page == 0) {
         heap_page_body_free(page_body, arena);
         rb_memerror();
     }
+    memset(page, 0, sizeof(struct heap_page));
+    GC_ASSERT((uintptr_t)&page->bits[0] % SLOT_BITS_ALIGN == 0);
 
     uintptr_t start = (uintptr_t)page_body + sizeof(struct heap_page_header);
     uintptr_t end = (uintptr_t)page_body + HEAP_PAGE_SIZE;
@@ -3040,8 +3070,11 @@ heap_add_page(rb_objspace_t *objspace, rb_heap_t *heap, struct heap_page *page)
     page->slot_size_reciprocal = heap_slot_reciprocal_table[heap - heaps];
     page->heap = heap;
 
-    memset(&page->wb_unprotected_bits[0], 0, HEAP_PAGE_BITMAP_SIZE);
-    memset(&page->age_bits[0], 0, sizeof(page->age_bits));
+    for (int i = 0; i < HEAP_PAGE_BITMAP_LIMIT; i++) {
+        page->bits[i].wb_unprotected = 0;
+        page->bits[i].age_lo = 0;
+        page->bits[i].age_hi = 0;
+    }
 
     asan_unlock_freelist(page);
     asan_unpoison_memory_region(page->body, HEAP_PAGE_SIZE, false);
@@ -3258,7 +3291,7 @@ newobj_init(VALUE klass, VALUE flags, int wb_protected, rb_objspace_t *objspace,
 #endif
 
     if (RB_UNLIKELY(wb_protected == FALSE)) {
-        MARK_IN_BITMAP(GET_HEAP_WB_UNPROTECTED_BITS(obj), obj);
+        SLOT_BIT_SET(obj, wb_unprotected);
     }
 
 #if RGENGC_PROFILE
@@ -4596,7 +4629,9 @@ static void
 gc_setup_mark_bits(struct heap_page *page)
 {
     /* copy oldgen bitmap to mark bitmap */
-    memcpy(&page->mark_bits[0], &page->uncollectible_bits[0], HEAP_PAGE_BITMAP_SIZE);
+    for (int i = 0; i < HEAP_PAGE_BITMAP_LIMIT; i++) {
+        page->bits[i].mark = page->uncollectible_bits[i];
+    }
 }
 
 static int gc_is_moveable_obj(rb_objspace_t *objspace, VALUE obj);
@@ -5281,7 +5316,8 @@ gc_sweep_page(rb_objspace_t *objspace, rb_heap_t *heap, struct gc_sweep_context 
     GC_ASSERT(sweep_page->heap == heap);
 
     uintptr_t p;
-    bits_t *bits, bitset;
+    bits_t bitset;
+    struct slot_bits *group;
 
     gc_report(2, objspace, "page_sweep: start.\n");
 
@@ -5299,30 +5335,26 @@ gc_sweep_page(rb_objspace_t *objspace, rb_heap_t *heap, struct gc_sweep_context 
     ctx->free_region = NULL;
 
     p = (uintptr_t)sweep_page->start;
-    bits = sweep_page->mark_bits;
+    group = sweep_page->bits;
     short slot_size = sweep_page->slot_size;
     int total_slots = sweep_page->total_slots;
     int bitmap_plane_count = CEILDIV(total_slots, BITS_BITLENGTH);
 
     int out_of_range_bits = total_slots % BITS_BITLENGTH;
     if (out_of_range_bits != 0) {
-        bits[bitmap_plane_count - 1] |= ~(((bits_t)1 << out_of_range_bits) - 1);
+        group[bitmap_plane_count - 1].mark |= ~(((bits_t)1 << out_of_range_bits) - 1);
     }
 
     // Clear wb_unprotected and age bits for all unmarked slots
-    {
-        bits_t *wb_unprotected_bits = sweep_page->wb_unprotected_bits;
-        bits_t *age_bits = sweep_page->age_bits;
-        for (int i = 0; i < bitmap_plane_count; i++) {
-            bits_t unmarked = ~bits[i];
-            wb_unprotected_bits[i] &= ~unmarked;
-            age_bits[i * 2] &= ~unmarked;
-            age_bits[i * 2 + 1] &= ~unmarked;
-        }
+    for (int i = 0; i < bitmap_plane_count; i++) {
+        bits_t marked = group[i].mark;
+        group[i].wb_unprotected &= marked;
+        group[i].age_lo &= marked;
+        group[i].age_hi &= marked;
     }
 
     for (int i = 0; i < bitmap_plane_count; i++) {
-        bitset = ~bits[i];
+        bitset = ~group[i].mark;
         if (bitset) {
             gc_sweep_plane(objspace, heap, p, bitset, ctx);
         }
@@ -5331,15 +5363,15 @@ gc_sweep_page(rb_objspace_t *objspace, rb_heap_t *heap, struct gc_sweep_context 
 
     /* Bulk-clear the freed slots' shareable and shref bits before the freelist is
      * published, so a reused slot is clean.  Freed slots are exactly the unmarked ones,
-     * so `bits &= mark_bits` keeps live shareable objects (which must stay pinned) and
+     * so `bits &= mark` keeps live shareable objects (which must stay pinned) and
      * drops the rest.  Pages with neither bit are skipped. */
     if (sweep_page->flags.has_shareable_objects || sweep_page->flags.has_shref_objects) {
         bits_t *shareable_bits = sweep_page->shareable_bits;
         bits_t *shref_bits = sweep_page->shref_bits;
         bits_t sh = 0, sr = 0;
         for (int i = 0; i < bitmap_plane_count; i++) {
-            shareable_bits[i] &= bits[i];
-            shref_bits[i] &= bits[i];
+            shareable_bits[i] &= group[i].mark;
+            shref_bits[i] &= group[i].mark;
             sh |= shareable_bits[i];
             sr |= shref_bits[i];
         }
@@ -5522,7 +5554,7 @@ heap_alloc_state_clear(rb_objspace_t *objspace)
 static void
 gc_sweep_freeobj_hooks_page(rb_objspace_t *objspace, struct heap_page *page)
 {
-    bits_t *bits = page->mark_bits;
+    const struct slot_bits *group = page->bits;
     uintptr_t p = (uintptr_t)page->start;
     short slot_size = page->slot_size;
     int total_slots = page->total_slots;
@@ -5534,7 +5566,7 @@ gc_sweep_freeobj_hooks_page(rb_objspace_t *objspace, struct heap_page *page)
         : 0;
 
     for (int j = 0; j < bitmap_plane_count; j++) {
-        bits_t bitset = ~bits[j];
+        bits_t bitset = ~group[j].mark;
         if (j == bitmap_plane_count - 1) {
             bitset &= ~last_plane_mask;
         }
@@ -5956,21 +5988,20 @@ static void
 invalidate_moved_page(rb_objspace_t *objspace, struct heap_page *page)
 {
     int i;
-    bits_t *mark_bits, *pin_bits;
     bits_t bitset;
     short slot_size = page->slot_size;
     int total_slots = page->total_slots;
     int bitmap_plane_count = CEILDIV(total_slots, BITS_BITLENGTH);
 
-    mark_bits = page->mark_bits;
-    pin_bits = page->pinned_bits;
+    const struct slot_bits *group = page->bits;
+    const bits_t *pin_bits = page->pinned_bits;
 
     uintptr_t p = page->start;
 
     for (i=0; i < bitmap_plane_count; i++) {
         /* Moved objects are pinned but never marked. We reuse the pin bits
          * to indicate there is a moved object in this slot. */
-        bitset = pin_bits[i] & ~mark_bits[i];
+        bitset = pin_bits[i] & ~group[i].mark;
         invalidate_moved_plane(objspace, page, p, bitset);
         p += BITS_BITLENGTH * slot_size;
     }
@@ -6274,7 +6305,7 @@ static inline int
 gc_mark_set(rb_objspace_t *objspace, VALUE obj)
 {
     if (RVALUE_MARKED(objspace, obj)) return 0;
-    MARK_IN_BITMAP(GET_HEAP_MARK_BITS(obj), obj);
+    SLOT_BIT_SET(obj, mark);
     return 1;
 }
 
@@ -7576,8 +7607,7 @@ gc_marks_wb_unprotected_objects(rb_objspace_t *objspace, rb_heap_t *heap)
     struct heap_page *page = 0;
 
     ccan_list_for_each(&heap->pages, page, page_node) {
-        bits_t *mark_bits = page->mark_bits;
-        bits_t *wbun_bits = page->wb_unprotected_bits;
+        const struct slot_bits *group = page->bits;
         uintptr_t p = page->start;
         short slot_size = page->slot_size;
         int total_slots = page->total_slots;
@@ -7585,7 +7615,7 @@ gc_marks_wb_unprotected_objects(rb_objspace_t *objspace, rb_heap_t *heap)
         size_t j;
 
         for (j=0; j<(size_t)bitmap_plane_count; j++) {
-            bits_t bits = mark_bits[j] & wbun_bits[j];
+            bits_t bits = group[j].mark & group[j].wb_unprotected;
             gc_marks_wb_unprotected_objects_plane(objspace, p, bits, slot_size);
             p += BITS_BITLENGTH * slot_size;
         }
@@ -7878,19 +7908,18 @@ gc_compact_page(rb_objspace_t *objspace, rb_heap_t *heap, struct heap_page *page
 {
     GC_ASSERT(page == heap->compact_cursor);
 
-    bits_t *mark_bits, *pin_bits;
     bits_t bitset;
     uintptr_t p = page->start;
     short slot_size = page->slot_size;
     int total_slots = page->total_slots;
     int bitmap_plane_count = CEILDIV(total_slots, BITS_BITLENGTH);
 
-    mark_bits = page->mark_bits;
-    pin_bits = page->pinned_bits;
+    const struct slot_bits *group = page->bits;
+    const bits_t *pin_bits = page->pinned_bits;
 
     for (int j = 0; j < bitmap_plane_count; j++) {
         // objects that can be moved are marked and not pinned
-        bitset = (mark_bits[j] & ~pin_bits[j]);
+        bitset = (group[j].mark & ~pin_bits[j]);
         if (bitset) {
             if (!gc_compact_plane(objspace, heap, (uintptr_t)p, bitset, page))
                 return false;
@@ -8060,7 +8089,7 @@ pinned_roots_mark(rb_objspace_t *objspace, rb_heap_t *heap)
             /* Only the pins ordinary marking left unmarked need work here: an already
              * marked object (reached by traversal, or pre-marked because it is old) is a
              * no-op in gc_mark_set, so skip visiting it. */
-            bits_t bitset = (page->shareable_bits[j] | sr_bits) & ~page->mark_bits[j];
+            bits_t bitset = (page->shareable_bits[j] | sr_bits) & ~page->bits[j].mark;
             uintptr_t pp = p;
             while (bitset) {
                 if (bitset & 1) {
@@ -8303,7 +8332,7 @@ rgengc_rememberset_mark(rb_objspace_t *objspace, rb_heap_t *heap)
             bits_t bitset, bits[HEAP_PAGE_BITMAP_LIMIT];
             bits_t *remembered_bits = page->remembered_bits;
             bits_t *uncollectible_bits = page->uncollectible_bits;
-            bits_t *wb_unprotected_bits = page->wb_unprotected_bits;
+            const struct slot_bits *group = page->bits;
 #if PROFILE_REMEMBERSET_MARK
             if (page->flags.has_remembered_objects && page->flags.has_uncollectible_wb_unprotected_objects) has_both++;
             else if (page->flags.has_remembered_objects) has_old++;
@@ -8318,7 +8347,7 @@ rgengc_rememberset_mark(rb_objspace_t *objspace, rb_heap_t *heap)
             page->flags.has_remembered_objects = FALSE;
             for (j=0; j < (size_t)bitmap_plane_count; j++) {
                 bits[j] = RUBY_ATOMIC_SIZE_EXCHANGE(*(volatile size_t *)&remembered_bits[j], 0)
-                          | (uncollectible_bits[j] & wb_unprotected_bits[j]);
+                          | (uncollectible_bits[j] & group[j].wb_unprotected);
             }
 
             for (j=0; j < (size_t)bitmap_plane_count; j++) {
@@ -8346,7 +8375,9 @@ gc_bitmaps_clear(rb_objspace_t *objspace, rb_heap_t *heap, bool clear_shref)
     struct heap_page *page = 0;
 
     ccan_list_for_each(&heap->pages, page, page_node) {
-        memset(&page->mark_bits[0],       0, HEAP_PAGE_BITMAP_SIZE);
+        for (int i = 0; i < HEAP_PAGE_BITMAP_LIMIT; i++) {
+            page->bits[i].mark = 0;
+        }
         memset(&page->uncollectible_bits[0], 0, HEAP_PAGE_BITMAP_SIZE);
         memset(&page->marking_bits[0],    0, HEAP_PAGE_BITMAP_SIZE);
         /* A plain memset can lose a concurrent remember, but only a shareable object can
@@ -8513,7 +8544,7 @@ rb_gc_impl_writebarrier_unprotect(void *objspace_ptr, VALUE obj)
     rb_objspace_t *objspace = objspace_ptr;
 
     /* A shareable object is never WB-unprotected.  Keeping shrefs correct relies on every
-     * store into s->u going through the write barrier, which keeps wb_unprotected_bits
+     * store into s->u going through the write barrier, which keeps the wb_unprotected bits
      * single-writer (only the owner thread can unprotect its own unshareable objects). */
     GC_ASSERT(!RB_FL_TEST_RAW(obj, RUBY_FL_SHAREABLE));
 
@@ -8545,7 +8576,7 @@ rb_gc_impl_writebarrier_unprotect(void *objspace_ptr, VALUE obj)
         }
 
         RB_DEBUG_COUNTER_INC(obj_wb_unprotect);
-        MARK_IN_BITMAP(GET_HEAP_WB_UNPROTECTED_BITS(obj), obj);
+        SLOT_BIT_SET(obj, wb_unprotected);
     }
 }
 
@@ -10437,7 +10468,7 @@ gc_move(rb_objspace_t *objspace, VALUE src, VALUE dest, struct heap_page *src_pa
     gc_report(4, objspace, "Moving object: %p -> %p\n", (void *)src, (void *)dest);
 
     GC_ASSERT(BUILTIN_TYPE(src) != T_NONE);
-    GC_ASSERT(!MARKED_IN_BITMAP(GET_HEAP_MARK_BITS(dest), dest));
+    GC_ASSERT(!SLOT_BIT_TEST(dest, mark));
 
     GC_ASSERT(!RVALUE_MARKING(objspace, src));
 
@@ -10454,8 +10485,8 @@ gc_move(rb_objspace_t *objspace, VALUE src, VALUE dest, struct heap_page *src_pa
     age = RVALUE_AGE_GET(src);
 
     /* Clear bits for eventual T_MOVED */
-    CLEAR_IN_BITMAP(GET_HEAP_MARK_BITS(src), src);
-    CLEAR_IN_BITMAP(GET_HEAP_WB_UNPROTECTED_BITS(src), src);
+    SLOT_BIT_CLEAR(src, mark);
+    SLOT_BIT_CLEAR(src, wb_unprotected);
     CLEAR_IN_BITMAP(GET_HEAP_UNCOLLECTIBLE_BITS(src), src);
     CLEAR_IN_BITMAP(GET_HEAP_PAGE(src)->remembered_bits, src);
     CLEAR_IN_BITMAP(GET_HEAP_SHAREABLE_BITS(src), src);
@@ -10487,17 +10518,17 @@ gc_move(rb_objspace_t *objspace, VALUE src, VALUE dest, struct heap_page *src_pa
     }
 
     if (marked) {
-        MARK_IN_BITMAP(GET_HEAP_MARK_BITS(dest), dest);
+        SLOT_BIT_SET(dest, mark);
     }
     else {
-        CLEAR_IN_BITMAP(GET_HEAP_MARK_BITS(dest), dest);
+        SLOT_BIT_CLEAR(dest, mark);
     }
 
     if (wb_unprotected) {
-        MARK_IN_BITMAP(GET_HEAP_WB_UNPROTECTED_BITS(dest), dest);
+        SLOT_BIT_SET(dest, wb_unprotected);
     }
     else {
-        CLEAR_IN_BITMAP(GET_HEAP_WB_UNPROTECTED_BITS(dest), dest);
+        SLOT_BIT_CLEAR(dest, wb_unprotected);
     }
 
     if (uncollectible) {
