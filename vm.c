@@ -721,8 +721,7 @@ VALUE rb_mRubyVMFrozenCore;
 VALUE rb_block_param_proxy;
 
 VALUE ruby_vm_const_missing_count = 0;
-rb_vm_t *ruby_current_vm_ptr = NULL;
-rb_ractor_t *ruby_single_main_ractor;
+RBIMPL_ALIGNAS(16) struct rb_vm_globals ruby_vm_globals;
 bool ruby_vm_keep_script_lines;
 
 #ifdef RB_THREAD_LOCAL_SPECIFIER
@@ -3676,7 +3675,7 @@ ruby_vm_destruct(rb_vm_t *vm)
         rb_native_mutex_destroy(&vm->once_lock);
         rb_native_cond_destroy(&vm->once_cond);
         /* after freeing objspace, you *can't* use ruby_xfree() */
-        ruby_current_vm_ptr = NULL;
+        ruby_vm_globals.current_vm_ptr = NULL;
 
         if (rb_free_at_exit) {
 #if USE_YJIT
@@ -4917,7 +4916,7 @@ Init_VM(void)
 
     /* VM bootstrap: phase 2 */
     {
-        rb_vm_t *vm = ruby_current_vm_ptr;
+        rb_vm_t *vm = ruby_vm_globals.current_vm_ptr;
         rb_thread_t *th = GET_THREAD();
         VALUE filename = rb_fstring_lit("<main>");
         const rb_iseq_t *iseq = rb_iseq_new(Qnil, filename, filename, Qnil, 0, ISEQ_TYPE_TOP);
@@ -4999,7 +4998,7 @@ Init_BareVM(void)
     // setup the VM
     vm_init2(vm);
 
-    ruby_current_vm_ptr = vm;
+    ruby_vm_globals.current_vm_ptr = vm;
     /* The boot objspace belongs to the main Ractor, so the main Ractor has to exist
      * before rb_gc_init_objspaces allocates it. */
     vm->ractor.main_ractor = rb_ractor_main_alloc();

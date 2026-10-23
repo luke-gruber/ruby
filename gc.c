@@ -235,13 +235,6 @@ rb_gc_event_hook(VALUE obj, rb_event_flag_t event)
 #endif
 }
 
-/* Nonzero once the cleanup walk has stashed an objspace, which is the only case where a
- * thread needs one other than its own Ractor's.  One unsynchronised load gates it,
- * keeping the per-reference marking path and the malloc paths clear of the lookups
- * below.  It is never unwound, so a stale zero only costs a resolution that predates the
- * stash. */
-static rb_atomic_t gc_objspace_override_count;
-
 /* VM destruct's free-at-exit walk can free the thread and Ractor structs first, so
  * resolving through the current Ractor would use freed memory; return the objspace
  * stashed before the walk started. */
@@ -252,7 +245,7 @@ rb_gc_stash_cleanup_objspace(void)
     GET_VM()->gc.cleanup_objspace = rb_gc_get_objspace();
     /* Never unwound, as the VM is going away: from here every resolution takes the slow
      * path, which is where the stashed objspace is returned from. */
-    RUBY_ATOMIC_INC(gc_objspace_override_count);
+    RUBY_ATOMIC_INC(ruby_vm_globals.gc_objspace_override_count);
 }
 
 /* Out of line to keep the rare arms out of RB_GC_MARK_OR_TRAVERSE's inline expansions. */
@@ -279,7 +272,7 @@ gc_current_objspace_slow(rb_ractor_t *const cr)
 static inline void *
 gc_current_objspace_of(rb_ractor_t *const cr)
 {
-    if (RB_LIKELY(cr != NULL && gc_objspace_override_count == 0)) {
+    if (RB_LIKELY(cr != NULL && ruby_vm_globals.gc_objspace_override_count == 0)) {
         RUBY_ASSERT(cr->objspace != NULL);
         return cr->objspace;
     }
@@ -1070,7 +1063,7 @@ rb_gc_init_objspaces(void)
     ruby_modular_gc_init();
 #endif
 
-    rb_vm_t *vm = ruby_current_vm_ptr;
+    rb_vm_t *vm = ruby_vm_globals.current_vm_ptr;
 
     void *objspace = rb_gc_impl_objspace_alloc();
     RUBY_ASSERT(vm->ractor.main_ractor != NULL);
@@ -1083,16 +1076,11 @@ rb_gc_init_objspaces(void)
 #endif
 }
 
-/* Stays true once the process has gone multi-Ractor (rb_multi_ractor_p goes back to
- * false when the other Ractors finish).  Used by verification that spans generation
- * state built while multiple Ractors ran. */
-static bool gc_ever_multi_ractor = false;
-
 bool
 rb_gc_ever_multi_ractor_p(void)
 {
-    if (!gc_ever_multi_ractor && rb_multi_ractor_p()) gc_ever_multi_ractor = true;
-    return gc_ever_multi_ractor;
+    if (!ruby_vm_globals.gc_ever_multi_ractor && rb_multi_ractor_p()) ruby_vm_globals.gc_ever_multi_ractor = true;
+    return ruby_vm_globals.gc_ever_multi_ractor;
 }
 
 /* Allocate the objspace of a new non-main Ractor.  Called on the creating Ractor's
@@ -1100,7 +1088,7 @@ rb_gc_ever_multi_ractor_p(void)
 void *
 rb_gc_objspace_alloc(void)
 {
-    gc_ever_multi_ractor = true;
+    ruby_vm_globals.gc_ever_multi_ractor = true;
     if (!rb_gc_impl_multi_objspace_p()) {
         /* One objspace shared by every Ractor. */
         return rb_gc_get_objspace();
@@ -4664,7 +4652,7 @@ rb_gc_single_objspace_p(void)
     rb_vm_t *vm = GET_VM();
     /* One Ractor is not one objspace: a forked child re-enters single-Ractor mode while
      * the pre-fork Ractors' objspaces are still parked in zombie_objspaces. */
-    return (ruby_single_main_ractor != NULL || vm->ractor.cnt == 1) &&
+    return (ruby_vm_globals.single_main_ractor != NULL || vm->ractor.cnt == 1) &&
            vm->gc.zombie_objspaces_count == 0 && gc_absorbing_zombie == 0 &&
            !gc_absorbed_since_global_gc &&
            (vm->ractor.main_ractor == NULL ||

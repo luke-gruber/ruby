@@ -229,7 +229,7 @@ class Ractor
   def self.new(*args, name: nil, &block)
     b = block # TODO: builtin bug
     raise ArgumentError, "must be called with a block" unless block
-    if __builtin_cexpr!("RBOOL(ruby_single_main_ractor)")
+    if __builtin_cexpr!("RBOOL(ruby_vm_globals.single_main_ractor)")
       Kernel.warn("Ractor API is experimental and may change in future versions of Ruby.",
                   uplevel: 0, category: :experimental)
     end

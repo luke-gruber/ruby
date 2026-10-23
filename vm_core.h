@@ -127,6 +127,7 @@ If `rb_vm_check_ints()` is called between the `RUBY_ASSERT_CRITICAL_SECTION_ENTE
 #include "ruby/ruby.h"
 #include "ruby/st.h"
 #include "ruby_atomic.h"
+#include "vm_globals.h"
 #include "vm_opts.h"
 
 #include "ruby/thread_native.h"
@@ -2154,8 +2155,6 @@ rb_execution_context_t *rb_vm_main_ractor_ec(rb_vm_t *vm); // ractor.c
 
 #if RUBY_VM_THREAD_MODEL == 2
 
-RUBY_EXTERN struct rb_ractor_struct *ruby_single_main_ractor; // ractor.c
-RUBY_EXTERN rb_vm_t *ruby_current_vm_ptr;
 RUBY_EXTERN rb_event_flag_t ruby_vm_event_flags;
 RUBY_EXTERN rb_event_flag_t ruby_vm_event_enabled_global_flags; // only ever added to
 RUBY_EXTERN unsigned int ruby_vm_iseq_events_enabled;
@@ -2250,8 +2249,8 @@ rb_current_thread(void)
 static inline rb_ractor_t *
 rb_current_ractor_raw(bool expect)
 {
-    if (ruby_single_main_ractor) {
-        return ruby_single_main_ractor;
+    if (ruby_vm_globals.single_main_ractor) {
+        return ruby_vm_globals.single_main_ractor;
     }
     else {
         const rb_execution_context_t *ec = rb_current_execution_context(expect);
@@ -2269,14 +2268,14 @@ static inline rb_vm_t *
 rb_current_vm(void)
 {
 #if 0 // TODO: reconsider the assertions
-    VM_ASSERT(ruby_current_vm_ptr == NULL ||
+    VM_ASSERT(ruby_vm_globals.current_vm_ptr == NULL ||
               ruby_current_execution_context_ptr == NULL ||
               rb_ec_thread_ptr(GET_EC()) == NULL ||
               rb_ec_thread_ptr(GET_EC())->status == THREAD_KILLED ||
-              rb_ec_vm_ptr(GET_EC()) == ruby_current_vm_ptr);
+              rb_ec_vm_ptr(GET_EC()) == ruby_vm_globals.current_vm_ptr);
 #endif
 
-    return ruby_current_vm_ptr;
+    return ruby_vm_globals.current_vm_ptr;
 }
 
 void rb_ec_vm_lock_rec_release(const rb_execution_context_t *ec,

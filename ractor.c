@@ -467,7 +467,7 @@ ractor_free(void *ptr)
     rb_st_free_embedded_table(&r->pub.targeted_hooks);
 
     if (r->newobj_cache) {
-        RUBY_ASSERT(r == ruby_single_main_ractor);
+        RUBY_ASSERT(r == ruby_vm_globals.single_main_ractor);
 
         rb_gc_ractor_cache_free(r->newobj_cache);
         r->newobj_cache = NULL;
@@ -624,7 +624,7 @@ vm_insert_ractor0(rb_vm_t *vm, rb_ractor_t *r, bool single_ractor_mode)
     vm->ractor.cnt++;
 
     if (r->newobj_cache) {
-        VM_ASSERT(r == ruby_single_main_ractor);
+        VM_ASSERT(r == ruby_vm_globals.single_main_ractor);
     }
     else {
         r->newobj_cache = rb_gc_ractor_cache_alloc(r);
@@ -637,7 +637,7 @@ cancel_single_ractor_mode(void)
     // enable multi-ractor mode
     RUBY_DEBUG_LOG("enable multi-ractor mode");
 
-    ruby_single_main_ractor = NULL;
+    ruby_vm_globals.single_main_ractor = NULL;
     rb_yjit_invalidate_single_ractor();
     rb_zjit_invalidate_single_ractor();
 
@@ -807,7 +807,7 @@ rb_ractor_main_alloc(void)
     rb_ractor_t *r = &_main_ractor;
     /* The main Ractor is allocated before its objspace exists, so its newobj cache is
      * created later in Init_BareVM, once rb_gc_init_objspaces has set r->objspace. */
-    ruby_single_main_ractor = r;
+    ruby_vm_globals.single_main_ractor = r;
 
     return r;
 }
@@ -828,7 +828,7 @@ rb_ractor_atfork(rb_vm_t *vm, rb_thread_t *th)
      * just emptied by rb_vm_living_threads_init, and zombie_objspaces still holds the
      * non-main objspaces that terminate_atfork parked there for the orphan merge. */
     th->ractor->creating_child_objspace = NULL;
-    ruby_single_main_ractor = th->ractor;
+    ruby_vm_globals.single_main_ractor = th->ractor;
     th->ractor->status_ = ractor_created;
 
     rb_ractor_living_threads_init(th->ractor);

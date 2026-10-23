@@ -354,6 +354,7 @@ RB_DEBUG_COUNTER(load_path_is_not_realpath)
 #include "ruby/internal/config.h"
 #include <stddef.h>             /* for size_t */
 #include "ruby/ruby.h"          /* for VALUE */
+#include "vm_globals.h"
 
 #if !defined(__GNUC__) && USE_DEBUG_COUNTER
 #error "USE_DEBUG_COUNTER is not supported by other than __GNUC__"
@@ -368,14 +369,13 @@ enum rb_debug_counter_type {
 
 #if USE_DEBUG_COUNTER
 extern size_t rb_debug_counter[];
-RUBY_EXTERN struct rb_ractor_struct *ruby_single_main_ractor;
 RUBY_EXTERN void rb_debug_counter_add_atomic(enum rb_debug_counter_type type, int add);
 
 inline static int
 rb_debug_counter_add(enum rb_debug_counter_type type, int add, int cond)
 {
     if (cond) {
-        if (ruby_single_main_ractor != NULL) {
+        if (ruby_vm_globals.single_main_ractor != NULL) {
             rb_debug_counter[(int)type] += add;
         }
         else {

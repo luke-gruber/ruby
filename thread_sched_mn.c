@@ -998,7 +998,7 @@ coroutine_thread_terminated(rb_thread_t *th)
     bool last = (th->invoke_type == thread_invoke_type_ractor_proc);
     bool is_dnt = th_has_dedicated_nt(th);
 
-    // VM destruct tears down the heap and then unsets ruby_current_vm_ptr;
+    // VM destruct tears down the heap and then unsets ruby_vm_globals.current_vm_ptr;
     // this native thread still frees the dead context afterwards (the nt
     // loop's reclaim uses ruby_xfree and the stack-pool geometry via
     // GET_VM()). Make destruct wait until the reclaim finished. (Observed:

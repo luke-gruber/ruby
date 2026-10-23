@@ -617,7 +617,7 @@ ruby_debug_log(const char *file, int line, const char *func_name, const char *fm
         rb_thread_t *th = ec ? rb_ec_thread_ptr(ec) : NULL;
 
         // ractor information
-        if (ruby_single_main_ractor == NULL) {
+        if (ruby_vm_globals.single_main_ractor == NULL) {
             rb_ractor_t *cr = th ? th->ractor : NULL;
             rb_vm_t *vm = GET_VM();
 

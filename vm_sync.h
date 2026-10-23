@@ -3,6 +3,7 @@
 
 #include "vm_debug.h"
 #include "debug_counter.h"
+#include "vm_globals.h"
 
 #if USE_RUBY_DEBUG_LOG
 #define LOCATION_ARGS const char *file, int line
@@ -37,12 +38,10 @@ RUBY_SYMBOL_EXPORT_END
 #include "vm_core.h"
 #endif
 
-RUBY_EXTERN struct rb_ractor_struct *ruby_single_main_ractor; // ractor.c
-
 static inline bool
 rb_multi_ractor_p(void)
 {
-    if (LIKELY(ruby_single_main_ractor)) {
+    if (LIKELY(ruby_vm_globals.single_main_ractor)) {
         // 0 on boot time.
         RUBY_ASSERT(GET_VM()->ractor.cnt <= 1);
         return false;

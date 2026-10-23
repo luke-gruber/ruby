@@ -442,9 +442,8 @@ vm_cc_valid(const struct rb_callcache *cc)
 /* Whether another ractor may have invalidated this cc mid-use (see
  * vm_cc_invalidate()). Extensions cannot use rb_multi_ractor_p() here: with
  * assertions enabled at -O0 (e.g. --enable-yjit=dev on macOS) the inline
- * materializes references to core-internal globals (ruby_current_vm_ptr,
- * ruby_single_main_ractor) that are not exported to them, and objspace.bundle
- * fails to load. RUBY_EXPORT marks a core TU. */
+ * materializes a reference to a core-internal global (ruby_vm_globals) that is not
+ * exported to them, and objspace.bundle fails to load.  RUBY_EXPORT marks a core TU. */
 #ifdef RUBY_EXPORT
 # define VM_CC_RACED_P() rb_multi_ractor_p()
 #else

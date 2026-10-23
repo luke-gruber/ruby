@@ -278,7 +278,7 @@ RUBY_SYMBOL_EXPORT_END
 static inline bool
 rb_ractor_main_p(void)
 {
-    if (ruby_single_main_ractor) {
+    if (ruby_vm_globals.single_main_ractor) {
         return true;
     }
     else {
