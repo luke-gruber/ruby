@@ -1993,6 +1993,10 @@ nt_start(void *ptr)
 
     RUBY_DEBUG_LOG("nt:%u", nt->serial);
 
+    // tag this native thread for profilers; a DNT also picks up its Ruby
+    // thread's name once that thread starts (native_set_thread_name)
+    native_set_nt_name(nt);
+
     if (nt->dedicated) {
         // wait running turn
         rb_thread_t *th = nt->running_thread;
@@ -2222,6 +2226,8 @@ thread_sched_main_to_shared(rb_thread_t *th)
         thread_sched_add_running_thread(sched, th);
     }
     thread_sched_unlock(sched, th);
+
+    native_set_nt_name(nt); // (DNT) -> (SNT)
 
     RUBY_DEBUG_LOG("main th:%u on nt:%d is now shared", rb_th_serial(th), nt->serial);
 }
@@ -2625,6 +2631,10 @@ rb_thread_lock_native_thread(void)
     rb_thread_t *th = GET_THREAD();
     bool is_snt = th->nt->dedicated == 0;
     native_thread_dedicated_inc(th->vm, th->ractor, th->nt);
+
+    if (is_snt) {
+        native_set_nt_name(th->nt); // pinned with no matching dec: (SNT) -> (DNT)
+    }
 
     return is_snt;
 }

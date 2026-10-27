@@ -1042,6 +1042,24 @@ enum {
 #endif
 };
 
+// Native thread kind tags, prefixed to the native thread name: a profiler
+// (samply &c.) shows that name, so these tell a dedicated native thread from
+// a shared one at a glance.  The tag comes first so it survives truncation to
+// the platform's name limit.
+#define NT_NAME_DNT "(DNT)"
+#define NT_NAME_SNT "(SNT)"
+
+// Name the running native thread after its kind.  A DNT gets its Ruby thread's
+// name appended to the tag later (native_set_thread_name); an SNT keeps this
+// name whichever M:N thread it happens to be running.
+static void
+native_set_nt_name(const struct rb_native_thread *nt)
+{
+#ifdef SET_CURRENT_THREAD_NAME
+    SET_CURRENT_THREAD_NAME(nt->dedicated ? NT_NAME_DNT : NT_NAME_SNT);
+#endif
+}
+
 static VALUE threadptr_invoke_proc_location(rb_thread_t *th);
 
 static void
@@ -1057,7 +1075,11 @@ native_set_thread_name(rb_thread_t *th)
     if (!th->has_dedicated_nt) return;
 
     if (!NIL_P(loc = th->name)) {
-        SET_CURRENT_THREAD_NAME(RSTRING_PTR(loc));
+        char buf[THREAD_NAME_MAX];
+
+        snprintf(buf, sizeof(buf), NT_NAME_DNT " %s", RSTRING_PTR(loc));
+        RB_GC_GUARD(loc);
+        SET_CURRENT_THREAD_NAME(buf);
     }
     else if ((loc = threadptr_invoke_proc_location(th)) != Qnil) {
         char *name, *p;
@@ -1070,7 +1092,7 @@ native_set_thread_name(rb_thread_t *th)
         if (p && p[1])
             name = p + 1;
 
-        n = snprintf(buf, sizeof(buf), "%s:%d", name, NUM2INT(RARRAY_AREF(loc, 1)));
+        n = snprintf(buf, sizeof(buf), NT_NAME_DNT " %s:%d", name, NUM2INT(RARRAY_AREF(loc, 1)));
         RB_GC_GUARD(loc);
 
         len = (size_t)n;
@@ -1088,18 +1110,15 @@ native_set_another_thread_name(rb_nativethread_id_t thread_id, VALUE name)
 {
 #if defined SET_ANOTHER_THREAD_NAME || defined SET_CURRENT_THREAD_NAME
     char buf[THREAD_NAME_MAX];
-    const char *s = "";
+    const char *s = NT_NAME_DNT; // rb_thread_setname only names a dedicated nt
 # if !defined SET_ANOTHER_THREAD_NAME
     if (!pthread_equal(pthread_self(), thread_id)) return;
 # endif
     if (!NIL_P(name)) {
-        long n;
-        RSTRING_GETMEM(name, s, n);
-        if (n >= (int)sizeof(buf)) {
-            memcpy(buf, s, sizeof(buf)-1);
-            buf[sizeof(buf)-1] = '\0';
-            s = buf;
-        }
+        // NUL-terminated by the StringValueCStr in rb_thread_setname
+        snprintf(buf, sizeof(buf), NT_NAME_DNT " %s", RSTRING_PTR(name));
+        RB_GC_GUARD(name);
+        s = buf;
     }
 # if defined SET_ANOTHER_THREAD_NAME
     SET_ANOTHER_THREAD_NAME(thread_id, s);

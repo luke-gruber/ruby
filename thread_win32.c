@@ -714,6 +714,11 @@ native_set_thread_name(rb_thread_t *th)
 {
 }
 
+static void
+native_set_nt_name(const struct rb_native_thread *nt)
+{
+}
+
 static VALUE
 native_thread_native_thread_id(rb_thread_t *th)
 {
