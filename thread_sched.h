@@ -115,6 +115,21 @@ struct rb_thread_sched_item {
     void *context_stack;
     size_t context_stack_size;
     struct coroutine_context *context;
+
+    /* The func pointer handed to rb_nogvl() / rb_thread_io_blocking_call(),
+     * valid only for the duration of that call; read by the SNT trace
+     * (thread_sched.c) and symbolized with dladdr().  Unconditional on
+     * purpose: this header reaches nearly every translation unit, and ext/
+     * and gems do not see -DUSE_SNT_TRACE, so a conditional field here would
+     * give them a different struct layout. */
+    void *snt_trace_cfunc;
+
+    /* SNT trace: the site this thread is currently charged to and when it was
+     * charged, so the dump can report how long each site held its nt (which is
+     * what drives SNT create/retire churn -- not the raw transition count).
+     * Unconditional for the same ABI reason as snt_trace_cfunc above. */
+    void *snt_trace_site;
+    uint64_t snt_trace_t0;
 };
 
 struct rb_native_thread {

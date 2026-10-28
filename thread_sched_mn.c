@@ -555,6 +555,14 @@ thread_sched_wait_events(struct rb_thread_sched *sched, rb_thread_t *th, int fd,
 
         reg = timer_thread_register_waiting(th, fd, events, rel, event_serial);
 
+        if (fd >= 0) { /* io waits only; a bare sleep is not what we are counting */
+            switch (reg) {
+              case timer_thread_registered:    SNT_TRACE_WHEEL_PARKED();  break;
+              case timer_thread_already_ready: SNT_TRACE_WHEEL_READY();   break;
+              default:                         SNT_TRACE_WHEEL_UNAVAIL(); break;
+            }
+        }
+
         if (reg == timer_thread_registered) {
             RUBY_DEBUG_LOG("wait fd:%d", fd);
 
@@ -971,6 +979,7 @@ native_thread_check_and_create_shared(rb_vm_t *vm)
 
     if (need_to_make) {
         struct rb_native_thread *nt = native_thread_alloc();
+        SNT_TRACE_NT_CREATED();
         nt->vm = vm;
         int err = native_thread_create0(nt);
         if (err) {

@@ -114,6 +114,413 @@ static void nt_snts_leave(rb_vm_t *vm, struct rb_native_thread *nt);
 static bool nt_shared_loop(struct rb_native_thread *nt);
 static bool native_thread_self_can_retire_p(void);
 
+/* ------------------------------------------------------------------------
+ * SNT trace -- why does a shared native thread become dedicated?
+ *
+ * Every shared nt that enters a blocking region hands its nt back
+ * (native_thread_dedicated_inc drops snt_cnt); the pool is refilled by
+ * native_thread_check_and_create_shared(), which spawns a brand new pthread
+ * with a brand new serial, and a thread coming back to a full pool retires
+ * instead of rejoining.  create + retire in a loop is the churn a profiler
+ * shows as an endless parade of "(SNT) nt:N".
+ *
+ * thread_sched_to_waiting() is the only high-volume way in (BLOCKING_REGION:
+ * every rb_nogvl / rb_thread_io_blocking_call), so record there.
+ *
+ *   build:  cppflags=-DUSE_SNT_TRACE=1
+ *   run:    RUBY_SNT_TRACE=1 [RUBY_SNT_TRACE_OUT=/tmp/snt.txt]
+ * ------------------------------------------------------------------------ */
+
+#ifndef USE_SNT_TRACE
+#define USE_SNT_TRACE 0
+#endif
+
+#if USE_SNT_TRACE
+#include <dlfcn.h>
+#include <execinfo.h>
+#include <fcntl.h>
+
+#define SNT_TRACE_BITS 12
+#define SNT_TRACE_SIZE (1 << SNT_TRACE_BITS)
+
+struct snt_trace_site {
+    uint64_t key;              // 0 == empty
+    unsigned long count;
+    unsigned long yield_now;   // of which: handed the ractor over immediately
+    void *cfunc;               // nogvl func pointer, NULL if not a nogvl
+    void *ret[4];              // return addresses: which BLOCKING_REGION this was
+    uint64_t nsec;             // total time this site held a dedicated nt
+    int line;
+    char path[112];
+    char label[64];
+};
+
+static struct snt_trace_site snt_trace_table[SNT_TRACE_SIZE];
+static rb_nativethread_lock_t snt_trace_lock;
+static bool snt_trace_enabled;
+static unsigned long snt_trace_total, snt_trace_dropped;
+static rb_atomic_t snt_trace_nt_created, snt_trace_nt_retired;
+/* Wheel outcomes: a wait that parks on the timer thread keeps its SNT, so it
+ * is NOT an snt->dnt transition.  Counted separately to keep the two apart. */
+static rb_atomic_t snt_trace_wheel_parked, snt_trace_wheel_ready, snt_trace_wheel_unavail, snt_trace_mn_declined;
+
+#define SNT_TRACE_NT_CREATED()     RUBY_ATOMIC_INC(snt_trace_nt_created)
+#define SNT_TRACE_NT_RETIRED()     RUBY_ATOMIC_INC(snt_trace_nt_retired)
+#define SNT_TRACE_WHEEL_PARKED()   RUBY_ATOMIC_INC(snt_trace_wheel_parked)
+#define SNT_TRACE_WHEEL_READY()    RUBY_ATOMIC_INC(snt_trace_wheel_ready)
+#define SNT_TRACE_WHEEL_UNAVAIL()  RUBY_ATOMIC_INC(snt_trace_wheel_unavail)
+/* thread_io_wait_events() declined to use the wheel.  NOTE: on platforms where
+ * USE_POLL is unset (macOS, every BSD but FreeBSD>=11) thread_io_wait() is the
+ * select(2) variant, which never calls thread_io_wait_events() at all -- so a
+ * zero here does NOT mean single-fd waits are reaching the wheel. */
+#define SNT_TRACE_MN_DECLINED()    RUBY_ATOMIC_INC(snt_trace_mn_declined)
+#define SNT_TRACE_CFUNC_SET(th, f) ((th)->sched.snt_trace_cfunc = (void *)(f))
+
+static void snt_trace_dump(void);
+
+/* Comma-separated substrings whose frames the path picker walks past, from
+ * RUBY_SNT_TRACE_SKIP.  Read once at init and never written again, so the
+ * recorders can read it without the lock. */
+static char *snt_trace_skip;
+
+static bool
+snt_trace_skip_match(const char *path)
+{
+    const char *p = snt_trace_skip;
+
+    while (*p) {
+        const char *comma = strchr(p, ',');
+        size_t len = comma ? (size_t)(comma - p) : strlen(p);
+
+        if (len > 0) {
+            // strstr needs a NUL-terminated needle; compare span by span
+            for (const char *hay = path; *hay; hay++) {
+                if (strncmp(hay, p, len) == 0) return true;
+            }
+        }
+        if (!comma) break;
+        p = comma + 1;
+    }
+    return false;
+}
+
+static void
+snt_trace_init(void)
+{
+    const char *e = getenv("RUBY_SNT_TRACE");
+    if (!(e && *e && *e != '0')) return;
+
+    const char *skip = getenv("RUBY_SNT_TRACE_SKIP");
+    if (skip && *skip) snt_trace_skip = strdup(skip);
+
+    rb_native_mutex_initialize(&snt_trace_lock);
+    snt_trace_enabled = true;
+    atexit(snt_trace_dump);
+}
+
+/* A forked child inherits the table, the counters and whatever state the lock
+ * was in.  Start it clean -- the child's own churn is what we want -- but do
+ * not re-register the atexit handler: fork already carried ours over. */
+static void
+snt_trace_atfork(void)
+{
+    if (!snt_trace_enabled) return;
+
+    rb_native_mutex_initialize(&snt_trace_lock);
+    memset(snt_trace_table, 0, sizeof(snt_trace_table));
+    snt_trace_total = snt_trace_dropped = 0;
+    snt_trace_nt_created = snt_trace_nt_retired = 0;
+    snt_trace_wheel_parked = snt_trace_wheel_ready = 0;
+    snt_trace_wheel_unavail = snt_trace_mn_declined = 0;
+}
+
+static inline uint64_t
+snt_trace_mix(uint64_t h, uint64_t v)
+{
+    h ^= v + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
+    return h ? h : 1;
+}
+
+/* Called by the blocking thread itself, BEFORE the sched lock.  nt->dedicated
+ * is only ever written by this nt (inc/dec always run on GET_THREAD()'s nt),
+ * so reading it unlocked here is safe.  dedicated == 0 is exactly "on an SNT",
+ * and self-gates the 1:1 build, where every nt is dedicated. */
+static uint64_t
+snt_trace_now_nsec(void)
+{
+    struct timespec ts;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) return 0;
+    return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+}
+
+/* Charge the elapsed dedicated-nt time back to the site that took it.  Called
+ * from thread_sched_to_running(), i.e. once the thread has its nt back. */
+static void
+snt_trace_settle(rb_thread_t *th)
+{
+    struct snt_trace_site *site = th->sched.snt_trace_site;
+    if (site == NULL) return;
+
+    uint64_t t0 = th->sched.snt_trace_t0;
+    th->sched.snt_trace_site = NULL;
+    th->sched.snt_trace_t0 = 0;
+    if (t0 == 0) return;
+
+    uint64_t now = snt_trace_now_nsec();
+    if (now <= t0) return;
+
+    /* Racy against the dump's qsort, as snt_trace_record already is: both
+     * only ever touch an in-bounds site, and the dump is an exit-time read. */
+    rb_native_mutex_lock(&snt_trace_lock);
+    site->nsec += now - t0;
+    rb_native_mutex_unlock(&snt_trace_lock);
+}
+
+static void
+snt_trace_record(rb_thread_t *th, bool yield_immediately)
+{
+    if (!snt_trace_enabled) return;
+    if (th->nt == NULL || th->nt->dedicated != 0) return;
+
+    void *cfunc = th->sched.snt_trace_cfunc;
+
+    /* Raw return addresses.  The `-` rows (IO.select, accept, IO#wait_readable)
+     * carry no nogvl func, so without these there is no way to tell which
+     * BLOCKING_REGION they came from.  Resolve offline with atos/addr2line. */
+    void *bt[8];
+    int nbt = backtrace(bt, (int)numberof(bt));
+
+    /* rb_profile_frames() only walks the cfp chain -- no allocation, no locks.
+     * The innermost frame is usually a cfunc (File.read, IO#write, ...), and
+     * frame2iseq() returns NULL for those, so rb_profile_frame_path/_label
+     * give Qnil there: take the method name off frame 0 and the path/line off
+     * the innermost frame that actually has an iseq.  _method_name and _path
+     * hand back strings that already exist (rb_id2str / rb_iseq_path); only
+     * _full_label would allocate (rb_sprintf), so it stays unused. */
+    VALUE frames[32];
+    int lines[32];
+    int nframes = rb_profile_frames(0, (int)numberof(frames), frames, lines);
+
+    const char *path = "(none)", *label = "(none)";
+    int line = 0;
+    VALUE pathv = Qnil, labelv = Qnil, pathframe = Qnil;
+
+    if (nframes > 0) {
+        /* The method name comes off the innermost frame whatever it is, so a
+         * row still says `read_nonblock` even when that frame is skipped
+         * below. */
+        labelv = rb_profile_frame_method_name(frames[0]);
+        if (RB_TYPE_P(labelv, T_STRING)) label = RSTRING_PTR(labelv);
+
+        /* Walk outwards for a frame worth acting on.  Ruby's own builtins are
+         * written in Ruby and show up as "<internal:io>" and friends, which
+         * name the method again rather than the caller -- skip anything whose
+         * path is bracketed.  RUBY_SNT_TRACE_SKIP adds comma-separated
+         * substrings to skip past, e.g. "/gems/,/vendor/" to walk through
+         * library frames into application code.  If every frame is skipped,
+         * fall back to the innermost one with a path rather than report
+         * nothing. */
+        for (int pass = 0; pass < 2 && NIL_P(pathv); pass++) {
+            for (int i = 0; i < nframes; i++) {
+                VALUE p = rb_profile_frame_path(frames[i]);
+                if (!RB_TYPE_P(p, T_STRING)) continue;
+
+                const char *cand = RSTRING_PTR(p);
+                if (pass == 0) {
+                    if (cand[0] == '<') continue;
+                    if (snt_trace_skip && snt_trace_skip_match(cand)) continue;
+                }
+
+                pathv = p;
+                path = cand;
+                line = lines[i];
+                pathframe = frames[i];
+                break;
+            }
+        }
+    }
+
+    uint64_t key = snt_trace_mix(snt_trace_mix(snt_trace_mix(snt_trace_mix(0,
+                       (uint64_t)(uintptr_t)cfunc),
+                       (uint64_t)(uintptr_t)(nframes > 0 ? frames[0] : Qnil)),
+                       (uint64_t)(uintptr_t)pathframe),
+                       (uint64_t)line);
+
+    rb_native_mutex_lock(&snt_trace_lock);
+    {
+        snt_trace_total++;
+        size_t i = (size_t)(key & (SNT_TRACE_SIZE - 1));
+        size_t probe;
+        for (probe = 0; probe < 64; probe++, i = (i + 1) & (SNT_TRACE_SIZE - 1)) {
+            struct snt_trace_site *site = &snt_trace_table[i];
+            if (site->key != 0 && site->key != key) continue;
+
+            if (site->key == 0) {
+                site->key = key;
+                site->cfunc = cfunc;
+                /* bt[0..1] are snt_trace_record and thread_sched_to_waiting
+                 * themselves; the interesting frames start above them. */
+                for (int b = 0; b < 4; b++) {
+                    site->ret[b] = (b + 2) < nbt ? bt[b + 2] : NULL;
+                }
+                site->line = line;
+                snprintf(site->path,  sizeof(site->path),  "%s", path);
+                snprintf(site->label, sizeof(site->label), "%s", label);
+            }
+            site->count++;
+            if (yield_immediately) site->yield_now++;
+            th->sched.snt_trace_site = site;
+            th->sched.snt_trace_t0 = snt_trace_now_nsec();
+            break;
+        }
+        if (probe == 64) snt_trace_dropped++;
+    }
+    rb_native_mutex_unlock(&snt_trace_lock);
+
+    RB_GC_GUARD(pathv);
+    RB_GC_GUARD(labelv);
+}
+
+static int
+snt_trace_cmp(const void *a, const void *b)
+{
+    unsigned long x = ((const struct snt_trace_site *)a)->count;
+    unsigned long y = ((const struct snt_trace_site *)b)->count;
+    return (y > x) - (y < x);
+}
+
+/* Runs from atexit, where stdio is not usable: macOS has already torn down
+ * `stderr` (it reads back NULL) by the time a handler registered this early
+ * gets called, and fprintf(NULL) faults in flockfile.  So format the whole
+ * report into one buffer and emit it with a single write(2).
+ *
+ * That also settles the multi-process case: Puma's workers are forks and all
+ * inherit fd 2, so with several of them dumping at once one write() per
+ * process is the only thing that keeps a report from being shredded into
+ * another's.  A per-pid file (RUBY_SNT_TRACE_OUT) avoids the question
+ * entirely; the pid tag is still there for when it lands on fd 2. */
+static void
+snt_trace_dump(void)
+{
+    if (!snt_trace_enabled) return;
+
+    int fd = 2;
+    const char *out = getenv("RUBY_SNT_TRACE_OUT");
+    if (out && *out) {
+        char name[1024];
+        snprintf(name, sizeof(name), "%s.%d", out, (int)getpid());
+        int opened = open(name, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        if (opened >= 0) fd = opened;
+    }
+
+    char tag[32] = "";
+    if (fd == 2) snprintf(tag, sizeof(tag), "[snt %d] ", (int)getpid());
+
+    /* rb_ractor_terminate_all() normally joins every Ractor before atexit runs,
+     * but exit!, an exit from a signal handler, or a worker killed mid-request
+     * all get here with threads still live -- and a thread in a blocking region
+     * is still calling snt_trace_record().  Hold the lock while formatting:
+     * otherwise qsort relocates a site while snprintf is writing into it. */
+    rb_native_mutex_lock(&snt_trace_lock);
+    {
+        qsort(snt_trace_table, SNT_TRACE_SIZE, sizeof(struct snt_trace_site), snt_trace_cmp);
+
+        size_t nsites = 0;
+        while (nsites < SNT_TRACE_SIZE && snt_trace_table[nsites].key != 0) nsites++;
+
+        size_t cap = 512 + nsites * 320;
+        char *buf = malloc(cap);
+        if (buf) {
+            size_t len = 0;
+            #define SNT_EMIT(...) do { \
+                if (len < cap) { \
+                    int n_ = snprintf(buf + len, cap - len, __VA_ARGS__); \
+                    if (n_ > 0) len += ((size_t)n_ < cap - len) ? (size_t)n_ : (cap - len); \
+                } \
+            } while (0)
+
+            SNT_EMIT("%s== SNT trace (pid %d) ==\n", tag, (int)getpid());
+            SNT_EMIT("%ssnt->dnt transitions  : %lu (dropped %lu)\n", tag,
+                     snt_trace_total, snt_trace_dropped);
+            SNT_EMIT("%snative threads created: %u  retired: %u\n", tag,
+                     (unsigned)RUBY_ATOMIC_LOAD(snt_trace_nt_created),
+                     (unsigned)RUBY_ATOMIC_LOAD(snt_trace_nt_retired));
+            SNT_EMIT("%swheel parked (kept snt) : %u\n", tag,
+                     (unsigned)RUBY_ATOMIC_LOAD(snt_trace_wheel_parked));
+            SNT_EMIT("%swheel ready-now         : %u\n", tag,
+                     (unsigned)RUBY_ATOMIC_LOAD(snt_trace_wheel_ready));
+            SNT_EMIT("%swheel unavailable       : %u\n", tag,
+                     (unsigned)RUBY_ATOMIC_LOAD(snt_trace_wheel_unavail));
+            SNT_EMIT("%smn declined (not sched) : %u\n", tag,
+                     (unsigned)RUBY_ATOMIC_LOAD(snt_trace_mn_declined));
+            SNT_EMIT("%s%10s %10s %10s %9s  %-30s %s\n", tag,
+                     "count", "yield-now", "held-ms", "us/call", "nogvl-func", "ruby-site");
+
+            for (size_t i = 0; i < nsites; i++) {
+                struct snt_trace_site *site = &snt_trace_table[i];
+
+                const char *sym = "-";
+                Dl_info info;
+                if (site->cfunc && dladdr(site->cfunc, &info) && info.dli_sname) sym = info.dli_sname;
+
+                SNT_EMIT("%s%10lu %10lu %10llu %9llu  %-30s %s:%d in %s\n", tag,
+                         site->count, site->yield_now,
+                         (unsigned long long)(site->nsec / 1000000ULL),
+                         (unsigned long long)(site->count ? site->nsec / site->count / 1000ULL : 0),
+                         sym, site->path, site->line, site->label);
+                if (getenv("RUBY_SNT_TRACE_RET")) {
+                    /* Image-relative so they survive ASLR: look them up with
+                     *   nm -n ruby   (add the mach-o base, 0x100000000) */
+                    SNT_EMIT("%s%21s  ret:", tag, "");
+                    for (int b = 0; b < 4; b++) {
+                        Dl_info ri;
+                        if (site->ret[b] && dladdr(site->ret[b], &ri) && ri.dli_fbase) {
+                            SNT_EMIT(" +%lx", (unsigned long)
+                                     ((char *)site->ret[b] - (char *)ri.dli_fbase));
+                        }
+                        else {
+                            SNT_EMIT(" -");
+                        }
+                    }
+                    SNT_EMIT("\n");
+                }
+            }
+            #undef SNT_EMIT
+
+            ssize_t wrote = 0;
+            while ((size_t)wrote < len) {
+                ssize_t n = write(fd, buf + wrote, len - (size_t)wrote);
+                if (n <= 0) break;
+                wrote += n;
+            }
+            free(buf);
+        }
+
+        /* qsort left the table in count order, not hash order: a recorder
+         * arriving after this would probe wrong and could double-count a site.
+         * Nothing is meant to read it again, so make that explicit.  A recorder
+         * already past its unlocked `enabled` check can still land here, which
+         * is harmless -- the probe stays in bounds and nobody reads the table. */
+        snt_trace_enabled = false;
+    }
+    rb_native_mutex_unlock(&snt_trace_lock);
+
+    if (fd != 2) close(fd);
+}
+#else
+#define snt_trace_init()           ((void)0)
+#define snt_trace_atfork()         ((void)0)
+#define snt_trace_record(th, y)    ((void)0)
+#define SNT_TRACE_NT_CREATED()     ((void)0)
+#define SNT_TRACE_NT_RETIRED()     ((void)0)
+#define snt_trace_settle(th)       ((void)0)
+#define SNT_TRACE_WHEEL_PARKED()   ((void)0)
+#define SNT_TRACE_WHEEL_READY()    ((void)0)
+#define SNT_TRACE_WHEEL_UNAVAIL()  ((void)0)
+#define SNT_TRACE_MN_DECLINED()    ((void)0)
+#define SNT_TRACE_CFUNC_SET(th, f) ((void)(f))  // keep `f` used
+#endif // USE_SNT_TRACE
+
 #include THREAD_IMPL_SRC
 
 #if USE_MN_THREADS
@@ -902,6 +1309,8 @@ thread_sched_to_running_common(struct rb_thread_sched *sched, rb_thread_t *th)
 static void
 thread_sched_to_running(struct rb_thread_sched *sched, rb_thread_t *th)
 {
+    snt_trace_settle(th);
+
     // We are reading and writing these sched fields without lock cover, but
     // there are no correctness issues resulting from stale cache or delayed writeback.
     // When it works, this causes the next-scheduled thread to yield the sched lock
@@ -1000,6 +1409,8 @@ thread_sched_to_waiting_common(struct rb_thread_sched *sched, rb_thread_t *th, b
 static void
 thread_sched_to_waiting(struct rb_thread_sched *sched, rb_thread_t *th, bool yield_immediately)
 {
+    snt_trace_record(th, yield_immediately);
+
     thread_sched_lock(sched, th);
     {
         thread_sched_to_waiting_common(sched, th, yield_immediately);
@@ -1380,6 +1791,7 @@ ractor_sched_deq(rb_vm_t *vm, rb_ractor_t *cr, bool can_retire)
             if (can_retire && SNT_IDLE_RETIRE >= 0 && ++idle_streak > SNT_IDLE_RETIRE &&
                 (int)RUBY_ATOMIC_LOAD(vm->ractor.sched.snt_cnt) > SNT_KEEP_MINIMUM) {
                 RUBY_ATOMIC_DEC(vm->ractor.sched.snt_cnt);
+                SNT_TRACE_NT_RETIRED();
                 RUBY_DEBUG_LOG("retire, snt_cnt:%d", (int)vm->ractor.sched.snt_cnt);
                 break;   // returning NULL ends this nt; see the caller
             }
@@ -1740,6 +2152,8 @@ thread_sched_atfork(struct rb_thread_sched *sched)
         vm->ractor.sched.dnt_cnt = 0;
 #endif
     }
+
+    snt_trace_atfork();
 
     rb_native_mutex_initialize(&vm->ractor.sched.lock);
 #if VM_CHECK_MODE > 0
@@ -2677,6 +3091,7 @@ rb_thread_malloc_stack_set(rb_thread_t *th, void *stack, size_t stack_size)
 static void
 thread_sched_init_vm(rb_vm_t *vm)
 {
+    snt_trace_init();
     rb_native_mutex_initialize(&vm->ractor.sched.lock);
     rb_native_cond_initialize(&vm->ractor.sched.cond);
     rb_native_cond_initialize(&vm->ractor.sched.barrier_complete_cond);

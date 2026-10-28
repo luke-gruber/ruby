@@ -1819,10 +1819,12 @@ rb_nogvl(void *(*func)(void *), void *data1,
     }
 
     rb_vm_t *volatile saved_vm = vm;
+    SNT_TRACE_CFUNC_SET(th, func);
     BLOCKING_REGION(th, {
         val = func(data1);
         saved_errno = rb_errno();
     }, ubf, data2, flags);
+    SNT_TRACE_CFUNC_SET(th, NULL);
     vm = saved_vm;
 
     if (is_main_thread) vm->ubf_async_safe = 0;
@@ -2232,10 +2234,12 @@ rb_thread_io_blocking_call(struct rb_io* io, rb_blocking_function_t *func, void 
         if ((state = EC_EXEC_TAG()) == TAG_NONE) {
             volatile enum ruby_tag_type saved_state = state; /* for BLOCKING_REGION */
           retry:
+            SNT_TRACE_CFUNC_SET(th, func);
             BLOCKING_REGION(th, {
                 val = func(data1);
                 saved_errno = errno;
             }, ubf_select, th, FALSE);
+            SNT_TRACE_CFUNC_SET(th, NULL);
 
             RUBY_ASSERT(th == rb_ec_thread_ptr(ec));
             if (events && blocking_call_retryable_p((int)val, saved_errno)) {
