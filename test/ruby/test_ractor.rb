@@ -550,6 +550,117 @@ class TestRactor < Test::Unit::TestCase
     RUBY
   end
 
+  def test_require_already_loaded_does_not_spawn_thread
+    # rb_ractor_require answers an already-loaded feature in the requiring Ractor,
+    # so the main Ractor must not be woken to rb_thread_create a helper for it.
+    # Sampled from a thread rather than checked once at the end: each helper is
+    # short-lived, so a single post-hoc Thread.list check would likely miss it.
+    assert_ractor(<<~'RUBY')
+      require "tmpdir"
+      baseline = Thread.list.size
+      peak = baseline
+      sampler = Thread.new do
+        loop do
+          n = Thread.list.size
+          peak = n if n > peak
+          Thread.pass
+        end
+      end
+      results = Ractor.new { 2000.times.map { require "tmpdir" }.uniq }.value
+      sampler.kill
+      sampler.join
+      assert_equal [false], results
+      # +1 for the sampler itself; anything more is a require helper thread.
+      assert_equal baseline + 1, peak
+    RUBY
+  end
+
+  def test_require_already_loaded_with_extension
+    assert_ractor(<<~'RUBY')
+      require "tmpdir"
+      results = Ractor.new do
+        [require("tmpdir"), require("tmpdir.rb")]
+      end.value
+      assert_equal [false, false], results
+    RUBY
+  end
+
+  def test_require_not_loaded_still_loads_from_ractor
+    assert_ractor(<<~'RUBY')
+      require "tempfile"
+      f = Tempfile.new(["fast_path_miss", ".rb"])
+      f.write("FAST_PATH_MISS = 42")
+      f.flush
+      result = Ractor.new(f.path) do |path|
+        [require(path), require(path)]
+      end.value
+      assert_equal [true, false], result
+      assert_equal 42, FAST_PATH_MISS
+    RUBY
+  end
+
+  # The next three make one of the fast path's guards decline. require must still
+  # give the right answer, by falling back to the main Ractor as before.
+  def test_require_fast_path_declines_on_relative_load_path
+    # A relative $LOAD_PATH entry sets load_path_check_cache, so
+    # get_expanded_load_path() would re-expand and the probe must bail.
+    assert_ractor(<<~'RUBY')
+      require "tmpdir"
+      $LOAD_PATH.unshift(".")
+      assert_equal false, Ractor.new { require "tmpdir" }.value
+    RUBY
+  end
+
+  def test_require_fast_path_declines_on_mutated_loaded_features
+    # Pushing to $LOADED_FEATURES breaks its sharing with the snapshot, which is
+    # how the probe detects that the features index is stale.
+    assert_ractor(<<~'RUBY')
+      require "tmpdir"
+      $LOADED_FEATURES << "not_a_real_feature_xyz.rb"
+      assert_equal false, Ractor.new { require "tmpdir" }.value
+    RUBY
+  end
+
+  def test_require_fast_path_declines_on_dot_relative_feature
+    # "./foo" is expanded against Dir.pwd by feature_provided(), which the probe
+    # does not do, so it must hand these to the main Ractor.
+    assert_ractor(<<~'RUBY')
+      require "tempfile"
+      f = Tempfile.new(["fast_path_dot_rel", ".rb"])
+      f.write("DOT_REL_LOADED = 1")
+      f.flush
+      dir, base = File.split(f.path)
+      Dir.chdir(dir) do
+        assert_equal true, Ractor.new(base) { |b| require("./#{b}") }.value
+      end
+      assert_equal 1, DOT_REL_LOADED
+    RUBY
+  end
+
+  def test_require_concurrent_while_load_path_churns
+    # Exercises the probe against a main Ractor that is repeatedly invalidating
+    # and rebuilding the expanded load path underneath it.
+    assert_ractor(<<~'RUBY')
+      require "tmpdir"
+      stop = false
+      churn = Thread.new do
+        until stop
+          $LOAD_PATH.unshift("/nonexistent_xyz")
+          $LOAD_PATH.delete("/nonexistent_xyz")
+        end
+      end
+      begin
+        rs = 4.times.map do
+          Ractor.new { 200.times.map { require "tmpdir" }.uniq }
+        end
+        assert_equal [[false]] * 4, rs.map(&:value)
+      ensure
+        stop = true
+        churn.join
+      end
+    RUBY
+  end
+
   def test_require_non_string
     assert_ractor(<<~'RUBY')
       require "tempfile"
@@ -624,6 +735,12 @@ class TestRactor < Test::Unit::TestCase
       f = Tempfile.new(["file_to_require_from_ractor", ".rb"])
       f.write("")
       f.flush
+      # The second Ractor below must require a *different* file: a require of an
+      # already-loaded feature is answered inside the requiring Ractor and never
+      # reaches the main one, so it would not exercise Kernel#require at all.
+      f2 = Tempfile.new(["file_to_require_from_ractor2", ".rb"])
+      f2.write("")
+      f2.flush
       old = $-w; $-w = nil
       class << Ractor
         alias __orig_ractor_require _require
@@ -648,12 +765,44 @@ class TestRactor < Test::Unit::TestCase
         end
       end
       $-w = old
-      result = Ractor.new(f.path) do |path|
+      result = Ractor.new(f2.path) do |path|
         require Pathname.new(path)
         Ractor.current[:required]
       end.value
-      assert_equal [["Ractor", :_require, f.path]], result
-      assert_equal ["nil", :require, f.path], Ractor.current[:required]&.first
+      assert_equal [["Ractor", :_require, f2.path]], result
+      assert_equal ["nil", :require, f2.path], Ractor.current[:required]&.first
+    RUBY
+  end
+
+  # A require of an already-loaded feature is answered inside the requiring
+  # Ractor, so it must not dispatch require again in the main Ractor.
+  def test_require_already_loaded_skips_main_ractor_dispatch
+    assert_separately([], __FILE__, __LINE__, <<-'RUBY')
+      Warning[:experimental] = false
+      refute defined?(Gem), "rubygems must not be loaded"
+
+      require "tempfile"
+      f = Tempfile.new(["file_to_require_from_ractor", ".rb"])
+      f.write("")
+      f.flush
+      old = $-w; $-w = nil
+      module Kernel
+        alias some_original_require require
+        def require(feature)
+          (Ractor.current[:required] ||= []) << feature.to_s
+          some_original_require(feature)
+        end
+      end
+      $-w = old
+
+      # Cold: crosses to the main Ractor, which dispatches the redefined require.
+      assert_equal true, Ractor.new(f.path) { |path| require path }.value
+      assert_equal [f.path], Ractor.current[:required]
+
+      Ractor.current[:required] = nil
+      # Warm: answered locally, so nothing runs in the main Ractor.
+      assert_equal false, Ractor.new(f.path) { |path| require path }.value
+      assert_nil Ractor.current[:required]
     RUBY
   end
 
