@@ -216,7 +216,7 @@ native_set_thread_name(rb_thread_t *th)
 }
 
 inline static void
-native_set_another_thread_name(rb_nativethread_id_t thread_id, VALUE name)
+native_set_another_thread_name(const struct rb_native_thread *nt, VALUE name)
 {
 }
 

@@ -851,10 +851,9 @@ native_thread_alloc(void)
     nt->nt_context = ruby_xmalloc(sizeof(struct coroutine_context));
 #endif
 
-#if USE_RUBY_DEBUG_LOG
+    // 1 is the main nt (Init_native_thread)
     static rb_atomic_t nt_serial = 2;
     nt->serial = RUBY_ATOMIC_FETCH_ADD(nt_serial, 1);
-#endif
     return nt;
 }
 
@@ -1049,6 +1048,23 @@ enum {
 #define NT_NAME_DNT "(DNT)"
 #define NT_NAME_SNT "(SNT)"
 
+#if defined SET_ANOTHER_THREAD_NAME || defined SET_CURRENT_THREAD_NAME
+// "<tag> nt:<serial>[ <name>]", truncation marked with '*' as before.  The nt
+// serial, not the pthread id: the system reuses those as threads come and go,
+// and it is what RUBY_DEBUG_LOG prints.
+static void
+nt_name_format(char *buf, size_t size, const char *tag, rb_atomic_t serial, const char *name)
+{
+    int n = snprintf(buf, size, "%s nt:%u%s%s", tag, (unsigned int)serial,
+                     name ? " " : "", name ? name : "");
+
+    if ((size_t)n >= size) {
+        buf[size-2] = '*';
+        buf[size-1] = '\0';
+    }
+}
+#endif
+
 // Name the running native thread after its kind.  A DNT gets its Ruby thread's
 // name appended to the tag later (native_set_thread_name); an SNT keeps this
 // name whichever M:N thread it happens to be running.
@@ -1056,7 +1072,10 @@ static void
 native_set_nt_name(const struct rb_native_thread *nt)
 {
 #ifdef SET_CURRENT_THREAD_NAME
-    SET_CURRENT_THREAD_NAME(nt->dedicated ? NT_NAME_DNT : NT_NAME_SNT);
+    char buf[THREAD_NAME_MAX];
+
+    nt_name_format(buf, sizeof(buf), nt->dedicated ? NT_NAME_DNT : NT_NAME_SNT, nt->serial, NULL);
+    SET_CURRENT_THREAD_NAME(buf);
 #endif
 }
 
@@ -1074,56 +1093,48 @@ native_set_thread_name(rb_thread_t *th)
     // skipped for the same reason (rb_thread_setname).
     if (!th->has_dedicated_nt) return;
 
-    if (!NIL_P(loc = th->name)) {
-        char buf[THREAD_NAME_MAX];
+    char buf[THREAD_NAME_MAX];
 
-        snprintf(buf, sizeof(buf), NT_NAME_DNT " %s", RSTRING_PTR(loc));
+    if (!NIL_P(loc = th->name)) {
+        nt_name_format(buf, sizeof(buf), NT_NAME_DNT, th->nt->serial, RSTRING_PTR(loc));
         RB_GC_GUARD(loc);
         SET_CURRENT_THREAD_NAME(buf);
     }
     else if ((loc = threadptr_invoke_proc_location(th)) != Qnil) {
         char *name, *p;
-        char buf[THREAD_NAME_MAX];
-        size_t len;
-        int n;
+        char loc_buf[THREAD_NAME_MAX];
 
         name = RSTRING_PTR(RARRAY_AREF(loc, 0));
         p = strrchr(name, '/'); /* show only the basename of the path. */
         if (p && p[1])
             name = p + 1;
 
-        n = snprintf(buf, sizeof(buf), NT_NAME_DNT " %s:%d", name, NUM2INT(RARRAY_AREF(loc, 1)));
+        snprintf(loc_buf, sizeof(loc_buf), "%s:%d", name, NUM2INT(RARRAY_AREF(loc, 1)));
         RB_GC_GUARD(loc);
 
-        len = (size_t)n;
-        if (len >= sizeof(buf)) {
-            buf[sizeof(buf)-2] = '*';
-            buf[sizeof(buf)-1] = '\0';
-        }
+        nt_name_format(buf, sizeof(buf), NT_NAME_DNT, th->nt->serial, loc_buf);
         SET_CURRENT_THREAD_NAME(buf);
     }
 #endif
 }
 
 static void
-native_set_another_thread_name(rb_nativethread_id_t thread_id, VALUE name)
+native_set_another_thread_name(const struct rb_native_thread *nt, VALUE name)
 {
 #if defined SET_ANOTHER_THREAD_NAME || defined SET_CURRENT_THREAD_NAME
     char buf[THREAD_NAME_MAX];
-    const char *s = NT_NAME_DNT; // rb_thread_setname only names a dedicated nt
 # if !defined SET_ANOTHER_THREAD_NAME
-    if (!pthread_equal(pthread_self(), thread_id)) return;
+    if (!pthread_equal(pthread_self(), nt->thread_id)) return;
 # endif
-    if (!NIL_P(name)) {
-        // NUL-terminated by the StringValueCStr in rb_thread_setname
-        snprintf(buf, sizeof(buf), NT_NAME_DNT " %s", RSTRING_PTR(name));
-        RB_GC_GUARD(name);
-        s = buf;
-    }
+    // rb_thread_setname only names a dedicated nt.  The name is NUL-terminated
+    // by its StringValueCStr.
+    nt_name_format(buf, sizeof(buf), NT_NAME_DNT, nt->serial,
+                   NIL_P(name) ? NULL : RSTRING_PTR(name));
+    RB_GC_GUARD(name);
 # if defined SET_ANOTHER_THREAD_NAME
-    SET_ANOTHER_THREAD_NAME(thread_id, s);
+    SET_ANOTHER_THREAD_NAME(nt->thread_id, buf);
 # elif defined SET_CURRENT_THREAD_NAME
-    SET_CURRENT_THREAD_NAME(s);
+    SET_CURRENT_THREAD_NAME(buf);
 # endif
 #endif
 }

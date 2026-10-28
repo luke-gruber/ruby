@@ -707,7 +707,12 @@ native_fd_select(int n, rb_fdset_t *readfds, rb_fdset_t *writefds, rb_fdset_t *e
 
 int rb_w32_set_thread_description(HANDLE th, const WCHAR *name);
 int rb_w32_set_thread_description_str(HANDLE th, VALUE name);
-#define native_set_another_thread_name rb_w32_set_thread_description_str
+
+static void
+native_set_another_thread_name(const struct rb_native_thread *nt, VALUE name)
+{
+    rb_w32_set_thread_description_str(nt->thread_id, name);
+}
 
 static void
 native_set_thread_name(rb_thread_t *th)
