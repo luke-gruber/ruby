@@ -4925,10 +4925,12 @@ wait_for_single_fd_blocking_region(rb_thread_t *th, struct pollfd *fds, nfds_t n
 }
 
 /*
- * returns a mask of events
+ * Blocking fallback for thread_io_wait(): used when the M:N wheel declined the
+ * wait.  Returns a mask of RB_WAITFD_* events, or -1 with errno set.
+ * The caller owns the rb_io_blocking_operation registration and the tag.
  */
 static int
-thread_io_wait(rb_thread_t *th, struct rb_io *io, int fd, int events, struct timeval *timeout)
+thread_io_wait_fallback(rb_thread_t *th, int fd, int events, struct timeval *timeout)
 {
     struct pollfd fds[1] = {{
         .fd = fd,
@@ -4937,82 +4939,20 @@ thread_io_wait(rb_thread_t *th, struct rb_io *io, int fd, int events, struct tim
     }};
     volatile int result = 0;
     nfds_t nfds;
-    struct rb_io_blocking_operation blocking_operation;
-    enum ruby_tag_type state = TAG_NONE;
     volatile int lerrno;
-
-    RUBY_ASSERT(th);
     rb_execution_context_t *ec = th->ec;
 
-    if (io) {
-        blocking_operation.ec = ec;
-        blocking_operation.scheduler_interrupt_target = Qnil;
-COMPILER_WARNING_PUSH
-#if RBIMPL_COMPILER_SINCE(GCC, 12, 0, 0)
-COMPILER_WARNING_IGNORED(-Wdangling-pointer)
-#endif
-        // rb_io_blocking_operation_exit() below unlinks it on every path.
-        rb_io_blocking_operation_enter(io, &blocking_operation);
-COMPILER_WARNING_POP
-    }
+    rb_hrtime_t *to, rel, end = 0;
+    RUBY_VM_CHECK_INTS_BLOCKING(ec);
+    timeout_prepare(&to, &rel, &end, timeout);
+    do {
+        nfds = numberof(fds);
+        result = wait_for_single_fd_blocking_region(th, fds, nfds, to, &lerrno);
 
-    // A zero timeout is a plain probe; ppoll answers it without parking.
-    bool mn_wait = timeout == NULL || timeout->tv_sec != 0 || timeout->tv_usec != 0;
+        RUBY_VM_CHECK_INTS_BLOCKING(ec);
+    } while (wait_retryable(&result, lerrno, to, end));
 
-    enum io_wait_result mn_result = io_wait_unhandled;
-    struct timeval tv_rest;
-    if (mn_wait) {
-        rb_hrtime_t started = timeout ? rb_hrtime_now() : 0;
-        mn_result = thread_io_wait_events(th, fd, events, timeout, false);
-
-        // The M:N wait may hand an interrupted wait back to the blocking path
-        // below.  Charge what it already waited against the timeout, so the
-        // deadline is the one the caller asked for.
-        if (mn_result == io_wait_unhandled && timeout) {
-            rb_hrtime_t total = rb_timeval2hrtime(timeout);
-            rb_hrtime_t spent = rb_hrtime_sub(rb_hrtime_now(), started);
-            rb_hrtime_t rest = spent < total ? total - spent : 0;
-            rb_hrtime2timeval(&tv_rest, &rest);
-            timeout = &tv_rest;
-        }
-    }
-
-    switch (mn_result) {
-      case io_wait_ready:
-        fds[0].revents = events;
-        errno = 0;
-        break;
-      case io_wait_timed_out:
-        // revents stays 0, so the result below becomes 0 as with ppoll's timeout.
-        errno = 0;
-        break;
-      case io_wait_unhandled:
-        EC_PUSH_TAG(ec);
-        struct timeval *volatile blocking_timeout = timeout;
-        if ((state = EC_EXEC_TAG()) == TAG_NONE) {
-            rb_hrtime_t *to, rel, end = 0;
-            RUBY_VM_CHECK_INTS_BLOCKING(ec);
-            timeout_prepare(&to, &rel, &end, blocking_timeout);
-            do {
-                nfds = numberof(fds);
-                result = wait_for_single_fd_blocking_region(th, fds, nfds, to, &lerrno);
-
-                RUBY_VM_CHECK_INTS_BLOCKING(ec);
-            } while (wait_retryable(&result, lerrno, to, end));
-
-            RUBY_VM_CHECK_INTS_BLOCKING(ec);
-        }
-
-        EC_POP_TAG();
-    }
-
-    if (io) {
-        rb_io_blocking_operation_exit(io, &blocking_operation);
-    }
-
-    if (state) {
-        EC_JUMP_TAG(ec, state);
-    }
+    RUBY_VM_CHECK_INTS_BLOCKING(ec);
 
     if (result < 0) {
         errno = lerrno;
@@ -5044,9 +4984,6 @@ COMPILER_WARNING_POP
 }
 #else /* ! USE_POLL - implement rb_io_poll_fd() using select() */
 struct select_args {
-    struct rb_io *io;
-    struct rb_io_blocking_operation *blocking_operation;
-
     union {
         int fd;
         int error;
@@ -5084,10 +5021,6 @@ select_single_cleanup(VALUE ptr)
 {
     struct select_args *args = (struct select_args *)ptr;
 
-    if (args->blocking_operation) {
-        rb_io_blocking_operation_exit(args->io, args->blocking_operation);
-    }
-
     if (args->read) rb_fd_term(args->read);
     if (args->write) rb_fd_term(args->write);
     if (args->except) rb_fd_term(args->except);
@@ -5107,27 +5040,17 @@ init_set_fd(int fd, rb_fdset_t *fds)
     return fds;
 }
 
+/*
+ * Blocking fallback for thread_io_wait(): used when the M:N wheel declined the
+ * wait.  Returns a mask of RB_WAITFD_* events, or -1 with errno set.
+ * The caller owns the rb_io_blocking_operation registration and the tag.
+ */
 static int
-thread_io_wait(rb_thread_t *th, struct rb_io *io, int fd, int events, struct timeval *timeout)
+thread_io_wait_fallback(rb_thread_t *th, int fd, int events, struct timeval *timeout)
 {
     rb_fdset_t rfds, wfds, efds;
     struct select_args args;
     VALUE ptr = (VALUE)&args;
-
-    struct rb_io_blocking_operation blocking_operation;
-    if (io) {
-        args.io = io;
-        blocking_operation.ec = th->ec;
-        blocking_operation.scheduler_interrupt_target = Qnil;
-        rb_io_blocking_operation_enter(io, &blocking_operation);
-        args.blocking_operation = &blocking_operation;
-    }
-    else {
-        args.io = NULL;
-        blocking_operation.ec = NULL;
-        blocking_operation.scheduler_interrupt_target = Qnil;
-        args.blocking_operation = NULL;
-    }
 
     args.as.fd = fd;
     args.read = (events & RB_WAITFD_IN) ? init_set_fd(fd, &rfds) : NULL;
@@ -5142,6 +5065,96 @@ thread_io_wait(rb_thread_t *th, struct rb_io *io, int fd, int events, struct tim
     return result;
 }
 #endif /* ! USE_POLL */
+
+/*
+ * Wait for `events` on a single fd, returning a mask of RB_WAITFD_* events.
+ *
+ * Tries the M:N timer wheel first, which parks without surrendering the native
+ * thread, and falls back to the platform's blocking wait when the wheel cannot
+ * take it (dedicated nt, RB_WAITFD_PRI, or an fd the backend refuses -- on
+ * Darwin kqueue rejects devices with EINVAL, which lands here).
+ *
+ * This is deliberately NOT inside the USE_POLL conditional.  USE_POLL selects
+ * the blocking fallback (ppoll vs select); the wheel backend is chosen
+ * independently by USE_MN_THREADS (kqueue or epoll).  Keeping the wheel attempt
+ * here is what lets non-USE_POLL platforms reach it at all.
+ */
+static int
+thread_io_wait(rb_thread_t *th, struct rb_io *io, int fd, int events, struct timeval *timeout)
+{
+    volatile int result = 0;
+    struct rb_io_blocking_operation blocking_operation;
+    enum ruby_tag_type state = TAG_NONE;
+
+    RUBY_ASSERT(th);
+    rb_execution_context_t *ec = th->ec;
+
+    if (io) {
+        blocking_operation.ec = ec;
+        blocking_operation.scheduler_interrupt_target = Qnil;
+COMPILER_WARNING_PUSH
+#if RBIMPL_COMPILER_SINCE(GCC, 12, 0, 0)
+COMPILER_WARNING_IGNORED(-Wdangling-pointer)
+#endif
+        // rb_io_blocking_operation_exit() below unlinks it on every path.
+        // This must bracket the wheel park too, not just the fallback: it is how
+        // rb_io_close() finds a waiter in order to interrupt it.
+        rb_io_blocking_operation_enter(io, &blocking_operation);
+COMPILER_WARNING_POP
+    }
+
+    // A zero timeout is a plain probe; the fallback answers it without parking.
+    bool mn_wait = timeout == NULL || timeout->tv_sec != 0 || timeout->tv_usec != 0;
+
+    enum io_wait_result mn_result = io_wait_unhandled;
+    struct timeval tv_rest;
+    if (mn_wait) {
+        rb_hrtime_t started = timeout ? rb_hrtime_now() : 0;
+        mn_result = thread_io_wait_events(th, fd, events, timeout, false);
+
+        // The M:N wait may hand an interrupted wait back to the blocking path
+        // below.  Charge what it already waited against the timeout, so the
+        // deadline is the one the caller asked for.
+        if (mn_result == io_wait_unhandled && timeout) {
+            rb_hrtime_t total = rb_timeval2hrtime(timeout);
+            rb_hrtime_t spent = rb_hrtime_sub(rb_hrtime_now(), started);
+            rb_hrtime_t rest = spent < total ? total - spent : 0;
+            rb_hrtime2timeval(&tv_rest, &rest);
+            timeout = &tv_rest;
+        }
+    }
+
+    switch (mn_result) {
+      case io_wait_ready:
+        // The wheel only ever reports the events it was asked to register.
+        result = events;
+        errno = 0;
+        break;
+      case io_wait_timed_out:
+        result = 0;
+        errno = 0;
+        break;
+      case io_wait_unhandled: {
+        struct timeval *volatile blocking_timeout = timeout;
+        EC_PUSH_TAG(ec);
+        if ((state = EC_EXEC_TAG()) == TAG_NONE) {
+            result = thread_io_wait_fallback(th, fd, events, blocking_timeout);
+        }
+        EC_POP_TAG();
+        break;
+      }
+    }
+
+    if (io) {
+        rb_io_blocking_operation_exit(io, &blocking_operation);
+    }
+
+    if (state) {
+        EC_JUMP_TAG(ec, state);
+    }
+
+    return result;
+}
 
 int
 rb_thread_wait_for_single_fd(rb_thread_t *th, int fd, int events, struct timeval *timeout)
