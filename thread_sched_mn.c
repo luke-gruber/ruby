@@ -978,6 +978,11 @@ native_thread_check_and_create_shared(rb_vm_t *vm)
     ractor_sched_unlock(vm, NULL);
 
     if (need_to_make) {
+        // A retired nt parked in the spare pool fills the slot just counted
+        // above without a native thread creation; only an empty pool pays for
+        // one (see "Spare shared native threads" in thread_sched.c).
+        if (nt_spare_take(vm)) return 0;
+
         struct rb_native_thread *nt = native_thread_alloc();
         SNT_TRACE_NT_CREATED();
         nt->vm = vm;

@@ -113,6 +113,8 @@ static void nt_snts_join(rb_vm_t *vm, struct rb_native_thread *nt);
 static void nt_snts_leave(rb_vm_t *vm, struct rb_native_thread *nt);
 static bool nt_shared_loop(struct rb_native_thread *nt);
 static bool native_thread_self_can_retire_p(void);
+static bool nt_spare_take(rb_vm_t *vm);
+static bool nt_spare_park(rb_vm_t *vm, struct rb_native_thread *nt);
 
 /* ------------------------------------------------------------------------
  * SNT trace -- why does a shared native thread become dedicated?
@@ -132,7 +134,7 @@ static bool native_thread_self_can_retire_p(void);
  * ------------------------------------------------------------------------ */
 
 #ifndef USE_SNT_TRACE
-#define USE_SNT_TRACE 0
+#define USE_SNT_TRACE 1
 #endif
 
 #if USE_SNT_TRACE
@@ -160,12 +162,18 @@ static rb_nativethread_lock_t snt_trace_lock;
 static bool snt_trace_enabled;
 static unsigned long snt_trace_total, snt_trace_dropped;
 static rb_atomic_t snt_trace_nt_created, snt_trace_nt_retired;
+/* What the spare pool absorbed.  "created" above stays the count of native
+ * threads actually started, so a large "reused" next to a small "created" is
+ * the pool doing its job; "reused" near zero means the churn is elsewhere. */
+static rb_atomic_t snt_trace_nt_parked, snt_trace_nt_reused;
 /* Wheel outcomes: a wait that parks on the timer thread keeps its SNT, so it
  * is NOT an snt->dnt transition.  Counted separately to keep the two apart. */
 static rb_atomic_t snt_trace_wheel_parked, snt_trace_wheel_ready, snt_trace_wheel_unavail, snt_trace_mn_declined;
 
 #define SNT_TRACE_NT_CREATED()     RUBY_ATOMIC_INC(snt_trace_nt_created)
 #define SNT_TRACE_NT_RETIRED()     RUBY_ATOMIC_INC(snt_trace_nt_retired)
+#define SNT_TRACE_NT_PARKED()      RUBY_ATOMIC_INC(snt_trace_nt_parked)
+#define SNT_TRACE_NT_REUSED()      RUBY_ATOMIC_INC(snt_trace_nt_reused)
 #define SNT_TRACE_WHEEL_PARKED()   RUBY_ATOMIC_INC(snt_trace_wheel_parked)
 #define SNT_TRACE_WHEEL_READY()    RUBY_ATOMIC_INC(snt_trace_wheel_ready)
 #define SNT_TRACE_WHEEL_UNAVAIL()  RUBY_ATOMIC_INC(snt_trace_wheel_unavail)
@@ -230,6 +238,7 @@ snt_trace_atfork(void)
     memset(snt_trace_table, 0, sizeof(snt_trace_table));
     snt_trace_total = snt_trace_dropped = 0;
     snt_trace_nt_created = snt_trace_nt_retired = 0;
+    snt_trace_nt_parked = snt_trace_nt_reused = 0;
     snt_trace_wheel_parked = snt_trace_wheel_ready = 0;
     snt_trace_wheel_unavail = snt_trace_mn_declined = 0;
 }
@@ -445,6 +454,9 @@ snt_trace_dump(void)
             SNT_EMIT("%snative threads created: %u  retired: %u\n", tag,
                      (unsigned)RUBY_ATOMIC_LOAD(snt_trace_nt_created),
                      (unsigned)RUBY_ATOMIC_LOAD(snt_trace_nt_retired));
+            SNT_EMIT("%sspare parked: %u  reused: %u\n", tag,
+                     (unsigned)RUBY_ATOMIC_LOAD(snt_trace_nt_parked),
+                     (unsigned)RUBY_ATOMIC_LOAD(snt_trace_nt_reused));
             SNT_EMIT("%swheel parked (kept snt) : %u\n", tag,
                      (unsigned)RUBY_ATOMIC_LOAD(snt_trace_wheel_parked));
             SNT_EMIT("%swheel ready-now         : %u\n", tag,
@@ -513,6 +525,8 @@ snt_trace_dump(void)
 #define snt_trace_record(th, y)    ((void)0)
 #define SNT_TRACE_NT_CREATED()     ((void)0)
 #define SNT_TRACE_NT_RETIRED()     ((void)0)
+#define SNT_TRACE_NT_PARKED()      ((void)0)
+#define SNT_TRACE_NT_REUSED()      ((void)0)
 #define snt_trace_settle(th)       ((void)0)
 #define SNT_TRACE_WHEEL_PARKED()   ((void)0)
 #define SNT_TRACE_WHEEL_READY()    ((void)0)
@@ -2181,6 +2195,11 @@ thread_sched_atfork(struct rb_thread_sched *sched)
     rb_native_mutex_initialize(&vm->ractor.sched.ntlist.lock);
     ccan_list_head_init(&vm->ractor.sched.ntlist.running_dnts);
     ccan_list_head_init(&vm->ractor.sched.ntlist.snts); // those nts are gone
+    // Parked nts are gone with the rest; the child starts with an empty pool.
+    rb_native_mutex_initialize(&vm->ractor.sched.spare.lock);
+    rb_native_cond_initialize(&vm->ractor.sched.spare.cond);
+    vm->ractor.sched.spare.cnt = 0;
+    vm->ractor.sched.spare.handoff = 0;
     rb_native_mutex_initialize(&vm->ractor.sched.timeslice.lock);
     ccan_list_head_init(&vm->ractor.sched.timeslice.scheds);
     rb_native_mutex_initialize(&th->nt->running_th_lock); // a scan could hold it at fork
@@ -2433,16 +2452,34 @@ nt_start(void *ptr)
         // TODO: allow to change to the SNT
     }
     else {
+        // The nt's own context is the stack this function runs on, and parking
+        // and coming back does not change it: initialize it once, outside the
+        // loop below.
         coroutine_initialize_main(nt->nt_context);
-        nt_snts_join(vm, nt);
 
-        bool retired = nt_shared_loop(nt);
-        nt_snts_leave(vm, nt);
+        // A retired nt offers itself to the spare pool rather than ending, and
+        // comes back around here when a taker hands it back out; it only ends
+        // once the pool has no room for it (see "Spare shared native threads").
+        while (1) {
+            nt_snts_join(vm, nt);
 
-        if (retired) {
-            // The counts dropped this nt already; nothing can reference it now.
-            RUBY_DEBUG_LOG("retired nt:%u", nt->serial);
-            native_thread_destroy_self(nt);
+            bool retired = nt_shared_loop(nt);
+            nt_snts_leave(vm, nt);
+
+            if (!retired) break; // went dedicated while running; this nt is th's now
+
+            if (!nt_spare_park(vm, nt)) {
+                // The counts dropped this nt already; nothing can reference it now.
+                RUBY_DEBUG_LOG("retired nt:%u", nt->serial);
+                native_thread_destroy_self(nt);
+                break;
+            }
+
+            // Handed back out: nt_spare_take counted this nt in snt_cnt for us,
+            // exactly as native_thread_check_and_create_shared would have done
+            // for a freshly created one.  The pool it had no room in is the one
+            // it is rejoining, so the flag that sent it here goes too.
+            nt->retiring = false;
         }
     }
 
@@ -2472,6 +2509,105 @@ nt_snts_leave(rb_vm_t *vm, struct rb_native_thread *nt)
         ccan_list_del_init(&nt->snts_node);
     }
     rb_native_mutex_unlock(&vm->ractor.sched.ntlist.lock);
+}
+
+/* ------------------------------------------------------------------------
+ * Spare shared native threads.
+ *
+ * Giving a shared nt back for a blocking region and taking one again is the
+ * common case -- every rb_nogvl() / blocking io does it -- and each round used
+ * to cost a native thread creation plus an exit: the replacement the timer
+ * thread mints (native_thread_check_and_create_shared) is a brand new pthread,
+ * and the nt coming back to a full pool retires instead of rejoining.  For a
+ * workload whose blocking calls are short that is one create per call, with
+ * nothing to show for it but a parade of serials in a profiler.
+ *
+ * So an nt on its way out parks here first and waits to be handed back out,
+ * and a taker prefers a parked nt over a new one.  The pool fills lazily --
+ * nothing is ever created for it, only kept -- and an nt that finds it full
+ * still ends, which bounds it at SNT_SPARE_MAX idle native threads.
+ *
+ * Parked nts are off ntlist.snts (nt_snts_leave precedes the park) and out of
+ * snt_cnt, so to the barrier, the timeslice scans and the pool sizing they do
+ * not exist; only the count here knows about them.
+ *
+ * The handoff is by count, not by identity: a taker promises one of the parked
+ * nts a slot (handoff) and signals, and whichever parked nt wakes claims the
+ * promise.  That keeps one condvar for the pool without the wake-them-all a
+ * named handoff would need.
+ * ------------------------------------------------------------------------ */
+
+/* How many retired shared nts to keep parked for reuse. */
+#ifndef SNT_SPARE_MAX
+#define SNT_SPARE_MAX 5
+#endif
+
+// Claim a parked nt for the shared pool slot the caller has already counted in
+// snt_cnt, in place of creating a native thread.  Returns false when no parked
+// nt is free, and the caller must create one after all.
+static bool
+nt_spare_take(rb_vm_t *vm)
+{
+    bool took = false;
+
+    rb_native_mutex_lock(&vm->ractor.sched.spare.lock);
+    {
+        // Parked nts beyond the promises outstanding: one is free to take.
+        if (vm->ractor.sched.spare.cnt > vm->ractor.sched.spare.handoff) {
+            vm->ractor.sched.spare.handoff++;
+            // Every parked nt waits on this cond under this lock, so the
+            // signal cannot be lost; which one of them takes the promise
+            // does not matter.
+            rb_native_cond_signal(&vm->ractor.sched.spare.cond);
+            took = true;
+
+            RUBY_DEBUG_LOG("take spare:%u handoff:%u",
+                           vm->ractor.sched.spare.cnt, vm->ractor.sched.spare.handoff);
+        }
+    }
+    rb_native_mutex_unlock(&vm->ractor.sched.spare.lock);
+
+    if (took) SNT_TRACE_NT_REUSED();
+
+    return took;
+}
+
+// A shared nt that is done offers itself to the pool.  Returns true once it has
+// been handed back out -- its caller re-enters the scheduling loop -- and false
+// if the pool had no room, in which case the nt really does end.
+//
+// Parking is untimed: the pool is meant to be the steady state of a process
+// that blocks, not a cache that decays.  The waiting nt holds nothing but its
+// own stack, and only the process ending takes it away.
+static bool
+nt_spare_park(rb_vm_t *vm, struct rb_native_thread *nt)
+{
+    bool reused = false;
+
+    VM_ASSERT(nt->dedicated == 0);
+    VM_ASSERT(nt->dead_co == NULL); // reclaimed by the loop before it returned
+
+    rb_native_mutex_lock(&vm->ractor.sched.spare.lock);
+    {
+        if (vm->ractor.sched.spare.cnt < SNT_SPARE_MAX) {
+            vm->ractor.sched.spare.cnt++;
+            SNT_TRACE_NT_PARKED();
+
+            RUBY_DEBUG_LOG("park nt:%u spare:%u", nt->serial, vm->ractor.sched.spare.cnt);
+
+            while (vm->ractor.sched.spare.handoff == 0) {
+                rb_native_cond_wait(&vm->ractor.sched.spare.cond, &vm->ractor.sched.spare.lock);
+            }
+            vm->ractor.sched.spare.handoff--;
+            vm->ractor.sched.spare.cnt--;
+            reused = true;
+
+            RUBY_DEBUG_LOG("unpark nt:%u spare:%u", nt->serial, vm->ractor.sched.spare.cnt);
+        }
+    }
+    rb_native_mutex_unlock(&vm->ractor.sched.spare.lock);
+
+    return reused;
 }
 
 // The shared nt's scheduling loop: serve Ractors from the grq until this nt
@@ -3101,6 +3237,8 @@ thread_sched_init_vm(rb_vm_t *vm)
     rb_native_mutex_initialize(&vm->ractor.sched.ntlist.lock);
     ccan_list_head_init(&vm->ractor.sched.ntlist.running_dnts);
     ccan_list_head_init(&vm->ractor.sched.ntlist.snts);
+    rb_native_mutex_initialize(&vm->ractor.sched.spare.lock);
+    rb_native_cond_initialize(&vm->ractor.sched.spare.cond);
     rb_native_mutex_initialize(&vm->ractor.sched.timeslice.lock);
     ccan_list_head_init(&vm->ractor.sched.timeslice.scheds);
 

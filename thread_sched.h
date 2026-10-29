@@ -254,6 +254,16 @@ struct rb_ractor_sched {
         struct ccan_list_head snts;
     } ntlist;
 
+    // Shared nts on their way out, kept parked for reuse instead of ending
+    // their native thread; see "Spare shared native threads" in thread_sched.c.
+    // Parked nts are on none of the lists above and in neither count.
+    struct {
+        rb_nativethread_lock_t lock;
+        rb_nativethread_cond_t cond;
+        unsigned int cnt;     // nts parked here, promised ones included
+        unsigned int handoff; // of those, how many are promised to a taker
+    } spare;
+
     // scheds whose readyq holds waiters: the timer ticks their
     // running thread (timeslice_scan) and prunes drained entries.
     struct {
