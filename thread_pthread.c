@@ -1041,6 +1041,13 @@ enum {
 #endif
 };
 
+// Native thread kind tags, prefixed to the native thread name: a profiler
+// (samply &c.) shows that name, so these tell a dedicated native thread from
+// a shared one at a glance.  The tag comes first so it survives truncation to
+// the platform's name limit.
+#define NT_NAME_DNT "(DNT)"
+#define NT_NAME_SNT "(SNT)"
+
 #if defined SET_ANOTHER_THREAD_NAME || defined SET_CURRENT_THREAD_NAME
 // "<tag> nt:<serial>[ <name>]", truncation marked with '*' as before.  The nt
 // serial, not the pthread id: the system reuses those as threads come and go,

@@ -132,13 +132,6 @@ struct rb_thread_sched_item {
     uint64_t snt_trace_t0;
 };
 
-// Native thread kind tags, prefixed to the native thread name: a profiler
-// (samply &c.) shows that name, so these tell a dedicated native thread from
-// a shared one at a glance.  The tag comes first so it survives truncation to
-// the platform's name limit.
-#define NT_NAME_DNT "(DNT)"
-#define NT_NAME_SNT "(SNT)"
-
 struct rb_native_thread {
     rb_atomic_t serial;
     struct rb_vm_struct *vm;

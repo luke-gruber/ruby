@@ -985,7 +985,6 @@ native_thread_check_and_create_shared(rb_vm_t *vm)
 
         struct rb_native_thread *nt = native_thread_alloc();
         SNT_TRACE_NT_CREATED();
-        SNT_TRACE_CREATE_SITE(vm);
         nt->vm = vm;
         int err = native_thread_create0(nt);
         if (err) {
@@ -1774,8 +1773,6 @@ timer_thread_polling(rb_vm_t *vm)
             }
         }
         ractor_sched_unlock(vm, NULL);
-
-        SNT_TRACE_TICK(vm);
 
         // (1-2)
         native_thread_check_and_create_shared(vm);
