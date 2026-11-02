@@ -3603,6 +3603,12 @@ rb_ractor_courier_mark(struct rb_ractor_courier *c)
 {
     if (!c) return;
     if (c->seen) rb_mark_set(c->seen);
+    /* Everything below is shareable or an immediate, which a local GC can neither free
+     * nor move once there is more than one objspace: pinned_roots_mark roots it from
+     * the page's shareable bits, and compaction is global-GC only (gc_marks_start
+     * clears during_compacting unless rb_gc_single_objspace_p).  So the marks below
+     * only do work for a global GC or a single objspace. */
+    if (!(rb_gc_single_objspace_p() || rb_gc_during_global_gc_p())) return;
     for (uint32_t i = 0; i < c->refs_count; i++) {
         rb_gc_mark(c->refs[i]);
     }
