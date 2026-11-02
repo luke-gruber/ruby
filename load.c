@@ -735,10 +735,12 @@ rb_feature_provided(const char *feature, const char **loading)
     return feature_provided(box, feature, loading);
 }
 
-/* Read-only counterpart to feature_provided() for the non-main Ractor `require`
- * fast path.  Returns 1 if the feature is already loaded, 0 if it is not, and -1
+/* Read-only counterpart to rb_feature_p() for the non-main Ractor `require`
+ * fast path.  Returns the type of the already-provided feature ('r', 's' or 'u')
+ * exactly as rb_feature_p() does, 0 if the index says it is not provided, and -1
  * if the fast path cannot answer, in which case the caller must hand the require
- * to the main Ractor as usual.
+ * to the main Ractor as usual.  Deciding what a given type means for `require`
+ * is left to rb_feature_provided_ractor_safe().
  *
  * Only state the main Ractor publishes under the VM lock may be read here.  Note
  * it walks loaded_features_snapshot, not loaded_features: the latter is
@@ -805,16 +807,31 @@ feature_p_ractor_safe(const rb_box_t *box, VALUE features, VALUE load_path,
         }
         if (!*(e = f + len)) {
             if (ext) continue;
-            return 1;
+            return 'u';
         }
         if (*e != '.') continue;
-        if ((!rb || !ext) && (IS_SOEXT(e) || IS_DLEXT(e))) return 1;
-        if ((rb || !ext) && (IS_RBEXT(e))) return 1;
+        if ((!rb || !ext) && (IS_SOEXT(e) || IS_DLEXT(e))) return 's';
+        if ((rb || !ext) && (IS_RBEXT(e))) return 'r';
     }
 
     return 0;
 }
 
+/* Returns 1 only when `require fname` is certain to be a no-op because the
+ * feature is already loaded, 0 when the index says it is not, and -1 when the
+ * fast path cannot answer.  The bar is search_required(): it is `require`'s own
+ * already-provided test, and it is stricter than feature_provided().
+ *
+ *   - Explicit .rb/.so/.o/DLEXT: search_required() short-circuits on any
+ *     non-zero rb_feature_p() result, so any match is conclusive.
+ *   - Unrecognized extension (".json"): search_required() makes no
+ *     already-provided probe at all before searching the filesystem, so nothing
+ *     here is conclusive.
+ *   - No extension (or a dot inside a directory component): search_required()
+ *     short-circuits only on 'r'.  After a 'u' or 's' match it keeps going, and
+ *     `case loadable_ext_rb` can still resolve a .rb on the load path and load
+ *     it -- so those must go to the main Ractor.
+ */
 int
 rb_feature_provided_ractor_safe(VALUE fname)
 {
@@ -822,33 +839,42 @@ rb_feature_provided_ractor_safe(VALUE fname)
     const char *feature = RSTRING_PTR(fname);
     rb_len_t flen = RSTRING_LEN(fname);
     const char *ext;
-    int result = -1;
+    int found = -1;
 
     if (flen == 0 || strlen(feature) != (size_t)flen) return -1;
     if (feature[0] == '.' &&
         (feature[1] == '/' || strncmp(feature + 1, "./", 2) == 0)) {
-        /* feature_provided() expands these against Dir.pwd. */
+        /* search_required() resolves these against Dir.pwd. */
         return -1;
     }
 
+    /* strrchr()/strchr() stand in for search_required()'s find_ext()/memchr(),
+     * which agree with them now that `feature` is known to be NUL-free. */
     ext = strrchr(feature, '.');
-    if (ext && (strchr(ext, '/') ||
-                (!IS_RBEXT(ext) && !IS_SOEXT(ext) && !IS_DLEXT(ext)))) {
+    if (ext && strchr(ext, '/')) {
+        /* The dot is in a directory component: no extension. */
         ext = NULL;
+    }
+    else if (ext && !IS_RBEXT(ext) && !IS_SOEXT(ext) && !IS_DLEXT(ext)) {
+        return -1;
     }
 
     RB_VM_LOCKING() {
         if (box->load_unstable_depth == 0 &&
             RTEST(rb_ary_shared_with_p(box->loaded_features_snapshot, box->loaded_features)) &&
             expanded_load_path_current_p(box)) {
-            result = feature_p_ractor_safe(box, box->loaded_features_snapshot,
+            found = feature_p_ractor_safe(box, box->loaded_features_snapshot,
                                           box->expanded_load_path, feature, ext,
-                                          ext ? IS_RBEXT(ext) : TRUE);
+                                          ext ? IS_RBEXT(ext) : FALSE);
         }
     }
 
     RB_GC_GUARD(fname);
-    return result;
+
+    if (found < 0) return -1;
+    if (ext) return found ? 1 : 0;
+    if (found == 'r') return 1;
+    return found ? -1 : 0;
 }
 
 static void

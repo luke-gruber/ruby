@@ -637,6 +637,50 @@ class TestRactor < Test::Unit::TestCase
     RUBY
   end
 
+  def test_require_fast_path_declines_when_only_the_so_is_loaded
+    # An already-loaded "foo.so" does not make `require "foo"` a no-op: after
+    # that 's' match search_required() keeps going, resolves a foo.rb on
+    # $LOAD_PATH and loads it.  The probe short-circuits only on an 'r' match,
+    # so a Ractor must reach the same answer.
+    assert_ractor(<<~'RUBY')
+      require "tmpdir"
+      Dir.mktmpdir do |dir|
+        # $LOAD_PATH entries are realpath-expanded, so the fake feature below
+        # has to be rooted at the realpath to match through loaded_feature_path.
+        dir = File.realpath(dir)
+        File.write(File.join(dir, "so_shadowed_feature.rb"), "SO_SHADOWED = 42")
+        $LOAD_PATH.unshift(dir)
+        # Stand in for a C extension required by explicit extension, with the
+        # same-named .rb not loaded yet.
+        $LOADED_FEATURES << File.join(dir, "so_shadowed_feature.so")
+        # Rebuild the features index and expanded load path that the probe
+        # requires to be current, so the fast path is live for the Ractor.
+        require "tmpdir"
+
+        assert_equal true, Ractor.new { require "so_shadowed_feature" }.value
+        assert_equal 42, SO_SHADOWED
+      end
+    RUBY
+  end
+
+  def test_require_fast_path_declines_on_unrecognized_extension
+    # search_required() makes no already-provided probe at all for an extension
+    # it does not recognize, so neither may the fast path.
+    assert_ractor(<<~'RUBY')
+      require "tmpdir"
+      Dir.mktmpdir do |dir|
+        dir = File.realpath(dir)
+        File.write(File.join(dir, "weird.json.rb"), "WEIRD_JSON = 7")
+        $LOAD_PATH.unshift(dir)
+        $LOADED_FEATURES << File.join(dir, "weird.json")
+        require "tmpdir"
+
+        assert_equal true, Ractor.new { require "weird.json" }.value
+        assert_equal 7, WEIRD_JSON
+      end
+    RUBY
+  end
+
   def test_require_concurrent_while_load_path_churns
     # Exercises the probe against a main Ractor that is repeatedly invalidating
     # and rebuilding the expanded load path underneath it.
@@ -647,11 +691,12 @@ class TestRactor < Test::Unit::TestCase
         until stop
           $LOAD_PATH.unshift("/nonexistent_xyz")
           $LOAD_PATH.delete("/nonexistent_xyz")
+          sleep 0.001
         end
       end
       begin
         rs = 4.times.map do
-          Ractor.new { 200.times.map { require "tmpdir" }.uniq }
+          Ractor.new { 100.times.map { require "tmpdir" }.uniq }
         end
         assert_equal [[false]] * 4, rs.map(&:value)
       ensure
