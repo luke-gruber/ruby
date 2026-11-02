@@ -167,12 +167,16 @@ sym_id_entry_list_mark(void *ptr)
 {
     rb_darray(struct sym_id_entry) ary = ptr;
 
+    /* Resolved once for the whole list: every entry marks two references, and the
+     * plain rb_gc_mark() family would re-resolve the current Ractor for each one. */
+    const struct rb_gc_mark_ctx ctx = rb_gc_current_mark_ctx();
+
     struct sym_id_entry *entry;
     rb_darray_foreach(ary, i, entry) {
         // sym must be pinned because it may be used in places that don't
         // support compaction
-        rb_gc_mark(entry->sym);
-        rb_gc_mark_movable(entry->str);
+        rb_gc_mark_and_pin_ctx(&ctx, entry->sym);
+        rb_gc_mark_movable_ctx(&ctx, entry->str);
     }
 }
 

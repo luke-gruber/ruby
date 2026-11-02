@@ -229,6 +229,7 @@ struct rb_gc_mark_ctx {
     bool checking_shareable;
 };
 
+struct rb_gc_mark_ctx rb_gc_current_mark_ctx(void);
 void rb_gc_mark_and_pin_ctx(const struct rb_gc_mark_ctx *ctx, VALUE obj);
 void rb_gc_mark_movable_ctx(const struct rb_gc_mark_ctx *ctx, VALUE obj);
 void rb_gc_mark_maybe_ctx(const struct rb_gc_mark_ctx *ctx, VALUE obj);

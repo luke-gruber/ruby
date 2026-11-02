@@ -2954,6 +2954,15 @@ gc_current_mark_ctx(void)
     };
 }
 
+/* The same ctx, for a mark function that lives outside gc.c.  Build it once at the top
+ * of the walk and pass &ctx to the _ctx variants: a dmark that calls the plain
+ * rb_gc_mark() family instead re-resolves the current Ractor on every reference. */
+struct rb_gc_mark_ctx
+rb_gc_current_mark_ctx(void)
+{
+    return gc_current_mark_ctx();
+}
+
 #define RB_GC_MARK_OR_TRAVERSE(ctx, func, obj_or_ptr, obj, check_obj) do { \
     if (!RB_SPECIAL_CONST_P(obj)) { \
         struct gc_mark_func_data_struct **mfdp = (ctx)->mfdp; \
