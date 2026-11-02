@@ -1380,6 +1380,51 @@ rb_dump_machine_register(FILE *errout, const ucontext_t *ctx)
 # define rb_dump_machine_register(errout, ctx) ((void)0)
 #endif /* dump_machine_register */
 
+/* "(DNT) nt:<serial> <name>" is what nt_name_format() bakes into the native
+ * thread name, which is the name a profiler (samply &c.) or `ps` shows, so lead
+ * with those pieces in that order: a crash can then be matched up with a
+ * profile.  th:/native_id: follow to match rb_vmdebug_stack_dump_all_threads().
+ *
+ * Everything but the name is plain C read straight out of the thread, and the
+ * name is only touched if it still looks like a String: this runs from a crash
+ * handler, where a half-torn-down thread is exactly the expected case. */
+static bool
+print_thread_ident(FILE *errout, const rb_thread_t *th)
+{
+    if (th->nt) {
+        kprintf("%s nt:%u", th->nt->dedicated ? NT_NAME_DNT : NT_NAME_SNT,
+                (unsigned int)th->nt->serial);
+    }
+    else {
+        kprintf("(no nt)");
+    }
+
+    VALUE name = th->name;
+    if (!NIL_P(name) && RB_TYPE_P(name, T_STRING)) {
+        long len = RSTRING_LEN(name);
+        /* Clamp rather than trust the length: a trashed object header should
+         * cost us this line, not the rest of the report. */
+        if (len < 0) len = 0;
+        if (len > 128) len = 128;
+        kprintf(" name:\"%.*s\"", (int)len, RSTRING_PTR(name));
+    }
+    else {
+        kprintf(" name:(none)");
+    }
+
+    kprintf(" th:%p", (void *)th);
+#ifndef NON_SCALAR_THREAD_ID
+    if (th->nt) {
+        kprintf(" native_id:%p", (void *)(uintptr_t)th->nt->thread_id);
+    }
+#endif
+
+    return true;
+
+  error:
+    return false;
+}
+
 bool
 rb_vm_bugreport(const void *ctx, FILE *errout)
 {
@@ -1445,6 +1490,14 @@ rb_vm_bugreport(const void *ctx, FILE *errout)
         const rb_ractor_t *cr = rb_ec_ractor_ptr(ec);
         if (cr) {
             kprintf("Ruby thread count for this ractor: %u\n", cr->threads.cnt);
+            kprintf("Crashed on ractor: #%"PRI_SERIALT_PREFIX"u (%s)\n",
+                    rb_ractor_id(cr),
+                    cr->main_ractor ? "the main ractor" : "NOT the main ractor");
+        }
+        if (ec->thread_ptr) {
+            kprintf("Crashed on thread: ");
+            if (!print_thread_ident(errout, ec->thread_ptr)) goto error;
+            kputs("\n");
         }
         if (ec->thread_ptr && ec->thread_ptr->scheduler != Qnil) {
             kprintf("Note that the Fiber scheduler is enabled\n");
