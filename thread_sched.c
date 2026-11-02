@@ -134,7 +134,7 @@ static bool nt_spare_park(rb_vm_t *vm, struct rb_native_thread *nt);
  * ------------------------------------------------------------------------ */
 
 #ifndef USE_SNT_TRACE
-#define USE_SNT_TRACE 1
+#define USE_SNT_TRACE 0
 #endif
 
 #if USE_SNT_TRACE
@@ -169,11 +169,46 @@ static rb_atomic_t snt_trace_nt_parked, snt_trace_nt_reused;
 /* Wheel outcomes: a wait that parks on the timer thread keeps its SNT, so it
  * is NOT an snt->dnt transition.  Counted separately to keep the two apart. */
 static rb_atomic_t snt_trace_wheel_parked, snt_trace_wheel_ready, snt_trace_wheel_unavail, snt_trace_mn_declined;
+/* Why an nt left the shared pool, and whether the spare pool caught it.
+ * retire_deq: ractor_sched_deq gave it back after SNT_IDLE_RETIRE empty pops.
+ * retire_dec: native_thread_dedicated_dec found the pool full on the way back.
+ * park_full : offered itself to the spare pool and found no room -> really ended. */
+static rb_atomic_t snt_trace_retire_deq, snt_trace_retire_dec, snt_trace_park_full;
+/* nts asleep in ractor_sched_deq right now.  snt_cnt is what the scheduler
+ * *thinks* the shared pool is; this is how many pthreads are actually sitting
+ * in it.  The two drifting apart is the pool losing track of itself. */
+static rb_atomic_t snt_trace_deq_waiting;
+/* Heartbeat from the timer thread: one line per RUBY_SNT_TRACE_TICK ms. */
+static unsigned long snt_trace_tick_ms;
+static uint64_t snt_trace_tick_last;
+
+/* Who asked for a native thread.  native_thread_check_and_create_shared() is
+ * the only creator, but it is reached from the timer thread, from a new
+ * Ractor/thread, and from every enqueue path, so the caller is the answer to
+ * "where are these threads coming from". */
+#define SNT_CREATE_SITES 64
+#define SNT_CREATE_DEPTH 7
+struct snt_create_site {
+    uint64_t key;
+    unsigned long count;
+    rb_atomic_t snt_cnt;      // snt_cnt as this creation saw it (last sample)
+    void *ret[SNT_CREATE_DEPTH];
+};
+static struct snt_create_site snt_create_table[SNT_CREATE_SITES];
+/* The dump runs from atexit, where ruby_current_vm_ptr is already gone. */
+static rb_vm_t *snt_trace_vm;
 
 #define SNT_TRACE_NT_CREATED()     RUBY_ATOMIC_INC(snt_trace_nt_created)
 #define SNT_TRACE_NT_RETIRED()     RUBY_ATOMIC_INC(snt_trace_nt_retired)
 #define SNT_TRACE_NT_PARKED()      RUBY_ATOMIC_INC(snt_trace_nt_parked)
 #define SNT_TRACE_NT_REUSED()      RUBY_ATOMIC_INC(snt_trace_nt_reused)
+#define SNT_TRACE_RETIRE_DEQ()     RUBY_ATOMIC_INC(snt_trace_retire_deq)
+#define SNT_TRACE_RETIRE_DEC()     RUBY_ATOMIC_INC(snt_trace_retire_dec)
+#define SNT_TRACE_PARK_FULL()      RUBY_ATOMIC_INC(snt_trace_park_full)
+#define SNT_TRACE_CREATE_SITE(vm)  snt_trace_create_site(vm)
+#define SNT_TRACE_DEQ_WAIT_IN()    RUBY_ATOMIC_INC(snt_trace_deq_waiting)
+#define SNT_TRACE_DEQ_WAIT_OUT()   RUBY_ATOMIC_DEC(snt_trace_deq_waiting)
+#define SNT_TRACE_TICK(vm)         snt_trace_tick(vm)
 #define SNT_TRACE_WHEEL_PARKED()   RUBY_ATOMIC_INC(snt_trace_wheel_parked)
 #define SNT_TRACE_WHEEL_READY()    RUBY_ATOMIC_INC(snt_trace_wheel_ready)
 #define SNT_TRACE_WHEEL_UNAVAIL()  RUBY_ATOMIC_INC(snt_trace_wheel_unavail)
@@ -218,6 +253,9 @@ snt_trace_init(void)
     const char *e = getenv("RUBY_SNT_TRACE");
     if (!(e && *e && *e != '0')) return;
 
+    const char *tick = getenv("RUBY_SNT_TRACE_TICK");
+    if (tick && *tick) snt_trace_tick_ms = (unsigned long)atol(tick);
+
     const char *skip = getenv("RUBY_SNT_TRACE_SKIP");
     if (skip && *skip) snt_trace_skip = strdup(skip);
 
@@ -241,6 +279,8 @@ snt_trace_atfork(void)
     snt_trace_nt_parked = snt_trace_nt_reused = 0;
     snt_trace_wheel_parked = snt_trace_wheel_ready = 0;
     snt_trace_wheel_unavail = snt_trace_mn_declined = 0;
+    snt_trace_retire_deq = snt_trace_retire_dec = snt_trace_park_full = 0;
+    memset(snt_create_table, 0, sizeof(snt_create_table));
 }
 
 static inline uint64_t
@@ -285,11 +325,93 @@ snt_trace_settle(rb_thread_t *th)
     rb_native_mutex_unlock(&snt_trace_lock);
 }
 
+/* One line per tick on stderr: how big the scheduler thinks the shared pool is
+ * (snt_cnt) against how many pthreads are really in it (ntlist / deq-waiting),
+ * and how many have been created so far.  Called from the timer thread. */
+static void
+snt_trace_tick(rb_vm_t *vm)
+{
+    if (!snt_trace_enabled || snt_trace_tick_ms == 0 || vm == NULL) return;
+
+    uint64_t now = snt_trace_now_nsec();
+    if (now == 0) return;
+    if (snt_trace_tick_last && now - snt_trace_tick_last < snt_trace_tick_ms * 1000000ULL) return;
+    snt_trace_tick_last = now;
+    snt_trace_vm = vm;
+
+    unsigned int nlist = 0;
+    struct rb_native_thread *ntp;
+    rb_native_mutex_lock(&vm->ractor.sched.ntlist.lock);
+    {
+        ccan_list_for_each(&vm->ractor.sched.ntlist.snts, ntp, snts_node) nlist++;
+    }
+    rb_native_mutex_unlock(&vm->ractor.sched.ntlist.lock);
+
+    fprintf(stderr, "[snt] snt_cnt:%d/%d ntlist:%u deq_wait:%d spare:%u grq:%u ractors:%u "
+                    "| created:%u reused:%u parked:%u park_full:%u retire(deq:%u dec:%u)\n",
+            (int)RUBY_ATOMIC_LOAD(vm->ractor.sched.snt_cnt),
+            (int)vm->ractor.sched.max_cpu,
+            nlist,
+            (int)RUBY_ATOMIC_LOAD(snt_trace_deq_waiting),
+            vm->ractor.sched.spare.cnt,
+            vm->ractor.sched.grq_cnt,
+            vm->ractor.cnt,
+            (unsigned)RUBY_ATOMIC_LOAD(snt_trace_nt_created),
+            (unsigned)RUBY_ATOMIC_LOAD(snt_trace_nt_reused),
+            (unsigned)RUBY_ATOMIC_LOAD(snt_trace_nt_parked),
+            (unsigned)RUBY_ATOMIC_LOAD(snt_trace_park_full),
+            (unsigned)RUBY_ATOMIC_LOAD(snt_trace_retire_deq),
+            (unsigned)RUBY_ATOMIC_LOAD(snt_trace_retire_dec));
+}
+
+/* Aggregate the call chain that reached native_thread_check_and_create_shared
+ * and decided to start a pthread.  Same open-addressed-by-key shape as
+ * snt_trace_table; resolve the addresses with dladdr at dump time. */
+static void
+snt_trace_create_site(rb_vm_t *vm)
+{
+    if (!snt_trace_enabled) return;
+
+    void *bt[SNT_CREATE_DEPTH + 2];
+    int nbt = backtrace(bt, (int)numberof(bt));
+    void *ret[SNT_CREATE_DEPTH] = {0};
+    uint64_t key = 0;
+
+    /* skip this function itself */
+    for (int i = 1, j = 0; i < nbt && j < SNT_CREATE_DEPTH; i++, j++) {
+        ret[j] = bt[i];
+        key = snt_trace_mix(key, (uint64_t)(uintptr_t)bt[i]);
+    }
+    if (key == 0) key = 1;
+
+    snt_trace_vm = vm;
+    rb_atomic_t snt = vm ? RUBY_ATOMIC_LOAD(vm->ractor.sched.snt_cnt) : 0;
+
+    rb_native_mutex_lock(&snt_trace_lock);
+    {
+        size_t idx = (size_t)(key % SNT_CREATE_SITES);
+        for (size_t probe = 0; probe < SNT_CREATE_SITES; probe++) {
+            struct snt_create_site *site = &snt_create_table[(idx + probe) % SNT_CREATE_SITES];
+            if (site->key == 0) {
+                site->key = key;
+                memcpy(site->ret, ret, sizeof(ret));
+            }
+            if (site->key == key) {
+                site->count++;
+                site->snt_cnt = snt;
+                break;
+            }
+        }
+    }
+    rb_native_mutex_unlock(&snt_trace_lock);
+}
+
 static void
 snt_trace_record(rb_thread_t *th, bool yield_immediately)
 {
     if (!snt_trace_enabled) return;
     if (th->nt == NULL || th->nt->dedicated != 0) return;
+    if (snt_trace_vm == NULL) snt_trace_vm = th->vm;
 
     void *cfunc = th->sched.snt_trace_cfunc;
 
@@ -437,7 +559,7 @@ snt_trace_dump(void)
         size_t nsites = 0;
         while (nsites < SNT_TRACE_SIZE && snt_trace_table[nsites].key != 0) nsites++;
 
-        size_t cap = 512 + nsites * 320;
+        size_t cap = 8192 + nsites * 320;
         char *buf = malloc(cap);
         if (buf) {
             size_t len = 0;
@@ -465,6 +587,56 @@ snt_trace_dump(void)
                      (unsigned)RUBY_ATOMIC_LOAD(snt_trace_wheel_unavail));
             SNT_EMIT("%smn declined (not sched) : %u\n", tag,
                      (unsigned)RUBY_ATOMIC_LOAD(snt_trace_mn_declined));
+            SNT_EMIT("%sretire via deq: %u  via dedicated_dec: %u  park found pool full: %u\n", tag,
+                     (unsigned)RUBY_ATOMIC_LOAD(snt_trace_retire_deq),
+                     (unsigned)RUBY_ATOMIC_LOAD(snt_trace_retire_dec),
+                     (unsigned)RUBY_ATOMIC_LOAD(snt_trace_park_full));
+
+            /* Live scheduler state.  snt_cnt above max_cpu, or an ntlist much
+             * longer than snt_cnt, is the pool having lost track of its own
+             * size -- which is what an endless parade of new serials means. */
+            {
+                rb_vm_t *dvm = snt_trace_vm ? snt_trace_vm : ruby_current_vm_ptr;
+                if (dvm) {
+                    unsigned int nlist = 0;
+                    struct rb_native_thread *ntp;
+                    ccan_list_for_each(&dvm->ractor.sched.ntlist.snts, ntp, snts_node) nlist++;
+                    SNT_EMIT("%sat exit: snt_cnt:%d max_cpu:%d ractor.cnt:%u grq_cnt:%u "
+                             "spare.cnt:%u spare.handoff:%u ntlist.snts:%u\n", tag,
+                             (int)RUBY_ATOMIC_LOAD(dvm->ractor.sched.snt_cnt),
+                             (int)dvm->ractor.sched.max_cpu,
+                             dvm->ractor.cnt,
+                             dvm->ractor.sched.grq_cnt,
+                             dvm->ractor.sched.spare.cnt,
+                             dvm->ractor.sched.spare.handoff,
+                             nlist);
+                }
+            }
+
+            /* Creation call chains. */
+            {
+                size_t ncs = 0;
+                for (size_t i = 0; i < SNT_CREATE_SITES; i++) {
+                    if (snt_create_table[i].key) ncs++;
+                }
+                SNT_EMIT("%s-- native thread creation sites (%zu) --\n", tag, ncs);
+                for (size_t i = 0; i < SNT_CREATE_SITES; i++) {
+                    struct snt_create_site *cs = &snt_create_table[i];
+                    if (!cs->key) continue;
+                    SNT_EMIT("%s  created %lu  (snt_cnt at last:%d)\n", tag,
+                             cs->count, (int)cs->snt_cnt);
+                    for (int j = 0; j < SNT_CREATE_DEPTH && cs->ret[j]; j++) {
+                        Dl_info di;
+                        const char *nm = "?";
+                        unsigned long off = 0;
+                        if (dladdr(cs->ret[j], &di) && di.dli_sname) {
+                            nm = di.dli_sname;
+                            off = (unsigned long)((char *)cs->ret[j] - (char *)di.dli_saddr);
+                        }
+                        SNT_EMIT("%s      %p %s+0x%lx\n", tag, cs->ret[j], nm, off);
+                    }
+                }
+            }
             SNT_EMIT("%s%10s %10s %10s %9s  %-30s %s\n", tag,
                      "count", "yield-now", "held-ms", "us/call", "nogvl-func", "ruby-site");
 
@@ -527,6 +699,13 @@ snt_trace_dump(void)
 #define SNT_TRACE_NT_RETIRED()     ((void)0)
 #define SNT_TRACE_NT_PARKED()      ((void)0)
 #define SNT_TRACE_NT_REUSED()      ((void)0)
+#define SNT_TRACE_RETIRE_DEQ()     ((void)0)
+#define SNT_TRACE_RETIRE_DEC()     ((void)0)
+#define SNT_TRACE_PARK_FULL()      ((void)0)
+#define SNT_TRACE_CREATE_SITE(vm)  ((void)0)
+#define SNT_TRACE_DEQ_WAIT_IN()    ((void)0)
+#define SNT_TRACE_DEQ_WAIT_OUT()   ((void)0)
+#define SNT_TRACE_TICK(vm)         ((void)0)
 #define snt_trace_settle(th)       ((void)0)
 #define SNT_TRACE_WHEEL_PARKED()   ((void)0)
 #define SNT_TRACE_WHEEL_READY()    ((void)0)
@@ -1806,12 +1985,15 @@ ractor_sched_deq(rb_vm_t *vm, rb_ractor_t *cr, bool can_retire)
                 (int)RUBY_ATOMIC_LOAD(vm->ractor.sched.snt_cnt) > SNT_KEEP_MINIMUM) {
                 RUBY_ATOMIC_DEC(vm->ractor.sched.snt_cnt);
                 SNT_TRACE_NT_RETIRED();
+                SNT_TRACE_RETIRE_DEQ();
                 RUBY_DEBUG_LOG("retire, snt_cnt:%d", (int)vm->ractor.sched.snt_cnt);
                 break;   // returning NULL ends this nt; see the caller
             }
 
             ractor_sched_set_unlocked(vm, cr);
+            SNT_TRACE_DEQ_WAIT_IN();
             rb_native_cond_wait(&vm->ractor.sched.cond, &vm->ractor.sched.lock);
+            SNT_TRACE_DEQ_WAIT_OUT();
             ractor_sched_set_locked(vm, cr);
 
             RUBY_DEBUG_LOG("wakeup grq_cnt:%d", (int)vm->ractor.sched.grq_cnt);
@@ -2339,6 +2521,7 @@ native_thread_dedicated_dec(rb_vm_t *vm, rb_ractor_t *cr, struct rb_native_threa
             }
             else {
                 nt->retiring = true;
+                SNT_TRACE_RETIRE_DEC();
                 break;
             }
         }
@@ -2609,6 +2792,9 @@ nt_spare_park(rb_vm_t *vm, struct rb_native_thread *nt)
             reused = true;
 
             RUBY_DEBUG_LOG("unpark nt:%u spare:%u", nt->serial, vm->ractor.sched.spare.cnt);
+        }
+        else {
+            SNT_TRACE_PARK_FULL();
         }
     }
     rb_native_mutex_unlock(&vm->ractor.sched.spare.lock);
