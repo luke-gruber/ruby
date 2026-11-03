@@ -678,8 +678,9 @@ typedef struct gc_function_map {
     bool (*during_global_gc_p)(void *objspace_ptr);
     bool (*during_postmortem_p)(void *objspace_ptr);
     bool (*obj_foreign_p)(void *objspace_ptr, VALUE obj);
-    bool (*shref_marked_p)(void *objspace_ptr, VALUE obj);
     size_t (*heap_page_count)(void *objspace_ptr);
+    bool (*shref_recorded_p)(void *objspace_ptr, VALUE parent, VALUE child);
+    void (*objspace_zombify)(void *objspace_ptr);
     void (*objspace_absorb)(void *dst_ptr, void *src_ptr);
     void (*gc_rest)(void *objspace_ptr);
     VALUE (*config_get)(void *objpace_ptr);
@@ -874,8 +875,9 @@ ruby_modular_gc_init(void)
     load_modular_gc_func(during_global_gc_p);
     load_modular_gc_func(during_postmortem_p);
     load_modular_gc_func(obj_foreign_p);
-    load_modular_gc_func(shref_marked_p);
     load_modular_gc_func(heap_page_count);
+    load_modular_gc_func(shref_recorded_p);
+    load_modular_gc_func(objspace_zombify);
     load_modular_gc_func(objspace_absorb);
     load_modular_gc_func(gc_rest);
     load_modular_gc_func(config_set);
@@ -979,8 +981,9 @@ ruby_modular_gc_init(void)
 # define rb_gc_impl_during_global_gc_p rb_gc_functions.during_global_gc_p
 # define rb_gc_impl_during_postmortem_p rb_gc_functions.during_postmortem_p
 # define rb_gc_impl_obj_foreign_p rb_gc_functions.obj_foreign_p
-# define rb_gc_impl_shref_marked_p rb_gc_functions.shref_marked_p
 # define rb_gc_impl_heap_page_count rb_gc_functions.heap_page_count
+# define rb_gc_impl_shref_recorded_p rb_gc_functions.shref_recorded_p
+# define rb_gc_impl_objspace_zombify rb_gc_functions.objspace_zombify
 # define rb_gc_impl_objspace_absorb rb_gc_functions.objspace_absorb
 # define rb_gc_impl_gc_rest rb_gc_functions.gc_rest
 # define rb_gc_impl_config_get rb_gc_functions.config_get
@@ -6954,7 +6957,7 @@ rb_gc_obj_shareable_p(VALUE obj)
 bool
 rb_gc_obj_shref_p(VALUE obj)
 {
-    return rb_gc_impl_shref_marked_p(rb_gc_get_objspace(), obj);
+    return rb_gc_impl_shref_recorded_p(rb_gc_get_objspace(), Qundef, obj);
 }
 
 void
@@ -6975,10 +6978,11 @@ check_shareable_i(const VALUE child, void *ptr)
 
     if (!rb_gc_obj_shareable_p(child)) {
         /* A shareable object may reference an unshareable one only if the write barrier
-         * recorded the edge in the target's shref bit (keeping it alive past its owner's
-         * local GC).  Root-like exceptions (Ractor private fields, cref, JIT) are hidden
-         * while checking_shareable is set. */
-        if (rb_gc_impl_shref_marked_p(rb_gc_get_objspace(), child)) {
+         * recorded the edge, keeping the child alive past its owner's local GC: in the
+         * child's shref bit, or -- for a parent in the child's own objspace -- in the
+         * rememberset.  Root-like exceptions (Ractor private fields, cref, JIT) are
+         * hidden while checking_shareable is set. */
+        if (rb_gc_impl_shref_recorded_p(rb_gc_get_objspace(), data->parent, child)) {
             return;
         }
 
