@@ -1591,6 +1591,12 @@ rb_gc_impl_undefine_finalizer(void *objspace_ptr, VALUE obj)
     RB_GC_VM_UNLOCK(lev);
 }
 
+bool
+rb_gc_impl_shref_recorded_p(void *objspace_ptr, VALUE parent, VALUE child)
+{
+    return RB_FL_TEST_RAW(obj, RUBY_FL_SHREF);
+}
+
 void
 rb_gc_impl_copy_finalizer(void *objspace_ptr, VALUE dest, VALUE obj)
 {
