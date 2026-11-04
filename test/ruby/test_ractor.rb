@@ -1752,4 +1752,40 @@ class TestRactor < Test::Unit::TestCase
       keeper.send(nil)
     RUBY
   end
+
+  def test_local_shareable_parent_reached_only_by_pin_keeps_child_across_majors
+    omit 'shareable -> unshareable records live in the default GC' unless GC.config[:implementation] == 'default'
+    assert_separately(%w[-W0], <<~'RUBY', timeout: 60)
+      port = Ractor::Port.new
+      # Only the keeper holds the class, so main's local GCs reach it (and its fields
+      # imemo) through the shareable pin alone.
+      keeper = Ractor.new(port) do |port|
+        k = Ractor.receive
+        Ractor.receive
+        port << k
+      end
+      expected = -> { Array.new(100) { |i| "child #{i}" } }
+
+      # Age the class's fields imemo so the store takes the rememberset path, not a shref
+      # bit. Then only a local major traversing that parent keeps the child alive, which
+      # each major has to re-derive from the previous one's traversal.
+      -> {
+        klass = Class.new
+        klass.instance_variable_set(:@x, nil)
+        4.times { GC.start(full_mark: false, global: false) }
+        klass.instance_variable_set(:@x, expected.call)
+        keeper.send(klass)
+      }.call
+      4.times { GC.start(full_mark: false, global: false) }
+
+      4.times do
+        GC.start(full_mark: true, immediate_sweep: true, global: false)
+        Array.new(100_000) { "garbage" }
+      end
+      GC.verify_internal_consistency
+
+      keeper.send(nil)
+      assert_equal expected.call, port.receive.instance_variable_get(:@x)
+    RUBY
+  end
 end
