@@ -6954,7 +6954,7 @@ rb_gc_obj_shareable_p(VALUE obj)
 bool
 rb_gc_obj_shref_p(VALUE obj)
 {
-    return rb_gc_impl_shref_marked_p(rb_gc_get_objspace(), obj);
+    return rb_gc_impl_shref_recorded_p(rb_gc_get_objspace(), Qundef, obj);
 }
 
 void

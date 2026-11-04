@@ -1449,7 +1449,7 @@ gc_malloc_counters_snapshot(rb_objspace_t *objspace, struct gc_malloc_bytes *c)
 static inline size_t
 gc_oldmalloc_increase_load(rb_objspace_t *objspace)
 {
-    return rbimpl_atomic_size_load(&objspace->malloc_counters.oldmalloc_increase, RBIMPL_ATOMIC_RELAXED);
+    return (size_t)rbimpl_atomic_value_load(&objspace->malloc_counters.oldmalloc_increase, RBIMPL_ATOMIC_RELAXED);
 }
 #endif
 
@@ -9604,6 +9604,7 @@ rb_gc_impl_shref_recorded_p(void *objspace_ptr, VALUE parent, VALUE child)
     rb_objspace_t *objspace = objspace_ptr;
 
     if (MARKED_IN_BITMAP(GET_HEAP_SHREF_BITS(child), child)) return true;
+    if (parent == Qundef) return false;
 
     if (GET_HEAP_OBJSPACE(parent) == GET_HEAP_OBJSPACE(child)) {
         if (RVALUE_OLD_P(objspace, child)) return true;
@@ -11711,7 +11712,7 @@ atomic_sub_nounderflow(size_t *var, size_t sub)
     if (sub == 0) return;
 
     while (1) {
-        size_t val = rbimpl_atomic_size_load(var, RBIMPL_ATOMIC_RELAXED);
+        size_t val = (size_t)rbimpl_atomic_value_load(var, RBIMPL_ATOMIC_RELAXED);
         size_t decrement = val < sub ? val : sub;
         if (RUBY_ATOMIC_SIZE_CAS(*var, val, val-decrement) == val) break;
     }
