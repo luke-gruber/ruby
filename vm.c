@@ -351,7 +351,19 @@ vm_cref_new0(VALUE klass, rb_method_visibility_t visi, int module_func, rb_cref_
 
     VM_ASSERT(singleton || klass);
 
-    rb_cref_t *cref = SHAREABLE_IMEMO_NEW(rb_cref_t, imemo_cref, refinements);
+    bool cref_shareable = true;
+    if (singleton && klass && !rb_ractor_shareable_p(klass)) {
+        cref_shareable = false;
+    }
+    else if (prev_cref != NULL && prev_cref != (void *)1 &&
+             !rb_ractor_shareable_p((VALUE)prev_cref)) {
+        cref_shareable = false;
+    }
+
+    rb_cref_t *cref = cref_shareable
+        ? SHAREABLE_IMEMO_NEW(rb_cref_t, imemo_cref, refinements)
+        : IMEMO_NEW(rb_cref_t, imemo_cref, refinements);
+
     /* A cref is born shareable, so possibly-unshareable children (a singleton cref's
      * self, `using`'s refinements hash) go through the write barrier to record a shref;
      * a plain store would let the owner's local GC collect the child under the pinned
