@@ -1086,7 +1086,11 @@ void
 rb_method_definition_set(const rb_method_entry_t *me, rb_method_definition_t *def, void *opts)
 {
     method_definition_release(me->def);
-    *(rb_method_definition_t **)&me->def = method_definition_addref(def, METHOD_ENTRY_COMPLEMENTED(me));
+    /* Release: other ractors read me->def without the VM lock, so what was written
+     * to def before this point must be visible to them once the pointer is. */
+    rbimpl_atomic_ptr_store((volatile void **)&me->def,
+                            method_definition_addref(def, METHOD_ENTRY_COMPLEMENTED(me)),
+                            RBIMPL_ATOMIC_RELEASE);
 
     if (!ruby_running) add_opt_method_entry(me);
 
@@ -2847,7 +2851,7 @@ original_method_definition(const rb_method_definition_t *def)
             }
             break;
           case VM_METHOD_TYPE_ALIAS:
-            def = def->body.alias.original_me->def;
+            def = rb_method_entry_def_acquire(rb_method_alias_original_me(def));
             goto again;
           default:
             break;
@@ -2976,7 +2980,7 @@ rb_add_alias(VALUE klass, ID alias_name, ID original_name, rb_method_visibility_
         goto again;
       case VM_METHOD_TYPE_ALIAS:
         visi = METHOD_ENTRY_VISI(orig_me);
-        orig_me = orig_me->def->body.alias.original_me;
+        orig_me = rb_method_alias_original_me(rb_method_entry_def_acquire(orig_me));
         VM_ASSERT(orig_me->def->type != VM_METHOD_TYPE_ALIAS);
         break;
       default: break;

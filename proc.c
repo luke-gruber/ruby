@@ -3613,7 +3613,7 @@ method_def_min_max_arity(const rb_method_definition_t *def, int *max)
       case VM_METHOD_TYPE_IVAR:
         return *max = 0;
       case VM_METHOD_TYPE_ALIAS:
-        def = def->body.alias.original_me->def;
+        def = rb_method_entry_def_acquire(rb_method_alias_original_me(def));
         goto again;
       case VM_METHOD_TYPE_BMETHOD:
         return rb_proc_min_max_arity(def->body.bmethod.proc, max);
@@ -3789,7 +3789,7 @@ rb_method_def(VALUE method)
     const struct METHOD *data;
 
     TypedData_Get_Struct(method, struct METHOD, &method_data_type, data);
-    return data->me->def;
+    return rb_method_entry_def_acquire(data->me);
 }
 
 static const rb_iseq_t *
@@ -3801,7 +3801,7 @@ method_def_iseq(const rb_method_definition_t *def)
       case VM_METHOD_TYPE_BMETHOD:
         return rb_proc_get_iseq(def->body.bmethod.proc, 0);
       case VM_METHOD_TYPE_ALIAS:
-        return method_def_iseq(def->body.alias.original_me->def);
+        return method_def_iseq(rb_method_entry_def_acquire(rb_method_alias_original_me(def)));
       case VM_METHOD_TYPE_CFUNC:
       case VM_METHOD_TYPE_ATTRSET:
       case VM_METHOD_TYPE_IVAR:
@@ -3832,7 +3832,7 @@ method_cref(VALUE method)
       case VM_METHOD_TYPE_ISEQ:
         return def->body.iseq.cref;
       case VM_METHOD_TYPE_ALIAS:
-        def = def->body.alias.original_me->def;
+        def = rb_method_entry_def_acquire(rb_method_alias_original_me(def));
         goto again;
       default:
         return NULL;
@@ -3943,7 +3943,7 @@ method_def_parameters(const rb_method_definition_t *def)
         break;
 
       case VM_METHOD_TYPE_ALIAS:
-        return method_def_parameters(def->body.alias.original_me->def);
+        return method_def_parameters(rb_method_entry_def_acquire(rb_method_alias_original_me(def)));
 
       case VM_METHOD_TYPE_OPTIMIZED:
         if (def->body.optimized.type == OPTIMIZED_METHOD_TYPE_STRUCT_ASET) {
@@ -4060,8 +4060,9 @@ method_inspect(VALUE method)
         mklass = RBASIC_CLASS(mklass);
     }
 
-    if (data->me->def->type == VM_METHOD_TYPE_ALIAS) {
-        defined_class = data->me->def->body.alias.original_me->owner;
+    const rb_method_definition_t *def = rb_method_entry_def_acquire(data->me);
+    if (def->type == VM_METHOD_TYPE_ALIAS) {
+        defined_class = rb_method_alias_original_me(def)->owner;
     }
     else {
         defined_class = method_entry_defined_class(data->me);
@@ -4293,10 +4294,12 @@ method_super_method(VALUE method)
     TypedData_Get_Struct(method, struct METHOD, &method_data_type, data);
     iclass = data->iclass;
     if (!iclass) return Qnil;
-    if (data->me->def->type == VM_METHOD_TYPE_ALIAS && data->me->defined_class) {
+    const rb_method_definition_t *def = rb_method_entry_def_acquire(data->me);
+    if (def->type == VM_METHOD_TYPE_ALIAS && data->me->defined_class) {
+        const rb_method_entry_t *orig_me = rb_method_alias_original_me(def);
         super_class = RCLASS_SUPER(rb_find_defined_class_by_owner(data->me->defined_class,
-            data->me->def->body.alias.original_me->owner));
-        mid = data->me->def->body.alias.original_me->def->original_id;
+            orig_me->owner));
+        mid = rb_method_entry_def_acquire(orig_me)->original_id;
     }
     else {
         VALUE klass = iclass;

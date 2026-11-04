@@ -6345,7 +6345,7 @@ rb_resolve_me_location(const rb_method_entry_t *me, VALUE resolved_location[5])
         return NULL;
       }
       case VM_METHOD_TYPE_ALIAS:
-        me = me->def->body.alias.original_me;
+        me = rb_method_alias_original_me(rb_method_entry_def_acquire(me));
         goto retry;
       case VM_METHOD_TYPE_REFINED:
         me = me->def->body.refined.orig_me;

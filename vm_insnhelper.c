@@ -4260,7 +4260,8 @@ rb_find_defined_class_by_owner(VALUE current_class, VALUE target_owner)
 static const rb_callable_method_entry_t *
 aliased_callable_method_entry(const rb_callable_method_entry_t *me)
 {
-    const rb_method_entry_t *orig_me = me->def->body.alias.original_me;
+    const rb_method_entry_t *orig_me =
+        rb_method_alias_original_me(rb_method_entry_def_acquire((const rb_method_entry_t *)me));
     const rb_callable_method_entry_t *cme = NULL;
 
     if (orig_me->defined_class == 0) {
@@ -4279,12 +4280,23 @@ aliased_callable_method_entry(const rb_callable_method_entry_t *me)
                 cme = rb_method_entry_complement_defined_class(orig_me, me->called_id, defined_class);
 
                 if (me->def->reference_count == 1) {
-                    RB_OBJ_WRITE(me, &me->def->body.alias.original_me, cme);
+                    // Release: cme was just built, and other ractors read
+                    // original_me without the VM lock.
+                    rbimpl_atomic_ptr_store((volatile void **)&me->def->body.alias.original_me,
+                                            (void *)cme, RBIMPL_ATOMIC_RELEASE);
+                    RB_OBJ_WRITTEN(me, Qundef, cme);
                 }
                 else {
                     rb_method_definition_t *def =
                         rb_method_definition_create(VM_METHOD_TYPE_ALIAS, me->def->original_id);
-                    rb_method_definition_set((rb_method_entry_t *)me, def, (void *)cme);
+                    // Fill the definition in before publishing it: other ractors
+                    // read me->def->body.alias.original_me without the VM lock, and
+                    // would see NULL if me->def pointed at it first.
+                    def->body.alias.original_me = (rb_method_entry_t *)cme;
+                    def->original_module = cme->def->original_module;
+                    rb_method_definition_set((rb_method_entry_t *)me, def, NULL);
+                    RB_OBJ_WRITTEN(me, Qundef, cme);
+                    RB_OBJ_WRITTEN(me, Qundef, def->original_module);
                 }
             }
             else {
