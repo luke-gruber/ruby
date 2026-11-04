@@ -1449,7 +1449,7 @@ gc_malloc_counters_snapshot(rb_objspace_t *objspace, struct gc_malloc_bytes *c)
 static inline size_t
 gc_oldmalloc_increase_load(rb_objspace_t *objspace)
 {
-    return (size_t)rbimpl_atomic_value_load(&objspace->malloc_counters.oldmalloc_increase, RBIMPL_ATOMIC_RELAXED);
+    return rbimpl_atomic_size_load(&objspace->malloc_counters.oldmalloc_increase, RBIMPL_ATOMIC_RELAXED);
 }
 #endif
 
@@ -6309,22 +6309,6 @@ ALWAYS_INLINE(static void gc_mark_check_t_none(rb_objspace_t *objspace, VALUE ob
 ALWAYS_INLINE(static void rgengc_check_relation(rb_objspace_t *objspace, VALUE obj));
 ALWAYS_INLINE(static void gc_aging(rb_objspace_t *objspace, VALUE obj));
 ALWAYS_INLINE(static void gc_grey(rb_objspace_t *objspace, VALUE obj));
-/* Where a shareable -> unshareable edge gets recorded, so a local GC of the child's
- * objspace keeps the child alive even though it never traverses the parent.  An old
- * parent in the child's own objspace keeps the edge in the rememberset: that record
- * drains every minor and is re-made only while the edge is still there, so it cannot
- * outlive the field.  Anything else needs the child's shref bit, which nothing but a
- * global GC clears -- a young parent because a minor could sweep it out from under its
- * own rememberset entry, a parent in another objspace because only the child's owner
- * walks the child.  The write barrier and a global GC's re-derivation must agree here,
- * or an edge ends up with no record at all. */
-static inline bool
-gc_shref_needs_bit_p(rb_objspace_t *objspace, VALUE parent, VALUE child)
-{
-    return GET_HEAP_OBJSPACE(parent) != GET_HEAP_OBJSPACE(child) ||
-           !RVALUE_OLD_P(objspace, parent);
-}
-
 static void
 rgengc_check_relation(rb_objspace_t *objspace, VALUE obj)
 {
@@ -6441,10 +6425,7 @@ gc_mark(rb_objspace_t *objspace, VALUE obj)
         VALUE parent = objspace->rgengc.parent_object;
         if (!UNDEF_P(parent) && parent != Qfalse &&
             RB_FL_TEST_RAW(parent, RUBY_FL_SHAREABLE) &&
-            !RB_FL_TEST_RAW(obj, RUBY_FL_SHAREABLE) &&
-            gc_shref_needs_bit_p(objspace, parent, obj)) {
-            /* The edges left out here are the ones rgengc_check_relation is about to put
-             * in the parent's rememberset instead. */
+            !RB_FL_TEST_RAW(obj, RUBY_FL_SHAREABLE)) {
             struct heap_page *page = GET_HEAP_PAGE(obj);
             _MARK_IN_BITMAP(page->shref_bits, page, obj);
             page->flags.has_shref_objects = TRUE;
@@ -8100,9 +8081,7 @@ gc_marks_continue(rb_objspace_t *objspace, rb_heap_t *heap)
  *   Only a global GC decides that a shareable object is dead.
  * - Every shref (an unshareable object referenced from a shareable one): the referring
  *   shareable object can live in another objspace or in an in-flight message queue.  The
- *   write barrier maintains them.  A locally owned, old shareable parent records its
- *   unshareable children in the rememberset instead, so those have no shref bit; a major
- *   mark re-derives them here by traversing the parent.
+ *   write barrier maintains them.
  * Skipped while the VM has a single Ractor: a local GC is then a whole-world GC and
  * shareable objects may die normally. */
 static void
@@ -8114,23 +8093,15 @@ pinned_roots_mark(rb_objspace_t *objspace, rb_heap_t *heap)
      * than the poison left by the previous GC. */
     gc_mark_set_parent_raw(objspace, Qundef, false);
 
-    /* A local GC never frees a shareable object, so:
-     *   - on a minor it only gets its mark bit set (like an old object), which keeps the
-     *     sweep off it, and is not traversed: its unshareable children are reached
-     *     through their shref bits or through the rememberset entry the write barrier
-     *     left on the parent;
-     *   - on a major both of those records are gone (gc_bitmaps_clear drops the
-     *     rememberset, and an overwritten field's stale shref would retain dead objects
-     *     for the rest of the epoch), so the parent is traversed and the live edges are
-     *     re-derived from the fields themselves.  Foreign children are skipped by
-     *     gc_mark and stay the business of their own objspace;
+    /* A local GC never frees or traverses a shareable object, and keeps its unshareable
+     * children alive through their shref bits, so:
+     *   - a shareable object only gets its mark bit set (like an old object), which keeps
+     *     the sweep off it, and is not traversed;
      *   - a shref is marked and traversed, like a remembered old->young target: without
      *     that, the referring shareable object is never walked and it would look
      *     unreachable.
      * Objects can become shareable between GCs, so this pass scans the bitmaps in every
      * mark (gc_marks_finish) instead of maintaining a pin set across the sweep. */
-    const bool traverse_shareable = is_full_marking(objspace);
-
     ccan_list_for_each(&heap->pages, page, page_node) {
         if (!(page->flags.has_shareable_objects | page->flags.has_shref_objects)) continue;
 
@@ -8160,10 +8131,6 @@ pinned_roots_mark(rb_objspace_t *objspace, rb_heap_t *heap)
                             gc_report(2, objspace, "pinned_roots_mark: mark %s\n", rb_obj_info(obj));
                             if (sr_bits & 1) {
                                 gc_mark(objspace, obj);          /* shref: root + traverse */
-                            }
-                            else if (traverse_shareable) {
-                                gc_mark(objspace, obj);          /* re-derive this parent's edges */
-                                gc_pin(objspace, obj);
                             }
                             else if (gc_mark_set(objspace, obj)) {
                                 gc_aging(objspace, obj);         /* shareable: mark, no traverse */
@@ -8535,33 +8502,15 @@ rb_gc_impl_writebarrier(void *objspace_ptr, VALUE a, VALUE b)
     GC_ASSERT(RB_BUILTIN_TYPE(a) != T_MOVED);
     GC_ASSERT(RB_BUILTIN_TYPE(a) != T_ZOMBIE);
 
-    /* A shareable object now references an unshareable one.  A local GC marks shareable
-     * objects without traversing them, so the edge needs a record of its own:
-     * gc_shref_needs_bit_p says which one.  Remembering the parent works exactly like an
-     * old -> young edge -- a minor traverses the rememberset, rgengc_check_relation keeps
-     * the parent in it while the child is young, and a major re-derives the edge by
-     * traversing the parent (pinned_roots_mark) -- so an overwritten field stops
-     * retaining its old value, which a shref bit would go on doing until a global GC. */
+    /* A shareable object now references an unshareable one: record b as a shref so its
+     * owner's local GC roots it (the parent may live in another objspace, untraversed
+     * there).  Only b's owner stores this, on its own page: a plain store suffices. */
     if (RB_UNLIKELY(RB_FL_TEST_RAW(a, RUBY_FL_SHAREABLE)) &&
             !RB_FL_TEST_RAW(b, RUBY_FL_SHAREABLE)) {
-        if (!gc_foreign_object_p(objspace, a) && !gc_shref_needs_bit_p(objspace, a, b)) {
-            if (RB_UNLIKELY(is_incremental_marking(objspace))) {
-                /* The rememberset is drained at gc_marks_start, so a store made later in
-                 * the cycle has to mark b itself; gc_writebarrier_incremental below only
-                 * covers a black parent, and a shareable one is marked at
-                 * gc_marks_finish.  gc_mark_from re-remembers a. */
-                gc_mark_from(objspace, b, a);
-            }
-            else if (!RVALUE_OLD_P(objspace, b)) {
-                rgengc_remember(objspace, a);
-            }
-        }
-        else {
-            struct heap_page *bpage = GET_HEAP_PAGE(b);
-            if (!_MARKED_IN_BITMAP(bpage->shref_bits, bpage, b)) {
-                _MARK_IN_BITMAP(bpage->shref_bits, bpage, b);
-                bpage->flags.has_shref_objects = TRUE;
-            }
+        struct heap_page *bpage = GET_HEAP_PAGE(b);
+        if (!_MARKED_IN_BITMAP(bpage->shref_bits, bpage, b)) {
+            _MARK_IN_BITMAP(bpage->shref_bits, bpage, b);
+            bpage->flags.has_shref_objects = TRUE;
         }
     }
 
@@ -9614,22 +9563,13 @@ rb_gc_impl_obj_foreign_p(void *objspace_ptr, VALUE obj)
 }
 
 
-/* Whether the shareable -> unshareable edge parent -> child carries the record the write
- * barrier owes it.  For the verifier.  Either the child has a shref bit, or the parent is
- * local and keeps the edge in the rememberset: an old child needs nothing there (it is
- * uncollectible), a young one needs its parent remembered. */
+/* Whether obj is recorded as an unshareable object referenced from a shareable one.  For
+ * the verifier: a shareable -> unshareable edge is only accepted if the write barrier
+ * recorded it here. */
 bool
-rb_gc_impl_shref_recorded_p(void *objspace_ptr, VALUE parent, VALUE child)
+rb_gc_impl_shref_marked_p(void *objspace_ptr, VALUE obj)
 {
-    rb_objspace_t *objspace = objspace_ptr;
-
-    if (MARKED_IN_BITMAP(GET_HEAP_SHREF_BITS(child), child)) return true;
-
-    if (parent != Qundef && GET_HEAP_OBJSPACE(parent) == GET_HEAP_OBJSPACE(child)) {
-        if (RVALUE_OLD_P(objspace, child)) return true;
-        if (RVALUE_REMEMBERED(objspace, parent)) return true;
-    }
-    return false;
+    return MARKED_IN_BITMAP(GET_HEAP_SHREF_BITS(obj), obj) != 0;
 }
 
 /* The objspace's current page count (used for the zombie_objspaces page accounting). */
@@ -11728,7 +11668,7 @@ atomic_sub_nounderflow(size_t *var, size_t sub)
     if (sub == 0) return;
 
     while (1) {
-        size_t val = (size_t)rbimpl_atomic_value_load(var, RBIMPL_ATOMIC_RELAXED);
+        size_t val = rbimpl_atomic_size_load(var, RBIMPL_ATOMIC_RELAXED);
         size_t decrement = val < sub ? val : sub;
         if (RUBY_ATOMIC_SIZE_CAS(*var, val, val-decrement) == val) break;
     }

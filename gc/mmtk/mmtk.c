@@ -1857,7 +1857,7 @@ rb_gc_impl_obj_foreign_p(void *objspace_ptr, VALUE obj)
 }
 
 bool
-rb_gc_impl_shref_recorded_p(void *objspace_ptr, VALUE parent, VALUE child)
+rb_gc_impl_shref_marked_p(void *objspace_ptr, VALUE obj)
 {
     return RB_FL_TEST_RAW(obj, RUBY_FL_SHREF);
 }
