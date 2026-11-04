@@ -6957,6 +6957,24 @@ rb_gc_obj_shref_p(VALUE obj)
     return rb_gc_impl_shref_recorded_p(rb_gc_get_objspace(), Qundef, obj);
 }
 
+/* Every child of a shareable obj of these types is shareable (a regexp's src and a
+ * symbol's fstr are fstrings), so traversing it can reach nothing unshareable. */
+bool
+rb_gc_shareable_leaf_p(VALUE obj)
+{
+    switch (BUILTIN_TYPE(obj)) {
+      case T_FLOAT:
+      case T_BIGNUM:
+      case T_REGEXP:
+      case T_SYMBOL:
+        return true;
+      case T_STRING:
+        return !STR_SHARED_P(obj) || RB_OBJ_SHAREABLE_P(RSTRING(obj)->as.heap.aux.shared);
+      default:
+        return false;
+    }
+}
+
 void
 rb_gc_rp(VALUE obj)
 {
