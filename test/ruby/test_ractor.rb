@@ -232,6 +232,43 @@ class TestRactor < Test::Unit::TestCase
     RUBY
   end
 
+  # `using` inside a shareable Proc replaces the cref in its shared env.  Another Ractor's
+  # cref may point at the replaced one, so its owner's local GC must not free it.
+  def test_cref_replaced_by_using_in_shareable_proc_outlives_local_gc
+    assert_ractor(<<~'RUBY', timeout: 60)
+      module UsingInRactor
+        refine(String) { def hi = :hi }
+      end
+      Ractor.make_shareable(UsingInRactor)
+      module UsingHolder; end
+
+      PR = eval(<<~'SETUP')
+        Object.new.instance_exec do
+          Ractor.shareable_proc(self: UsingHolder) do |u|
+            using UsingInRactor if u
+            Object.new.instance_exec { proc { Module.nesting } }
+          end
+        end
+      SETUP
+
+      eval('PR.(true)')
+      port = Ractor::Port.new
+      r = Ractor.new(port) do |pt|
+        q = eval('PR.(false)')
+        pt << :ready
+        Ractor.receive
+        2000.times.map { q.call }.last
+      end
+      port.receive
+      eval('PR.(true)')
+      3.times { GC.start }
+      keep = []
+      400.times { keep << Array.new(20_000) { "aaaaaaaa".dup }; keep.shift if keep.size > 40 }
+      r << :go
+      assert_equal [], r.value
+    RUBY
+  end
+
   def test_shareability_error_uses_inspect
     x = (+"").instance_exec { method(:to_s) }
     def x.to_s
