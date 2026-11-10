@@ -1590,6 +1590,7 @@ rb_gc_imemo_needs_cleanup_p(VALUE obj)
       case imemo_callcache:
       case imemo_throw_data:
       case imemo_cvar_entry:
+      case imemo_tombstone:
         return false;
 
       case imemo_env:
@@ -1973,6 +1974,93 @@ rb_gc_obj_free(void *objspace, VALUE obj)
     else {
         return TRUE;
     }
+}
+
+bool
+rb_gc_obj_tombstone_p(VALUE obj)
+{
+    return RB_BUILTIN_TYPE(obj) == T_IMEMO && imemo_type(obj) == imemo_tombstone;
+}
+
+/* Whether rb_gc_mark_children(obj) would reach nothing but obj's class, which is always
+ * shareable (class_alloc). */
+bool
+rb_gc_obj_leaf_p(VALUE obj)
+{
+    VALUE flags = RBASIC(obj)->flags;
+
+    if (flags & RUBY_FL_WEAK_REFERENCE) return false;
+    if (rb_obj_gen_fields_p(obj)) return false;
+
+    switch (flags & RUBY_T_MASK) {
+      case T_FLOAT:
+      case T_BIGNUM:
+        return true;
+      case T_STRING:
+        return !STR_SHARED_P(obj);
+      case T_ARRAY:
+        return !ARY_SHARED_P(obj) && RARRAY_LEN(obj) == 0;
+      case T_HASH:
+        return RHASH_SIZE(obj) == 0 && SPECIAL_CONST_P(RHASH(obj)->ifnone);
+      case T_RATIONAL:
+        return SPECIAL_CONST_P(RRATIONAL(obj)->num) && SPECIAL_CONST_P(RRATIONAL(obj)->den);
+      case T_COMPLEX:
+        return SPECIAL_CONST_P(RCOMPLEX(obj)->real) && SPECIAL_CONST_P(RCOMPLEX(obj)->imag);
+      case T_IMEMO:
+        return imemo_type(obj) == imemo_tombstone;
+      default:
+        return false;
+    }
+}
+
+/* Whether rb_gc_obj_make_tombstone can take obj: its free must be immediate and
+ * self-contained (no finalizer, no deferred dfree) and it must not be frozen. Frozen
+ * unshareables can be upgraded to shareable by foreign readers. */
+bool
+rb_gc_obj_tombstoneable_p(VALUE obj)
+{
+    VALUE flags = RBASIC(obj)->flags;
+
+    if (flags & (FL_SHAREABLE | FL_FINALIZE | FL_FREEZE)) return false;
+
+    switch (flags & RUBY_T_MASK) {
+      case T_OBJECT:
+      case T_STRING:
+      case T_ARRAY:
+      case T_HASH:
+      case T_STRUCT:
+      case T_FLOAT:
+      case T_BIGNUM:
+      case T_RATIONAL:
+      case T_COMPLEX:
+      case T_MATCH:
+        return true;
+      default:
+        return false;
+    }
+}
+
+/* Free obj's body but keep its slot, rewritten as a childless, unshareable imemo_tombstone.
+ * This is for an unshareable object no shareable one currently references. Another Ractor
+ * may be about to read its flags, so the slot must stay allocated until a global GC. */
+void
+rb_gc_obj_make_tombstone(void *objspace, VALUE obj)
+{
+    RUBY_ASSERT(rb_gc_obj_tombstoneable_p(obj));
+    VALUE promoted = RBASIC(obj)->flags & FL_PROMOTED;
+
+    rb_gc_obj_free_vm_weak_references(obj);
+    bool freed = rb_gc_obj_free(objspace, obj);
+    RUBY_ASSERT(freed);
+    (void)freed;
+
+    RBASIC_SET_CLASS_RAW(obj, 0);
+#if RBASIC_SHAPE_ID_FIELD
+    RBASIC(obj)->shape_id = 0;
+#endif
+    /* One store: a concurrent reader sees the old or the new header, unshareable in both. Still racy, but
+     * benign if readers check shareability before accessing other fields of the object. */
+    RBASIC(obj)->flags = T_IMEMO | ((VALUE)imemo_tombstone << FL_USHIFT) | promoted;
 }
 
 void

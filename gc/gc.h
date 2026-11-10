@@ -105,6 +105,10 @@ MODULAR_GC_FN void rb_gc_trigger_postponed_job_on_main(rb_postponed_job_handle_t
 MODULAR_GC_FN void rb_gc_unset_pending_interrupt(void);
 MODULAR_GC_FN void rb_gc_obj_free_vm_weak_references(VALUE obj);
 MODULAR_GC_FN bool rb_gc_obj_free(void *objspace, VALUE obj);
+MODULAR_GC_FN bool rb_gc_obj_tombstoneable_p(VALUE obj);
+MODULAR_GC_FN void rb_gc_obj_make_tombstone(void *objspace, VALUE obj);
+MODULAR_GC_FN bool rb_gc_obj_tombstone_p(VALUE obj);
+MODULAR_GC_FN bool rb_gc_obj_leaf_p(VALUE obj);
 MODULAR_GC_FN void rb_gc_save_machine_context(void);
 MODULAR_GC_FN void rb_gc_mark_roots(void *objspace, const char **categoryp);
 MODULAR_GC_FN bool rb_gc_multi_ractor_p(void);

@@ -54,6 +54,7 @@ rb_imemo_name(enum imemo_type type)
         IMEMO_NAME(fields);
         IMEMO_NAME(subclasses);
         IMEMO_NAME(cdhash);
+        IMEMO_NAME(tombstone);
 #undef IMEMO_NAME
     }
     rb_bug("unreachable");
@@ -329,6 +330,8 @@ rb_imemo_memsize(VALUE obj)
         size += st_memsize(rb_imemo_cdhash_tbl(obj)) - sizeof(st_table);
 
         break;
+      case imemo_tombstone:
+        break;
       default:
         rb_bug("unreachable");
     }
@@ -603,6 +606,8 @@ rb_imemo_mark_and_move(const struct rb_gc_mark_ctx *ctx, VALUE obj, bool referen
         }
         break;
       }
+      case imemo_tombstone:
+        break;
       default:
         rb_bug("unreachable");
     }
@@ -719,6 +724,8 @@ rb_imemo_free(VALUE obj)
         st_free_embedded_table(rb_imemo_cdhash_tbl(obj));
         RB_DEBUG_COUNTER_INC(obj_imemo_cdhash);
 
+        break;
+      case imemo_tombstone:
         break;
       default:
         rb_bug("unreachable");

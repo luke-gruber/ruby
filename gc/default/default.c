@@ -704,8 +704,8 @@ typedef struct rb_objspace {
     size_t incremental_mark_step_allocated_slots;
 
     /* Inputs of the global GC trigger, all owned by this objspace's thread.
-     * shareable_objects is the live population of shareable objects; exceeding the
-     * limit requests a global GC. */
+     * shareable_objects is the live population of shareable objects plus the tombstones
+     * made since the last global GC; exceeding the limit requests a global GC. */
     size_t shareable_objects;
     size_t shareable_objects_limit;
     /* Whether the last mark ran the pinned walk; the sweep asserts on it. */
@@ -1285,6 +1285,13 @@ slot_offset_aligned_p(const struct heap_page *page, uintptr_t p)
 #define GET_HEAP_SHAREABLE_BITS(x)      (&GET_HEAP_PAGE(x)->shareable_bits[0])
 #define GET_HEAP_SHREF_BITS(x)          (&GET_HEAP_PAGE(x)->shref_bits[0])
 #define GET_HEAP_OBJSPACE(x)            (GET_HEAP_PAGE(x)->objspace)
+
+/* On a shref'd object: some referring shareable object lives in another objspace, which
+ * this objspace's local GC cannot trace.  Without it, every referrer is local, so a local
+ * full mark that does not reach the object proves no shareable slot holds it any more and
+ * it can be retired to a tombstone (pinned_shrefs_retire).  Written only by the owner
+ * (write barrier) or a global GC; a stale set bit only delays reclamation. */
+#define GC_FL_FOREIGN_SHREF RUBY_FL_UNUSED6
 
 /* obj lives on a page of another objspace, not the current one (i.e. it is foreign). */
 static inline bool
@@ -6506,7 +6513,11 @@ gc_mark(rb_objspace_t *objspace, VALUE obj)
     if (RB_UNLIKELY(objspace->flags.during_global_gc)) {
         /* Recompute the shref of every shareable -> unshareable edge, within and across
          * objspaces: the clear pass dropped all shref bits and the write barrier
-         * maintains them from here on. */
+         * maintains them from here on.  The foreign flag is recomputed the same way,
+         * dropping a stale one on the first visit. */
+        if (RB_FL_TEST_RAW(obj, GC_FL_FOREIGN_SHREF) && !RVALUE_MARKED_BITMAP(obj)) {
+            RB_FL_UNSET_RAW(obj, GC_FL_FOREIGN_SHREF);
+        }
         VALUE parent = objspace->rgengc.parent_object;
         if (!UNDEF_P(parent) && parent != Qfalse &&
             RB_FL_TEST_RAW(parent, RUBY_FL_SHAREABLE) &&
@@ -6514,6 +6525,9 @@ gc_mark(rb_objspace_t *objspace, VALUE obj)
             struct heap_page *page = GET_HEAP_PAGE(obj);
             _MARK_IN_BITMAP(page->shref_bits, page, obj);
             page->flags.has_shref_objects = TRUE;
+            if (GET_HEAP_OBJSPACE(parent) != page->objspace) {
+                RB_FL_SET_RAW(obj, GC_FL_FOREIGN_SHREF);
+            }
         }
     }
 
@@ -6672,6 +6686,7 @@ gc_mark_set_parent_invalid(rb_objspace_t *objspace)
 }
 
 static void pinned_roots_mark(rb_objspace_t *objspace, rb_heap_t *heap);
+static void pinned_shrefs_retire(rb_objspace_t *objspace, bool make_tombstone);
 
 static void
 mark_roots(rb_objspace_t *objspace, const char **categoryp)
@@ -7743,6 +7758,9 @@ rb_gc_impl_handle_weak_references_alive_p(void *objspace_ptr, VALUE obj)
     bool marked = RVALUE_MARKED(objspace, obj);
 
     if (marked) {
+        /* A tombstone is kept only for racing readers of its flags; to a weak
+         * reference it is dead. */
+        if (RB_UNLIKELY(rb_gc_obj_tombstone_p(obj))) return false;
         rgengc_check_relation(objspace, obj);
     }
 
@@ -7819,6 +7837,11 @@ gc_marks_finish(rb_objspace_t *objspace)
         }
         /* And everything they keep alive. */
         gc_mark_stacked_objects_all(objspace);
+
+        if (is_full_marking(objspace)) {
+            pinned_shrefs_retire(objspace, false);
+            pinned_shrefs_retire(objspace, true);
+        }
     }
 
     gc_update_weak_references(objspace);
@@ -8159,11 +8182,29 @@ gc_marks_continue(rb_objspace_t *objspace, rb_heap_t *heap)
  *   shareable object can live in another objspace or in an in-flight message queue.  The
  *   write barrier maintains them.
  * Skipped while the VM has a single Ractor: a local GC is then a whole-world GC and
- * shareable objects may die normally. */
+ * shareable objects may die normally.
+ *
+ * A full mark traverses the shareable objects too and leaves the shrefs whose referrers
+ * are all local (no GC_FL_FOREIGN_SHREF) to pinned_shrefs_retire: tracing decides whether
+ * one is still referenced. */
+/* gc_mark, but a leaf is not pushed: its only child is its class, which is shareable and
+ * so rooted by pinned_roots_mark itself. */
+static void
+pinned_mark(rb_objspace_t *objspace, VALUE obj)
+{
+    if (rb_gc_obj_leaf_p(obj)) {
+        if (gc_mark_set(objspace, obj)) gc_aging(objspace, obj);
+    }
+    else {
+        gc_mark(objspace, obj);
+    }
+}
+
 static void
 pinned_roots_mark(rb_objspace_t *objspace, rb_heap_t *heap)
 {
     struct heap_page *page = NULL;
+    const bool full_mark = is_full_marking(objspace);
 
     /* Runs before mark_roots, so rgengc_check_relation sees a valid (absent) parent rather
      * than the poison left by the previous GC. */
@@ -8206,7 +8247,13 @@ pinned_roots_mark(rb_objspace_t *objspace, rb_heap_t *heap)
                           default:
                             gc_report(2, objspace, "pinned_roots_mark: mark %s\n", rb_obj_info(obj));
                             if (sr_bits & 1) {
-                                gc_mark(objspace, obj);          /* shref: root + traverse */
+                                if (!full_mark || RB_FL_TEST_RAW(obj, GC_FL_FOREIGN_SHREF)) {
+                                    pinned_mark(objspace, obj);  /* shref: root + traverse */
+                                }
+                            }
+                            else if (full_mark) {
+                                pinned_mark(objspace, obj);      /* shareable: root + traverse */
+                                gc_pin(objspace, obj);
                             }
                             else if (gc_mark_set(objspace, obj)) {
                                 gc_aging(objspace, obj);         /* shareable: mark, no traverse */
@@ -8226,6 +8273,68 @@ pinned_roots_mark(rb_objspace_t *objspace, rb_heap_t *heap)
             p += BITS_BITLENGTH * slot_size;
         }
     }
+}
+
+/* After a full local mark, a shref still unmarked has only local referrers (the foreign
+ * ones were rooted by pinned_roots_mark) and none of them holds it any more. Its children
+ * belong to nothing and can be swept. The object itself may still be in another Ractor's
+ * hands, loaded from a shareable slot just before the overwrite, so its slot is kept as a
+ * tombstone until a global GC. A type that cannot be tombstoned is kept whole, as before,
+ * and is rooted (and drained) first. What it reaches must not be tombstoned under it. */
+static void
+pinned_shrefs_retire(rb_objspace_t *objspace, bool create_tombstone)
+{
+    gc_mark_set_parent_raw(objspace, Qundef, false);
+
+    for (int i = 0; i < HEAP_COUNT; i++) {
+        struct heap_page *page = NULL;
+        ccan_list_for_each(&heaps[i].pages, page, page_node) {
+            if (!page->flags.has_shref_objects) continue;
+
+            uintptr_t p = page->start;
+            short slot_size = page->slot_size;
+            int bitmap_plane_count = CEILDIV(page->total_slots, BITS_BITLENGTH);
+
+            for (int j = 0; j < bitmap_plane_count; j++) {
+                bits_t bitset = page->shref_bits[j] & ~page->mark_bits[j];
+                uintptr_t pp = p;
+                while (bitset) {
+                    if (bitset & 1) {
+                        VALUE obj = (VALUE)pp;
+                        asan_unpoisoning_object(obj) {
+                            switch (BUILTIN_TYPE(obj)) {
+                              case T_NONE:
+                              case T_ZOMBIE:
+                              case T_MOVED:
+                                break;
+                              default:
+                                GC_ASSERT(!RB_FL_TEST_RAW(obj, GC_FL_FOREIGN_SHREF));
+                                if (rb_gc_obj_tombstone_p(obj)) {
+                                    if (create_tombstone) pinned_mark(objspace, obj);
+                                }
+                                else if (!rb_gc_obj_tombstoneable_p(obj)) {
+                                    if (!create_tombstone) pinned_mark(objspace, obj);
+                                }
+                                else if (create_tombstone) {
+                                    gc_report(2, objspace, "pinned_shrefs_retire: %s\n", rb_obj_info(obj));
+                                    rb_gc_obj_make_tombstone(objspace, obj);
+                                    /* Garbage only a global GC reclaims: count it toward one. */
+                                    objspace->shareable_objects++;
+                                    pinned_mark(objspace, obj);
+                                }
+                                break;
+                            }
+                        }
+                    }
+                    pp += slot_size;
+                    bitset >>= 1;
+                }
+                p += BITS_BITLENGTH * slot_size;
+            }
+        }
+    }
+
+    gc_mark_stacked_objects_all(objspace);
 }
 
 static void
@@ -8588,6 +8697,9 @@ rb_gc_impl_writebarrier(void *objspace_ptr, VALUE a, VALUE b)
             _MARK_IN_BITMAP(bpage->shref_bits, bpage, b);
             bpage->flags.has_shref_objects = TRUE;
         }
+        if (RB_UNLIKELY(GET_HEAP_OBJSPACE(a) != bpage->objspace)) {
+            RB_FL_SET_RAW(b, GC_FL_FOREIGN_SHREF);
+        }
     }
 
     if (!is_incremental_marking(objspace)) {
@@ -8630,6 +8742,7 @@ rb_gc_impl_obj_became_shareable(void *objspace_ptr, VALUE obj)
         _CLEAR_IN_BITMAP(page->shref_bits, page, obj);
         // NOTE: page->has_shref_objects could become stale here (value is true even though logically false)
     }
+    RB_FL_UNSET_RAW(obj, GC_FL_FOREIGN_SHREF);
 }
 
 void

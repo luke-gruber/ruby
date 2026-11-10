@@ -82,6 +82,7 @@ module RubyTimelineTool
     imemo_fields:       13,
     imemo_subclasses:   14,
     imemo_cdhash:       15,
+    imemo_tombstone:    16,
   })
 
   # Keep in sync with `IMEMO_MASK` in `internal/imemo.h`.

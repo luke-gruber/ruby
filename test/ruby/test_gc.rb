@@ -1764,6 +1764,94 @@ class TestGc < Test::Unit::TestCase
     RUBY
   end
 
+  # An unshareable value overwritten in a shareable slot (a class ivar) used to stay a
+  # shref root, keeping its whole graph alive until a global GC.  A local major now keeps
+  # only its slot, as a tombstone, and frees what it referenced.
+  def test_local_major_gc_frees_graph_of_overwritten_shref
+    omit 'default GC only' unless GC.config[:implementation] == 'default'
+    assert_ractor(<<~'RUBY')
+      class C; class << self; attr_accessor :obj; end; end
+      r = Ractor.new { Ractor.receive }
+      children = ObjectSpace::WeakMap.new
+      holders = ObjectSpace::WeakMap.new
+      n = 1000
+      GC.disable
+      n.times do |i|
+        inner = Object.new
+        holder = [inner]
+        children[inner] = i
+        holders[holder] = i
+        C.obj = holder
+      end
+      C.obj = nil
+
+      before = GC.stat(:global_gc_count)
+      GC.start(global: false)
+      assert_equal before, GC.stat(:global_gc_count)
+      assert_operator children.size, :<, n / 2
+      # A tombstone is dead to weak references.
+      assert_operator holders.size, :<, n / 2
+      r.send(:done)
+    RUBY
+  end
+
+  def test_local_major_gc_keeps_referenced_shref
+    omit 'default GC only' unless GC.config[:implementation] == 'default'
+    assert_ractor(<<~'RUBY')
+      class C; class << self; attr_accessor :obj; end; end
+      r = Ractor.new { Ractor.receive }
+      C.obj = [+"alive"]
+      GC.start(global: false)
+      GC.start(global: false)
+      assert_equal ["alive"], C.obj
+      r.send(:done)
+    RUBY
+  end
+
+  # A shareable object only another Ractor still references is traversed by a local
+  # major, so the unshareable values it holds are not retired.
+  def test_local_major_gc_keeps_shref_of_shareable_held_by_other_ractor
+    omit 'default GC only' unless GC.config[:implementation] == 'default'
+    assert_ractor(<<~'RUBY')
+      r = Ractor.new { k = Ractor.receive; Ractor.receive; k }
+      def make_class
+        k = Class.new { class << self; attr_accessor :obj; end }
+        k.obj = [+"payload"]
+        k
+      end
+      r.send(make_class)
+      GC.start(global: false)
+      GC.start(global: false)
+      r.send(:go)
+      assert_equal ["payload"], r.value.obj
+    RUBY
+  end
+
+  # Another Ractor's read of an unshareable class ivar loads the value before checking its
+  # flags; an overwrite plus local GC in between must leave the slot readable.
+  def test_local_gc_racing_unshareable_class_ivar_reader
+    omit 'default GC only' unless GC.config[:implementation] == 'default'
+    assert_ractor(<<~'RUBY')
+      class C; class << self; attr_accessor :obj; end; end
+      C.obj = [Object.new]
+      reads = 20_000
+      r = Ractor.new(reads) do |reads|
+        errors = 0
+        reads.times do
+          C.obj
+        rescue Ractor::IsolationError
+          errors += 1
+        end
+        errors
+      end
+      500.times do |i|
+        C.obj = [Object.new]
+        GC.start(global: false) if i % 10 == 0
+      end
+      assert_equal reads, r.value
+    RUBY
+  end
+
   def test_gc_start_ractor_global_true
     omit "no GC.stat(:global_gc_count)" unless GC.stat.key?(:global_gc_count)
     assert_ractor(<<~'RUBY')
