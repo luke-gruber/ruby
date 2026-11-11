@@ -312,6 +312,9 @@ bool rb_gc_handle_weak_references_alive_p(void *objspace, VALUE obj);
 void rb_objspace_each_objects(
     int (*callback)(void *start, void *end, size_t stride, void *data),
     void *data);
+void rb_objspace_each_objects_local(
+    int (*callback)(void *start, void *end, size_t stride, void *data),
+    void *data);
 
 
 size_t rb_gc_obj_slot_size(VALUE obj);

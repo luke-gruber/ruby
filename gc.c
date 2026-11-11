@@ -4463,7 +4463,8 @@ each_objects_foreign_i(void *objspace, void *arg)
  * Ractor: the set of heap pages must not change under the callback, and a
  * GC is stop-the-world.  Because of that, the callback must not wait on
  * another Ractor (e.g. send/receive) -- they are all suspended and it
- * would deadlock.
+ * would deadlock. Use rb_objspace_each_objects_local() for a callback that
+ * runs Ruby.
  *
  * This is a sample callback code to iterate liveness objects:
  *
@@ -4505,6 +4506,14 @@ rb_objspace_each_objects(int (*callback)(void *, void *, size_t, void *), void *
         struct each_objects_foreign_arg arg = { self, callback, data };
         rb_gc_vm_each_objspace(each_objects_foreign_i, &arg);
     }
+}
+
+/* Like rb_objspace_each_objects(), but walking only the calling Ractor's own objspace.
+ * No lock is taken, so the callback may run Ruby. */
+void
+rb_objspace_each_objects_local(int (*callback)(void *, void *, size_t, void *), void *data)
+{
+    rb_gc_impl_each_objects(rb_gc_get_objspace(), callback, data);
 }
 
 /* Enumerate live, creating, and zombie objspaces under the VM lifetime lock.
