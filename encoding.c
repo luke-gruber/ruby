@@ -351,6 +351,7 @@ static int
 enc_table_expand(struct enc_table *enc_table, int newsize)
 {
     if (newsize > ENCODING_LIST_CAPA) {
+        if (RB_VM_LOCKED_P()) RB_VM_UNLOCK();
         rb_raise(rb_eEncodingError, "too many encoding (> %d)", ENCODING_LIST_CAPA);
     }
     return newsize;
@@ -2091,7 +2092,9 @@ Init_unicode_version(void)
 void
 Init_encodings(void)
 {
-    rb_enc_init(&global_enc_table);
+    RB_VM_LOCKING() {
+        rb_enc_init(&global_enc_table);
+    }
 }
 
 /* locale insensitive ctype functions */

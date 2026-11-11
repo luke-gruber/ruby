@@ -3931,7 +3931,10 @@ const_added(VALUE klass, ID const_name)
 {
     if (GET_VM()->running) {
         VALUE arg = ID2SYM(const_name);
+        bool is_locked = RB_VM_LOCKED_P();
+        if (is_locked) RB_VM_UNLOCK();
         rb_funcallv_uncached(klass, idConst_added, 1, &arg);
+        if (is_locked) RB_VM_LOCK();
     }
 }
 
