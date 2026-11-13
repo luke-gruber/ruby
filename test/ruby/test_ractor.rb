@@ -781,6 +781,75 @@ class TestRactor < Test::Unit::TestCase
     RUBY
   end
 
+  # The expanded load path cache hangs off the box, which only the main Ractor's GC
+  # marks, so a stale cache must be rebuilt on the main Ractor: one built in another
+  # Ractor's objspace would be freed by that Ractor's next local GC.  Allocation (not
+  # GC.start, which escalates to a global GC that marks the box) drives those GCs.
+  def test_load_from_ractor_with_stale_load_path_cache
+    assert_ractor(<<~'RUBY')
+      require "tmpdir"
+      Dir.mktmpdir do |dir|
+        File.write(File.join(dir, "ractor_load_stale_cache.rb"), "")
+        $LOAD_PATH.unshift(dir)
+        3.times do |i|
+          $LOAD_PATH.unshift(File.join(dir, "nonexistent#{i}"))
+          r = Ractor.new do
+            result = load("ractor_load_stale_cache.rb")
+            200_000.times { |j| "s#{j}" }
+            result
+          end
+          assert_equal true, r.value
+          5.times { assert_equal true, load("ractor_load_stale_cache.rb") }
+        end
+      end
+    RUBY
+  end
+
+  def test_load_from_ractor_wrap
+    assert_ractor(<<~'RUBY')
+      require "tempfile"
+      f = Tempfile.new(["ractor_load_wrap", ".rb"])
+      f.write("RACTOR_LOAD_WRAPPED = 1")
+      f.flush
+      assert_equal true, Ractor.new(f.path) { |path| load(path, true) }.value
+      refute Object.const_defined?(:RACTOR_LOAD_WRAPPED)
+      assert_equal true, Ractor.new(f.path) { |path| load(path) }.value
+      assert_equal 1, RACTOR_LOAD_WRAPPED
+    RUBY
+  end
+
+  def test_load_from_ractor_wrap_module
+    assert_ractor(<<~'RUBY')
+      require "tempfile"
+      f = Tempfile.new(["ractor_load_wrap_module", ".rb"])
+      f.write("RACTOR_LOAD_INTO = :loaded")
+      f.flush
+
+      main_mod = Module.new
+      results = Ractor.new(main_mod, f.path) do |from_main, path|
+        [from_main, Module.new].map do |mod|
+          load(path, mod)
+        rescue Ractor::IsolationError => e
+          e.message
+        end
+      end.value
+      assert_equal ["can not load with a wrap module from a non-main Ractor"] * 2, results
+      refute main_mod.const_defined?(:RACTOR_LOAD_INTO)
+      refute Object.const_defined?(:RACTOR_LOAD_INTO)
+    RUBY
+  end
+
+  def test_load_from_ractor_missing_file
+    assert_ractor(<<~'RUBY')
+      err = Ractor.new do
+        load("ractor_load_no_such_file_xyz.rb")
+      rescue LoadError => e
+        [e.class, e.message]
+      end.value
+      assert_equal [LoadError, "cannot load such file -- ractor_load_no_such_file_xyz.rb"], err
+    RUBY
+  end
+
   # Ex: Rubygems redefines require before single-ractor mode is cancelled. The redefined require
   # from a gem like rubygems should run in the main Ractor regardless of whether the gem is loaded
   # before or after single ractor mode is cancelled.

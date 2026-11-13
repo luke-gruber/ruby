@@ -13,6 +13,7 @@
 #include "internal/complex.h"
 #include "internal/cont.h"
 #include "internal/error.h"
+#include "internal/file.h"
 #include "internal/gc.h"
 #include "internal/hash.h"
 #include "internal/object.h"
@@ -4116,8 +4117,13 @@ struct cross_ractor_require {
             VALUE module;
             ID name;
         } autoload;
+
+        struct {
+            VALUE fname;
+        } load;
     } as;
 
+    bool load_wrap;
     bool silent;
 };
 
@@ -4300,6 +4306,61 @@ rb_ractor_autoload_load(VALUE module, ID name)
     rb_ractor_interrupt_exec(main_r, ractor_autoload_load_func, (void *)crr_obj, rb_interrupt_exec_flag_value_data);
 
     // wait for require done
+    VALUE results = ractor_port_receive(ec, crr->port, Qnil);
+    ractor_port_close(ec, crr->port);
+
+    VALUE exc = rb_ary_pop(results);
+    VALUE result = rb_ary_pop(results);
+    RB_GC_GUARD(crr_obj);
+
+    if (RTEST(exc)) {
+        rb_exc_raise(result);
+    }
+    else {
+        return result;
+    }
+}
+
+static VALUE
+load_body(VALUE crr_obj)
+{
+    struct cross_ractor_require *crr;
+    TypedData_Get_Struct(crr_obj, struct cross_ractor_require, &cross_ractor_require_data_type, crr);
+    return rb_load_entrypoint(crr->as.load.fname, RBOOL(crr->load_wrap));
+}
+
+static VALUE
+ractor_load_func(void *crr_obj)
+{
+    return ractor_require_protect((VALUE)crr_obj, load_body);
+}
+
+VALUE
+rb_ractor_load(VALUE fname, VALUE wrap)
+{
+    // We're about to block on the main ractor, so if we're holding the global lock we'll deadlock.
+    ASSERT_vm_unlocking();
+
+    // The file runs on the main Ractor, which can't define constants or methods in a
+    // module owned by this one, and its allocations would land in main's objspace.
+    if (RB_TYPE_P(wrap, T_MODULE)) {
+        rb_raise(rb_eRactorIsolationError, "can not load with a wrap module from a non-main Ractor");
+    }
+
+    fname = rb_fstring(rb_get_path_check_to_string(fname));
+
+    struct cross_ractor_require *crr;
+    VALUE crr_obj = TypedData_Make_Struct(0, struct cross_ractor_require, &cross_ractor_require_data_type, crr);
+    RB_OBJ_SET_SHAREABLE(crr_obj); // TODO: internal data?
+
+    RB_OBJ_WRITE(crr_obj, &crr->as.load.fname, fname);
+    crr->load_wrap = RTEST(wrap);
+    RB_OBJ_WRITE(crr_obj, &crr->port, rb_ractor_make_shareable(ractor_port_new(GET_RACTOR())));
+
+    rb_execution_context_t *ec = GET_EC();
+    rb_ractor_t *main_r = GET_VM()->ractor.main_ractor;
+    rb_ractor_interrupt_exec(main_r, ractor_load_func, (void *)crr_obj, rb_interrupt_exec_flag_value_data);
+
     VALUE results = ractor_port_receive(ec, crr->port, Qnil);
     ractor_port_close(ec, crr->port);
 

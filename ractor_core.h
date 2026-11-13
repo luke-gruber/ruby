@@ -260,6 +260,7 @@ void rb_ractor_atfork(rb_vm_t *vm, rb_thread_t *th);
 void rb_ractor_terminate_atfork(rb_vm_t *vm, rb_ractor_t *th);
 VALUE rb_ractor_require(VALUE feature, bool silent);
 VALUE rb_ractor_autoload_load(VALUE space, ID id);
+VALUE rb_ractor_load(VALUE fname, VALUE wrap);
 
 VALUE rb_ractor_ensure_shareable(VALUE obj, VALUE name);
 st_table *rb_ractor_targeted_hooks(rb_ractor_t *cr);

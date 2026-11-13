@@ -1185,6 +1185,10 @@ rb_load_entrypoint(VALUE fname, VALUE wrap)
 {
     VALUE path, orig_fname;
 
+    if (!rb_ractor_main_p()) {
+        return rb_ractor_load(fname, wrap);
+    }
+
     orig_fname = rb_get_path_check_to_string(fname);
     fname = rb_str_encode_ospath(orig_fname);
     RUBY_DTRACE_HOOK(LOAD_ENTRY, RSTRING_PTR(orig_fname));
