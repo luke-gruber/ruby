@@ -1765,6 +1765,125 @@ assert_equal '[:m, :b, :s, :m2, :b2]', %q{
   [k.new.m, k.new.b, k.s, k2.new.m2, k2.new.b2].inspect
 }
 
+# Ids the middle Ractor never touched (a bmethod, a metaclass, the class) still name the
+# innermost one, so main resolves them through the chain inner -> middle -> main
+assert_equal '[:b, :s, :m]', %q{
+  k = Ractor.new do
+    Ractor.new do
+      k0 = Class.new
+      k0.define_method(:b) { :b }
+      k0.singleton_class
+      k0
+    end.value
+  end.value
+  b = k.new.b
+  k.singleton_class.define_method(:s) { :s }
+  k.define_method(:m) { :m }
+  [b, k.s, k.new.m].inspect
+}
+
+# A prune between two inheritances: the mark re-stamps the ids naming the inner Ractor
+# with the middle one, and the middle one's entry is added after the prune
+assert_equal '[:b, :s, :m]', %q{
+  k = Ractor.new do
+    k0 = Ractor.new do
+      c = Class.new
+      c.define_method(:b) { :b }
+      c.singleton_class
+      c
+    end.value
+    GC.start # global: main's objspace exists
+    k0
+  end.value
+  b = k.new.b
+  k.singleton_class.define_method(:s) { :s }
+  k.define_method(:m) { :m }
+  [b, k.s, k.new.m].inspect
+}
+
+# The last heir of a chain need not be main, and only it may modify the class
+assert_equal '[:b, :m, Ractor::IsolationError]', %q{
+  port = Ractor::Port.new
+  r = Ractor.new(port) do |port|
+    k = Ractor.new do
+      Ractor.new { Class.new.tap { _1.define_method(:b) { :b } } }.value
+    end.value
+    k.define_method(:m) { :m }
+    port << [k.new.b, k.new.m, k]
+    Ractor.receive
+  end
+  b, m, k = port.receive
+  main = begin
+    k.define_method(:x) {}
+    :no_error
+  rescue Ractor::IsolationError => e
+    e.class
+  end
+  r << :done
+  r.join
+  [b, m, main].inspect
+}
+
+# A module the dead Ractor created, and the module's singleton class, are inherited too
+assert_equal '[:m, :s, :c]', %q{
+  mod = Ractor.new { Module.new }.value
+  mod.define_method(:m) { :m }
+  mod.define_singleton_method(:s) { :s }
+  mod.const_set(:C, :c)
+  [Class.new { include mod }.new.m, mod.s, mod::C].inspect
+}
+
+# Main inherits from a Ractor whose value nobody took, once its handle is collected
+assert_equal ':m', %q{
+  port = Ractor::Port.new
+  # on a thread of its own, so no stale slot in main's machine stack keeps the handle alive
+  Thread.new { Ractor.new(port) { |port| port << Class.new; nil }.join; nil }.join
+  k = port.receive
+  inherited = 100.times.any? do
+    GC.start
+    Thread.pass # the orphan merge is a postponed job on main
+    k.define_method(:m) { :m }
+    true
+  rescue Ractor::IsolationError
+    false
+  end
+  inherited ? k.new.m.inspect : 'never inherited'
+}
+
+# Inheriting a class does not let other Ractors read its unshareable ivars, whether the
+# dead Ractor or the heir set them; shareable ones stay readable
+assert_equal '[Ractor::IsolationError, Ractor::IsolationError, :s]', %q{
+  k = Ractor.new do
+    k0 = Class.new
+    k0.instance_variable_set(:@dead, +'set by the dead Ractor')
+    k0
+  end.value
+  k.instance_variable_set(:@heir, +'set by the heir')
+  k.instance_variable_set(:@s, :s)
+  read = ->(name) do
+    Ractor.new(k, name) { |k, name| k.instance_variable_get(name) }.value
+  rescue Ractor::RemoteError => e
+    e.cause.class
+  end
+  [read.(:@dead), read.(:@heir), read.(:@s)].inspect
+}
+
+# A moved object's singleton class belongs to the receiver, and so passes to the
+# receiver's heir; taking it over is the only id the receiver records
+assert_equal '[:foo, :bar]', %q{
+  r = Ractor.new do
+    o = Ractor.receive
+    def o.foo = :foo
+    o
+  end
+  o = Object.new
+  def o.before_move = nil
+  r.send(o, move: true)
+  o = r.value
+  def o.bar = :bar
+  [o.foo, o.bar].inspect
+}
+
 # Getting non-shareable objects via constants by other Ractors is not allowed
 assert_equal 'can not access non-shareable objects in constant C::CONST of a class/module created by another Ractor.', <<~'RUBY', frozen_string_literal: false
   class C
