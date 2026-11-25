@@ -7467,10 +7467,13 @@ fn gen_send_bmethod(
     let iseq = unsafe { *capture.code.iseq.as_ref() };
 
     if !procv.shareable_p() {
-        let ractor_serial = unsafe { rb_yjit_cme_ractor_serial(cme) };
-        asm_comment!(asm, "guard current ractor == {}", ractor_serial);
+        // Read the id at run time: the Ractor that inherits the defining one rewrites it.
+        let defined_ractor_id_ptr = unsafe { rb_yjit_bmethod_defined_ractor_id_ptr(cme) };
+        asm_comment!(asm, "guard current ractor == defining ractor");
+        let defined_ractor_id_base = asm.load(Opnd::const_ptr(defined_ractor_id_ptr as *const u8));
+        let defined_ractor_id = asm.load(Opnd::mem(64, defined_ractor_id_base, 0));
         let current_ractor_serial = asm.load(Opnd::mem(64, EC, RUBY_OFFSET_EC_RACTOR_ID as i32));
-        asm.cmp(current_ractor_serial, ractor_serial.into());
+        asm.cmp(current_ractor_serial, defined_ractor_id);
         asm.jne(Target::side_exit(Counter::send_bmethod_ractor));
     }
 

@@ -1115,6 +1115,18 @@ class TestYJIT < Test::Unit::TestCase
     RUBY
   end
 
+  def test_bmethod_inherited_from_terminated_ractor
+    # Main inherits foo by taking the value. The guard used to compare against the
+    # defining Ractor's id as of compile time, so every call from main side-exited.
+    stats = assert_compiles(<<~RUBY, result: 100, exits: :any)
+      Warning[:experimental] = false
+      klass = Ractor.new { Class.new { define_method(:foo) { 1 } } }.value
+      obj = klass.new
+      100.times.sum { obj.foo }
+    RUBY
+    assert_operator stats[:send_bmethod_ractor], :<=, 1
+  end
+
   def test_bug_22116
     # Regression test from report which used to crash during environment escape
     # to pass block to Hash.new

@@ -434,10 +434,10 @@ rb_yjit_invokeblock_sp_pops(const struct rb_callinfo *ci)
     return 1 - sp_inc_of_invokeblock(ci); // + 1 to ignore return value push
 }
 
-rb_serial_t
-rb_yjit_cme_ractor_serial(const rb_callable_method_entry_t *cme)
+const uint64_t *
+rb_yjit_bmethod_defined_ractor_id_ptr(const rb_callable_method_entry_t *cme)
 {
-    return (rb_serial_t)ATOMIC_U64_LOAD_RELAXED(cme->def->body.bmethod.defined_ractor_id);
+    return &cme->def->body.bmethod.defined_ractor_id;
 }
 
 bool

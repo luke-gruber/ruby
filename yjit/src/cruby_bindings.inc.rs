@@ -1290,7 +1290,9 @@ extern "C" {
     pub fn rb_yjit_shape_index(shape_id: shape_id_t) -> attr_index_t;
     pub fn rb_yjit_sendish_sp_pops(ci: *const rb_callinfo) -> usize;
     pub fn rb_yjit_invokeblock_sp_pops(ci: *const rb_callinfo) -> usize;
-    pub fn rb_yjit_cme_ractor_serial(cme: *const rb_callable_method_entry_t) -> rb_serial_t;
+    pub fn rb_yjit_bmethod_defined_ractor_id_ptr(
+        cme: *const rb_callable_method_entry_t,
+    ) -> *const u64;
     pub fn rb_yjit_attached_object_is(klass: VALUE, object: VALUE) -> bool;
     pub fn rb_yjit_set_exception_return(
         cfp: *mut rb_control_frame_t,

@@ -271,7 +271,7 @@ fn main() {
         .allowlist_function("rb_optimized_call")
         .allowlist_function("rb_yjit_sendish_sp_pops")
         .allowlist_function("rb_yjit_invokeblock_sp_pops")
-        .allowlist_function("rb_yjit_cme_ractor_serial")
+        .allowlist_function("rb_yjit_bmethod_defined_ractor_id_ptr")
         .allowlist_function("rb_yjit_attached_object_is")
         .allowlist_function("rb_yjit_set_exception_return")
         .allowlist_function("rb_jit_str_concat_codepoint")
