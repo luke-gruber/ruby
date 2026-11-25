@@ -4052,7 +4052,7 @@ rb_ractor_local_storage_ptr_set(rb_ractor_local_key_t key, void *ptr)
  * Owner checks resolve a recorded id through it (rb_class_owned_slow_p,
  * vm_bmethod_callable_p), so inheritance needs no help from the GC.  Lock-free readers;
  * writers (absorbing Ractors, and ractor_free on a GC thread) take ractor_heirs_lock.
- * Entries always name the final heir: inheriting a heir re-points them.  Open
+ * An entry names the direct heir; a lookup follows heirs that terminated in turn.  Open
  * addressing, key 0 empty, at most half full.  A stop-the-world complete mark rewrites
  * every recorded id it reaches (rb_ractor_heirs_rehome_*), after which the whole table,
  * including the copies left behind by growth, is freed (rb_ractor_heirs_prune).  Plain
@@ -4114,13 +4114,6 @@ rb_ractor_bequeath_id(rb_serial_t dead_id, rb_ractor_t *heir)
 
     rb_native_mutex_lock(&ractor_heirs_lock);
     struct ractor_heirs *t = ractor_heirs;
-    if (t) {
-        for (size_t i = 0; i < t->capa; i++) {
-            if (t->slots[i].id && t->slots[i].heir == dead_id) {
-                ATOMIC_U64_SET_RELAXED(t->slots[i].heir, heir_id);
-            }
-        }
-    }
     if (t == NULL || (t->cnt + 1) * 2 > t->capa) t = ractor_heirs_grow(t);
     ractor_heirs_insert(t, dead_id, heir_id);
     rb_native_mutex_unlock(&ractor_heirs_lock);
@@ -4135,18 +4128,28 @@ rb_ractor_bequeath(rb_ractor_t *dead, rb_ractor_t *heir)
     rb_ractor_bequeath_id(rb_ractor_id(dead), heir);
 }
 
-// the id of the Ractor that inherited the terminated Ractor id, or 0
-rb_serial_t
-rb_ractor_heir(rb_serial_t id)
+static rb_serial_t
+ractor_heirs_lookup(const struct ractor_heirs *t, rb_serial_t id)
 {
-    const struct ractor_heirs *t = RUBY_ATOMIC_PTR_LOAD(ractor_heirs);
-    if (t == NULL) return 0;
     size_t mask = t->capa - 1;
     for (size_t i = (size_t)id & mask;; i = (i + 1) & mask) {
         uint64_t key = ATOMIC_U64_LOAD_ACQUIRE(t->slots[i].id);
         if (key == id) return (rb_serial_t)ATOMIC_U64_LOAD_RELAXED(t->slots[i].heir);
         if (key == 0) return 0;
     }
+}
+
+// the id of the Ractor that last inherited the terminated Ractor id, or 0
+rb_serial_t
+rb_ractor_heir(rb_serial_t id)
+{
+    const struct ractor_heirs *t = RUBY_ATOMIC_PTR_LOAD(ractor_heirs);
+    if (t == NULL) return 0;
+    rb_serial_t heir = ractor_heirs_lookup(t, id);
+    if (heir == 0) return 0;
+    // a dead Ractor never becomes a heir, so the chain has no cycle
+    for (rb_serial_t next; (next = ractor_heirs_lookup(t, heir)) != 0; heir = next);
+    return heir;
 }
 
 /* Only stop-the-world marks rewrite, so nothing races the rewrite (rb_class_take_ownership
