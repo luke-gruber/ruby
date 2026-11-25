@@ -4181,6 +4181,22 @@ vm_call_attrset(rb_execution_context_t *ec, rb_control_frame_t *cfp, struct rb_c
     return vm_call_attrset_direct(ec, cfp, calling->cc, calling->recv);
 }
 
+/* As with classes (rb_class_owned_slow_p), an unshareable proc found in my objspace
+ * was inherited by absorbing its defining Ractor's objspace. */
+static bool
+vm_bmethod_callable_p(const rb_execution_context_t *ec, const rb_callable_method_entry_t *cme, VALUE procv)
+{
+    if (RB_OBJ_SHAREABLE_P(procv)) return true;
+
+    rb_serial_t id = rb_ec_ractor_id(ec);
+    uint64_t *defined_ractor_id = &cme->def->body.bmethod.defined_ractor_id;
+    if (LIKELY(ATOMIC_U64_LOAD_RELAXED(*defined_ractor_id) == id)) return true;
+    if (!rb_gc_multi_objspace_p() || rb_gc_obj_foreign_p(procv)) return false;
+
+    ATOMIC_U64_SET_RELAXED(*defined_ractor_id, id);
+    return true;
+}
+
 static inline VALUE
 vm_call_bmethod_body(rb_execution_context_t *ec, struct rb_calling_info *calling, const VALUE *argv)
 {
@@ -4190,8 +4206,7 @@ vm_call_bmethod_body(rb_execution_context_t *ec, struct rb_calling_info *calling
     const rb_callable_method_entry_t *cme = vm_cc_cme(cc);
     VALUE procv = cme->def->body.bmethod.proc;
 
-    if (!RB_OBJ_SHAREABLE_P(procv) &&
-        cme->def->body.bmethod.defined_ractor_id != rb_ec_ractor_id(ec)) {
+    if (UNLIKELY(!vm_bmethod_callable_p(ec, cme, procv))) {
         rb_raise(rb_eRuntimeError, "defined with an un-shareable Proc in a different Ractor");
     }
 
@@ -4213,8 +4228,7 @@ vm_call_iseq_bmethod(rb_execution_context_t *ec, rb_control_frame_t *cfp, struct
     const rb_callable_method_entry_t *cme = vm_cc_cme(cc);
     VALUE procv = cme->def->body.bmethod.proc;
 
-    if (!RB_OBJ_SHAREABLE_P(procv) &&
-        cme->def->body.bmethod.defined_ractor_id != rb_ec_ractor_id(ec)) {
+    if (UNLIKELY(!vm_bmethod_callable_p(ec, cme, procv))) {
         rb_raise(rb_eRuntimeError, "defined with an un-shareable Proc in a different Ractor");
     }
 

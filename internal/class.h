@@ -68,11 +68,11 @@ struct rb_classext_struct {
             VALUE refinement_iclasses;
         } iclass;
     } as;
-    /* Id of the Ractor that created this class/module; only that Ractor may modify
-     * it.  0 is the main Ractor, so a program that never leaves it stores nothing.
-     * Ids are never reused, so a terminated owner leaves the class read-only for
-     * everybody.  Prime classext only; always 0 for T_ICLASS. */
-    rb_serial_t owner_ractor_id;
+    /* Id of the Ractor that may modify this class/module: its creator, until whoever
+     * absorbs the creator's objspace claims it (rb_class_owned_slow_p).  0 is the main
+     * Ractor, so a program that never leaves it stores nothing.  Prime classext only;
+     * always 0 for T_ICLASS.  Relaxed atomic: only the new owner rewrites it. */
+    uint64_t owner_ractor_id; /* an rb_serial_t, typed for ATOMIC_U64_* */
     uint16_t superclass_depth;
     attr_index_t max_iv_count;
     uint8_t variation_count;
@@ -127,34 +127,34 @@ static inline void RCLASS_SET_PRIME_CLASSEXT_WRITABLE(VALUE obj, bool writable);
 #define RCLASS_EXT_PRIME_P(ext, c) (&((struct RClass_and_rb_classext_t*)(c))->classext == ext)
 
 // Class ownership. See rb_classext_struct::owner_ractor_id.
-#define RCLASSEXT_OWNER_RACTOR_ID(ext) (ext->owner_ractor_id)
+#define RCLASSEXT_OWNER_RACTOR_ID(ext) ((rb_serial_t)ATOMIC_U64_LOAD_RELAXED((ext)->owner_ractor_id))
 
 static inline rb_serial_t
 RCLASS_OWNER_RACTOR_ID(VALUE klass)
 {
-    return RCLASS_EXT_PRIME(klass)->owner_ractor_id;
+    return (rb_serial_t)ATOMIC_U64_LOAD_RELAXED(RCLASS_EXT_PRIME(klass)->owner_ractor_id);
 }
 
 static inline void
 RCLASS_SET_OWNER_RACTOR_ID(VALUE klass, rb_serial_t ractor_id)
 {
     // not a VALUE: no write barrier, nothing for the GC to mark or move
-    RCLASS_EXT_PRIME(klass)->owner_ractor_id = ractor_id;
+    ATOMIC_U64_SET_RELAXED(RCLASS_EXT_PRIME(klass)->owner_ractor_id, ractor_id);
 }
 
-bool rb_class_owned_by_ractor_p(rb_serial_t owner_id); // rb_class_owned_p's slow half
+bool rb_class_owned_slow_p(VALUE klass, rb_serial_t owner_id); // rb_class_owned_p's slow half
 void rb_class_owner_check(VALUE klass);      // raise Ractor::IsolationError unless rb_class_owned_p(klass)
 void rb_class_take_ownership(VALUE klass);   // for a moved object's singleton class only
 void rb_class_check_singleton_movable(VALUE klass); // raise if it holds unshareable values
 
-// true if the current Ractor created klass.  Inline because the class ivar and
+// true if the current Ractor created klass or inherited it.  Inline because the class ivar and
 // constant read paths take it on every access.
 static inline bool
 rb_class_owned_p(VALUE klass)
 {
     rb_serial_t owner_id = RCLASS_OWNER_RACTOR_ID(klass);
     if (LIKELY(!owner_id)) return rb_ractor_main_p(); // the only case single-Ractor programs take
-    return rb_class_owned_by_ractor_p(owner_id);
+    return rb_class_owned_slow_p(klass, owner_id);
 }
 
 static inline rb_classext_t * RCLASS_EXT_READABLE_IN_BOX(VALUE obj, const rb_box_t *box);

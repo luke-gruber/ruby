@@ -166,7 +166,7 @@ typedef struct rb_method_refined_struct {
 
 typedef struct rb_method_bmethod_struct {
     VALUE proc; /* should be marked */
-    rb_serial_t defined_ractor_id;
+    uint64_t defined_ractor_id; /* an rb_serial_t; relaxed atomic, see vm_bmethod_callable_p */
     unsigned int local_hooks_cnt;
 } rb_method_bmethod_t;
 

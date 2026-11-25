@@ -647,10 +647,30 @@ class_alloc(enum ruby_value_type type, VALUE klass)
     return class_alloc0(type, klass, boxable, false);
 }
 
-bool
-rb_class_owned_by_ractor_p(rb_serial_t owner_id)
+/* Pages only enter an objspace by absorbing a terminated Ractor's, so a class in mine
+ * was inherited.  A singleton class follows its attached object: a non-owner may have
+ * allocated it lazily, and a moved object leaves it behind. */
+static bool
+class_inherited_p(VALUE klass)
 {
-    return owner_id == rb_ractor_id(GET_RACTOR());
+    if (!rb_gc_multi_objspace_p()) return false;
+
+    if (RCLASS_SINGLETON_P(klass)) {
+        VALUE obj = RCLASS_ATTACHED_OBJECT(klass);
+        if (RB_TYPE_P(obj, T_CLASS) || RB_TYPE_P(obj, T_MODULE)) return rb_class_owned_p(obj);
+        return !rb_gc_obj_foreign_p(obj);
+    }
+    return !rb_gc_obj_foreign_p(klass);
+}
+
+bool
+rb_class_owned_slow_p(VALUE klass, rb_serial_t owner_id)
+{
+    if (owner_id == rb_ractor_id(GET_RACTOR())) return true;
+    if (!class_inherited_p(klass)) return false;
+
+    RCLASS_SET_OWNER_RACTOR_ID(klass, rb_ractor_main_p() ? 0 : rb_ractor_id(GET_RACTOR()));
+    return true;
 }
 
 /* A singleton class has no class path of its own, so name it by the object it
