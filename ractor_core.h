@@ -179,6 +179,9 @@ struct rb_ractor_struct {
 
     bool malloc_gc_disabled;
     bool main_ractor;
+    /* Its id may be recorded as a class owner or a bmethod's defined Ractor, so whoever
+     * inherits it needs a heir table entry.  Only this Ractor's own thread sets it. */
+    bool owns_ids;
     void *newobj_cache;
 
     /* This Ractor's objspace.  The main Ractor receives the boot objspace from
@@ -276,6 +279,10 @@ st_table *rb_ractor_targeted_hooks(rb_ractor_t *cr);
 
 RUBY_SYMBOL_EXPORT_BEGIN
 void rb_ractor_finish_marking(bool full_mark);
+
+void rb_ractor_bequeath(rb_ractor_t *dead, rb_ractor_t *heir);
+void rb_ractor_bequeath_id(rb_serial_t dead_id, rb_ractor_t *heir);
+rb_serial_t rb_ractor_heir(rb_serial_t id);
 
 bool rb_ractor_shareable_p_continue(VALUE obj);
 
@@ -380,6 +387,13 @@ static inline rb_serial_t
 rb_ractor_id(const rb_ractor_t *r)
 {
     return r->pub.id;
+}
+
+// r (the current Ractor) is about to record its id somewhere a heir must take over
+static inline void
+rb_ractor_set_owns_ids(rb_ractor_t *r)
+{
+    if (!r->owns_ids) r->owns_ids = true;
 }
 
 static inline void

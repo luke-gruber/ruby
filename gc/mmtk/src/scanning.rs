@@ -160,6 +160,12 @@ impl Scanning<Ruby> for VMScanning {
         worker: &mut GCWorker<Ruby>,
         tracer_context: impl mmtk::vm::ObjectTracerContext<Ruby>,
     ) -> bool {
+        // Before process_weak_stuff queues the obj_free work (ractor_free adds heir entries).
+        let is_nursery_gc = (crate::mmtk().get_plan().generational())
+            .is_some_and(|gen_plan| gen_plan.is_current_gc_nursery());
+        if !is_nursery_gc {
+            crate::upcalls::full_heap_marked();
+        }
         crate::binding()
             .weak_proc
             .process_weak_stuff(worker, tracer_context);

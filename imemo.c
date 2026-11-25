@@ -4,6 +4,7 @@
 #include "internal.h"
 #include "internal/imemo.h"
 #include "internal/object.h"
+#include "internal/ractor.h"
 #include "internal/st.h"
 #include "vm_callinfo.h"
 
@@ -372,6 +373,7 @@ mark_and_move_method_entry(const struct rb_gc_mark_ctx *ctx, rb_method_entry_t *
             break;
           case VM_METHOD_TYPE_BMETHOD:
             rb_gc_mark_and_move_ctx(ctx, &def->body.bmethod.proc);
+            if (!reference_updating) rb_ractor_heirs_rehome_id(&def->body.bmethod.defined_ractor_id);
             break;
           case VM_METHOD_TYPE_ALIAS:
             rb_gc_mark_and_move_ptr_ctx(ctx, &def->body.alias.original_me);

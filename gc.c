@@ -3785,6 +3785,12 @@ gc_mark_roots_ctx(const struct rb_gc_mark_ctx *ctx, void *objspace, const char *
 }
 
 void
+rb_gc_full_heap_marked(void)
+{
+    rb_ractor_heirs_prune();
+}
+
+void
 rb_gc_mark_roots(void *objspace, const char **categoryp)
 {
     const struct rb_gc_mark_ctx ctx = gc_current_mark_ctx();
@@ -3913,6 +3919,7 @@ gc_mark_children_ctx(const struct rb_gc_mark_ctx *ctx, VALUE obj)
         }
         // Continue to the shared T_CLASS/T_MODULE
       case T_MODULE:
+        if (UNLIKELY(RCLASS_OWNER_RACTOR_ID(obj))) rb_ractor_heirs_rehome_class(obj);
         foreach_args.ctx = ctx;
         foreach_args.obj = obj;
         if (RCLASS_HAS_STRUCT_INLINE_FIELD(obj)) {
@@ -4547,7 +4554,7 @@ static void gc_orphan_merge_job(void *unused);
  * sweep, where the accounting allocator is not allowed.  This table is VM-lifetime
  * metadata with at most a few dozen entries. */
 static void
-zombie_objspaces_push(rb_vm_t *vm, void *objspace, void **owner_slot, struct rb_ractor_struct *owner)
+zombie_objspaces_push(rb_vm_t *vm, void *objspace, void **owner_slot, struct rb_ractor_struct *owner, rb_serial_t ractor_id)
 {
     ASSERT_vm_locking();
     if (vm->gc.zombie_objspaces_count == vm->gc.zombie_objspaces_capa) {
@@ -4562,6 +4569,7 @@ zombie_objspaces_push(rb_vm_t *vm, void *objspace, void **owner_slot, struct rb_
         .objspace = objspace,
         .owner_slot = owner_slot,
         .owner = owner,
+        .ractor_id = ractor_id,
     };
     rb_gc_impl_objspace_zombify(objspace);
 }
@@ -4616,7 +4624,9 @@ rb_gc_objspace_retire(void **objspace_slot)
          * value; rb_gc_objspace_disown clears it when the zombie becomes an orphan. */
         struct rb_ractor_struct *owner =
             (struct rb_ractor_struct *)((char *)objspace_slot - offsetof(rb_ractor_t, objspace));
-        zombie_objspaces_push(vm, *objspace_slot, objspace_slot, owner);
+        rb_serial_t ractor_id = owner->owns_ids ? rb_ractor_id(owner) : 0;
+        owner->owns_ids = false;
+        zombie_objspaces_push(vm, *objspace_slot, objspace_slot, owner, ractor_id);
     }
 }
 
@@ -4643,7 +4653,7 @@ rb_gc_objspace_disown(void *objspace)
         }
     }
     if (!found) {
-        zombie_objspaces_push(vm, objspace, NULL, NULL);
+        zombie_objspaces_push(vm, objspace, NULL, NULL, 0);
     }
 
     /* The trigger is wait-free (an atomic bit plus an interrupt flag), so it is safe
@@ -4660,7 +4670,8 @@ rb_gc_during_global_gc_p(void)
     return rb_gc_impl_during_global_gc_p(rb_gc_get_objspace());
 }
 
-static void
+// returns the zombie's ractor_id
+static rb_serial_t
 rb_gc_vm_forget_zombie(void *objspace)
 {
     ASSERT_vm_locking();
@@ -4668,11 +4679,13 @@ rb_gc_vm_forget_zombie(void *objspace)
     size_t n = vm->gc.zombie_objspaces_count;
     for (size_t i = 0; i < n; i++) {
         if (vm->gc.zombie_objspaces[i].objspace == objspace) {
+            rb_serial_t ractor_id = vm->gc.zombie_objspaces[i].ractor_id;
             vm->gc.zombie_objspaces[i] = vm->gc.zombie_objspaces[n - 1];
             vm->gc.zombie_objspaces_count = n - 1;
-            break;
+            return ractor_id;
         }
     }
+    return 0;
 }
 
 /* Number of live Ractors, for the heap growth heuristic (r_mul); a racy read is fine. */
@@ -4786,6 +4799,8 @@ rb_gc_objspace_absorb_into_current(void **objspace_slot)
 {
     if (!rb_gc_impl_multi_objspace_p()) {
         *objspace_slot = NULL;
+        rb_ractor_t *dead = (rb_ractor_t *)((char *)objspace_slot - offsetof(rb_ractor_t, objspace));
+        rb_ractor_bequeath(dead, GET_RACTOR());
         return;
     }
     RB_VM_LOCKING() {
@@ -4793,8 +4808,9 @@ rb_gc_objspace_absorb_into_current(void **objspace_slot)
         if (objspace != NULL) {
             *objspace_slot = NULL;
             gc_absorbing_zombie++;
-            rb_gc_vm_forget_zombie(objspace);
+            rb_serial_t dead_id = rb_gc_vm_forget_zombie(objspace);
             objspace_absorb_merge(rb_gc_get_objspace(), objspace);
+            rb_ractor_bequeath_id(dead_id, GET_RACTOR());
             gc_absorbing_zombie--;
         }
     }
@@ -4816,8 +4832,9 @@ objspace_absorb_disowned_zombies(void)
                 /* Drop the entry before the merge, in this same VM-lock section:
                  * objspace_absorb expects src to be out of the table. */
                 gc_absorbing_zombie++;
-                rb_gc_vm_forget_zombie(zombie);
+                rb_serial_t dead_id = rb_gc_vm_forget_zombie(zombie);
                 objspace_absorb_merge(rb_gc_get_objspace(), zombie);
+                rb_ractor_bequeath_id(dead_id, GET_RACTOR());
                 gc_absorbing_zombie--;
             }
             else {

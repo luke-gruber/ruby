@@ -612,7 +612,9 @@ class_alloc0(enum ruby_value_type type, VALUE klass, bool boxable, bool struct_i
     // The creating Ractor owns the new class/module; an iclass has no owner.
     // Singleton classes of classes/modules override this below.
     if (type != T_ICLASS && UNLIKELY(!rb_ractor_main_p())) {
-        RCLASS_SET_OWNER_RACTOR_ID((VALUE)obj, rb_ractor_id(GET_RACTOR()));
+        rb_ractor_t *cr = GET_RACTOR();
+        rb_ractor_set_owns_ids(cr);
+        RCLASS_SET_OWNER_RACTOR_ID((VALUE)obj, rb_ractor_id(cr));
     }
 
     /* ZALLOC
@@ -647,10 +649,39 @@ class_alloc(enum ruby_value_type type, VALUE klass)
     return class_alloc0(type, klass, boxable, false);
 }
 
-bool
-rb_class_owned_by_ractor_p(rb_serial_t owner_id)
+/* The owner terminated and cr took its value (rb_ractor_heir).  The eigenclass of a
+ * class or module follows that class, whoever allocated it. */
+static bool
+class_cr_inherited_p(VALUE klass, rb_serial_t owner_id, rb_ractor_t *cr)
 {
-    return owner_id == rb_ractor_id(GET_RACTOR());
+    bool heir_p = rb_ractor_heir(owner_id) == rb_ractor_id(cr);
+    if (RCLASS_SINGLETON_P(klass)) {
+        VALUE obj = RCLASS_ATTACHED_OBJECT(klass);
+        if (RB_TYPE_P(obj, T_CLASS) || RB_TYPE_P(obj, T_MODULE)) {
+            bool owned = rb_class_owned_p(obj);
+            // an eigenclass's recorded id is copied from its class's and kept in step
+            RUBY_ASSERT(owned == heir_p);
+            return owned;
+        }
+    }
+    return heir_p;
+}
+
+bool
+rb_class_owned_slow_p(VALUE klass, rb_serial_t owner_id)
+{
+    rb_ractor_t *cr = GET_RACTOR();
+    if (owner_id == rb_ractor_id(cr)) return true;
+    if (!class_cr_inherited_p(klass, owner_id, cr)) return false;
+
+    if (rb_ractor_main_p()) {
+        RCLASS_SET_OWNER_RACTOR_ID(klass, 0);
+    }
+    else {
+        rb_ractor_set_owns_ids(cr);
+        RCLASS_SET_OWNER_RACTOR_ID(klass, rb_ractor_id(cr));
+    }
+    return true;
 }
 
 /* A singleton class has no class path of its own, so name it by the object it
@@ -679,7 +710,12 @@ void
 rb_class_take_ownership(VALUE klass)
 {
     // keep class_alloc0's "0 means main" encoding
-    rb_serial_t id = rb_ractor_main_p() ? 0 : rb_ractor_id(GET_RACTOR());
+    rb_serial_t id = 0;
+    if (!rb_ractor_main_p()) {
+        rb_ractor_t *cr = GET_RACTOR();
+        rb_ractor_set_owns_ids(cr);
+        id = rb_ractor_id(cr);
+    }
 
     // and up the eigenclass chain: each one belongs to the class below it
     do {

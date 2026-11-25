@@ -437,7 +437,7 @@ rb_yjit_invokeblock_sp_pops(const struct rb_callinfo *ci)
 rb_serial_t
 rb_yjit_cme_ractor_serial(const rb_callable_method_entry_t *cme)
 {
-    return cme->def->body.bmethod.defined_ractor_id;
+    return (rb_serial_t)ATOMIC_U64_LOAD_RELAXED(cme->def->body.bmethod.defined_ractor_id);
 }
 
 bool

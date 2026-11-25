@@ -1156,7 +1156,11 @@ rb_method_definition_set(const rb_method_entry_t *me, rb_method_definition_t *de
             }
           case VM_METHOD_TYPE_BMETHOD:
             RB_OBJ_WRITE(me, &def->body.bmethod.proc, (VALUE)opts);
-            def->body.bmethod.defined_ractor_id = rb_ec_ractor_id(GET_EC());
+            {
+                rb_ractor_t *cr = GET_RACTOR();
+                if (!cr->main_ractor) rb_ractor_set_owns_ids(cr);
+                def->body.bmethod.defined_ractor_id = rb_ractor_id(cr);
+            }
             return;
           case VM_METHOD_TYPE_NOTIMPLEMENTED:
             setup_method_cfunc_struct(UNALIGNED_MEMBER_PTR(def, body.cfunc), (VALUE(*)(ANYARGS))rb_f_notimplement_internal, -1);

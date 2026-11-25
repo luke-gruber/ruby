@@ -449,6 +449,12 @@ rb_mmtk_update_finalizer_table_replace_i(st_data_t *key, st_data_t *value, st_da
 }
 
 RB_MMTK_UPCALL void
+rb_mmtk_full_heap_marked(void)
+{
+    rb_gc_full_heap_marked();
+}
+
+RB_MMTK_UPCALL void
 rb_mmtk_update_finalizer_table(void)
 {
     struct objspace *objspace = rb_gc_get_objspace();

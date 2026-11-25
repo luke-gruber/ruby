@@ -107,6 +107,8 @@ MODULAR_GC_FN void rb_gc_obj_free_vm_weak_references(VALUE obj);
 MODULAR_GC_FN bool rb_gc_obj_free(void *objspace, VALUE obj);
 MODULAR_GC_FN void rb_gc_save_machine_context(void);
 MODULAR_GC_FN void rb_gc_mark_roots(void *objspace, const char **categoryp);
+/* A stop-the-world mark of the whole heap just reached its fixpoint; nothing swept yet. */
+MODULAR_GC_FN void rb_gc_full_heap_marked(void);
 MODULAR_GC_FN bool rb_gc_multi_ractor_p(void);
 MODULAR_GC_FN bool rb_gc_ever_multi_ractor_p(void);
 /* Process-wide GC disable flag (GC.disable / rb_gc_disable).  Every GC trigger in

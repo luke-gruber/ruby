@@ -817,6 +817,8 @@ typedef struct rb_vm_struct {
              * rb_gc_register_mark_object pins and join value through it.  NULL for an
              * orphan, whose Ractor struct is gone and has neither any more. */
             struct rb_ractor_struct *owner;
+            /* Its id, for the heir table once inherited; 0 if it recorded it nowhere. */
+            rb_serial_t ractor_id;
         } *zombie_objspaces;
         size_t zombie_objspaces_count;
         size_t zombie_objspaces_capa;

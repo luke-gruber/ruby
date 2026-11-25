@@ -316,6 +316,7 @@ ractor_mark_unshareable_parts(const struct rb_gc_mark_ctx *ctx, rb_ractor_t *r)
 
 struct class_field_shareable_p;
 static void shareable_p_requests_atfork(rb_ractor_t *r);
+static rb_nativethread_lock_t ractor_heirs_lock; // see struct ractor_heirs
 
 static void
 ractor_mark(void *ptr)
@@ -486,6 +487,9 @@ ractor_free(void *ptr)
     if (r->objspace && !r->main_ractor) {
         rb_gc_objspace_disown(r->objspace);
         r->objspace = NULL;
+    }
+    else if (!rb_gc_multi_objspace_p() && !r->main_ractor) {
+        rb_ractor_bequeath(r, GET_VM()->ractor.main_ractor);
     }
 
     ractor_sync_free(r);
@@ -842,6 +846,11 @@ rb_ractor_atfork(rb_vm_t *vm, rb_thread_t *th)
     ractor_reply_port_atfork(th->ractor);
     ruby_single_main_ractor = th->ractor;
     th->ractor->status_ = ractor_created;
+    /* No bequeath can be underway during a fork. With per-Ractor objspaces every one runs
+     * under the VM lock, which rb_fork_ruby holds across the fork. With a single objspace,
+     * rb_gc_impl_before_fork's barrier stops every Ractor outside one and idles any GC
+     * workers. The table itself also stays valid. */
+    rb_native_mutex_initialize(&ractor_heirs_lock);
 
     ractor_sync_atfork(th->ractor);
     rb_ractor_living_threads_init(th->ractor);
@@ -1438,6 +1447,7 @@ static void ractor_shareable_p_drain(void *);
 void
 Init_Ractor(void)
 {
+    rb_native_mutex_initialize(&ractor_heirs_lock);
     shareable_p_pjob = rb_postponed_job_preregister(0, ractor_shareable_p_drain, NULL);
     rb_cRactor = rb_define_class("Ractor", rb_cObject);
     rb_undef_alloc_func(rb_cRactor);
@@ -4038,6 +4048,152 @@ rb_ractor_local_storage_ptr_set(rb_ractor_local_key_t key, void *ptr)
     ractor_local_set(key, ptr);
 }
 
+/* Heir table: a terminated Ractor's id -> the id of the Ractor that inherited it.
+ * Owner checks resolve a recorded id through it (rb_class_owned_slow_p,
+ * vm_bmethod_callable_p), so inheritance needs no help from the GC.  Lock-free readers;
+ * writers (absorbing Ractors, and ractor_free on a GC thread) take ractor_heirs_lock.
+ * Entries always name the final heir: inheriting a heir re-points them.  Open
+ * addressing, key 0 empty, at most half full.  A stop-the-world complete mark rewrites
+ * every recorded id it reaches (rb_ractor_heirs_rehome_*), after which the whole table,
+ * including the copies left behind by growth, is freed (rb_ractor_heirs_prune).  Plain
+ * malloc: ractor_free runs inside a sweep. */
+struct ractor_heir {
+    uint64_t id;
+    uint64_t heir;
+};
+
+struct ractor_heirs {
+    struct ractor_heirs *retired;
+    size_t capa, cnt;
+    struct ractor_heir slots[FLEX_ARY_LEN];
+};
+
+static struct ractor_heirs *ractor_heirs;
+
+static void
+ractor_heirs_insert(struct ractor_heirs *t, rb_serial_t id, rb_serial_t heir)
+{
+    size_t mask = t->capa - 1;
+    for (size_t i = (size_t)id & mask;; i = (i + 1) & mask) {
+        uint64_t key = t->slots[i].id;
+        if (key == 0 || key == id) {
+            ATOMIC_U64_SET_RELAXED(t->slots[i].heir, heir);
+            if (key == 0) {
+                ATOMIC_U64_SET_RELEASE(t->slots[i].id, id);
+                t->cnt++;
+            }
+            return;
+        }
+    }
+}
+
+static struct ractor_heirs *
+ractor_heirs_grow(struct ractor_heirs *old)
+{
+    size_t capa = old ? old->capa * 2 : 16;
+    struct ractor_heirs *t = calloc(1, offsetof(struct ractor_heirs, slots) + capa * sizeof(struct ractor_heir));
+    if (t == NULL) rb_bug("ractor_heirs_grow: out of memory");
+    t->capa = capa;
+    t->retired = old;
+    if (old) {
+        for (size_t i = 0; i < old->capa; i++) {
+            if (old->slots[i].id) ractor_heirs_insert(t, old->slots[i].id, old->slots[i].heir);
+        }
+    }
+    RUBY_ATOMIC_PTR_SET(ractor_heirs, t);
+    return t;
+}
+
+// heir inherits whatever the dead Ractor dead_id (0: none) left
+void
+rb_ractor_bequeath_id(rb_serial_t dead_id, rb_ractor_t *heir)
+{
+    if (dead_id == 0) return;
+    rb_serial_t heir_id = rb_ractor_id(heir);
+    if (!heir->main_ractor) rb_ractor_set_owns_ids(heir);
+
+    rb_native_mutex_lock(&ractor_heirs_lock);
+    struct ractor_heirs *t = ractor_heirs;
+    if (t) {
+        for (size_t i = 0; i < t->capa; i++) {
+            if (t->slots[i].id && t->slots[i].heir == dead_id) {
+                ATOMIC_U64_SET_RELAXED(t->slots[i].heir, heir_id);
+            }
+        }
+    }
+    if (t == NULL || (t->cnt + 1) * 2 > t->capa) t = ractor_heirs_grow(t);
+    ractor_heirs_insert(t, dead_id, heir_id);
+    rb_native_mutex_unlock(&ractor_heirs_lock);
+}
+
+// the terminated Ractor dead hands its ids to heir, at most once
+void
+rb_ractor_bequeath(rb_ractor_t *dead, rb_ractor_t *heir)
+{
+    if (!dead->owns_ids) return;
+    dead->owns_ids = false;
+    rb_ractor_bequeath_id(rb_ractor_id(dead), heir);
+}
+
+// the id of the Ractor that inherited the terminated Ractor id, or 0
+rb_serial_t
+rb_ractor_heir(rb_serial_t id)
+{
+    const struct ractor_heirs *t = RUBY_ATOMIC_PTR_LOAD(ractor_heirs);
+    if (t == NULL) return 0;
+    size_t mask = t->capa - 1;
+    for (size_t i = (size_t)id & mask;; i = (i + 1) & mask) {
+        uint64_t key = ATOMIC_U64_LOAD_ACQUIRE(t->slots[i].id);
+        if (key == id) return (rb_serial_t)ATOMIC_U64_LOAD_RELAXED(t->slots[i].heir);
+        if (key == 0) return 0;
+    }
+}
+
+/* Only stop-the-world marks rewrite, so nothing races the rewrite (rb_class_take_ownership
+ * could otherwise be overwritten).  gc_mark_children_ctx also runs on mutators, outside
+ * any GC (reachable_objects_from), and under a local GC other Ractors keep running. */
+static rb_serial_t
+ractor_heir_at_mark(rb_serial_t id)
+{
+    if (RUBY_ATOMIC_PTR_LOAD(ractor_heirs) == NULL) return 0;
+    if (!rb_gc_during_global_gc_p()) return 0;
+    return rb_ractor_heir(id);
+}
+
+void
+rb_ractor_heirs_rehome_class(VALUE klass)
+{
+    rb_serial_t heir = ractor_heir_at_mark(RCLASS_OWNER_RACTOR_ID(klass));
+    if (heir) {
+        RCLASS_SET_OWNER_RACTOR_ID(klass, heir == rb_ractor_id(GET_VM()->ractor.main_ractor) ? 0 : heir);
+    }
+}
+
+void
+rb_ractor_heirs_rehome_id(uint64_t *id)
+{
+    rb_serial_t heir = ractor_heir_at_mark((rb_serial_t)ATOMIC_U64_LOAD_RELAXED(*id));
+    if (heir) ATOMIC_U64_SET_RELAXED(*id, heir);
+}
+
+/* Right after a complete mark with the world stopped, before the sweep: the mark
+ * rewrote every live recorded id.  An entry the following sweep adds (ractor_free)
+ * survives to the next prune. */
+void
+rb_ractor_heirs_prune(void)
+{
+    struct ractor_heirs *t = ractor_heirs;
+    if (t == NULL) return;
+    rb_native_mutex_lock(&ractor_heirs_lock);
+    RUBY_ATOMIC_PTR_SET(ractor_heirs, NULL);
+    rb_native_mutex_unlock(&ractor_heirs_lock);
+    while (t) {
+        struct ractor_heirs *next = t->retired;
+        free(t);
+        t = next;
+    }
+}
+
 #define DEFAULT_KEYS_CAPA 0x10
 
 void
@@ -4069,6 +4225,10 @@ rb_ractor_finish_marking(bool full_mark)
     if (freed_ractor_local_keys.capa > DEFAULT_KEYS_CAPA) {
         freed_ractor_local_keys.capa = DEFAULT_KEYS_CAPA;
         SIZED_REALLOC_N(freed_ractor_local_keys.keys, rb_ractor_local_key_t, DEFAULT_KEYS_CAPA, freed_ractor_local_keys.capa);
+    }
+
+    if (full_mark && rb_gc_during_global_gc_p()) {
+        rb_ractor_heirs_prune();
     }
 
     /* Under a minor mark an unmarked port is not a dead one. */
@@ -4657,6 +4817,16 @@ ractor_living_by_id(rb_serial_t id)
     return NULL;
 }
 
+// the Ractor that may write klass: its recorded owner, or that owner's heir
+static rb_serial_t
+ractor_class_writer_id(VALUE klass)
+{
+    rb_serial_t id = RCLASS_OWNER_RACTOR_ID(klass);
+    rb_serial_t heir = id ? rb_ractor_heir(id) : 0;
+    if (!heir) return id;
+    return heir == rb_ractor_id(GET_VM()->ractor.main_ractor) ? 0 : heir;
+}
+
 /* val was read from a field or constant of klass, which the current Ractor does not own:
  * whether it is shareable, asking the Ractor that holds val's page to flag it if needed.
  * Nothing between the read and shareable_p_new may GC: until then only this stack holds val. */
@@ -4689,7 +4859,7 @@ rb_class_field_shareable_p(VALUE klass, VALUE val)
         int state = 0;
         // keeps val's page from moving (absorb) and its objspace from changing hands
         RB_VM_LOCKING() {
-            rb_ractor_t *const r = multi_objspace ? rb_gc_obj_ractor(val) : ractor_living_by_id(RCLASS_OWNER_RACTOR_ID(klass));
+            rb_ractor_t *const r = multi_objspace ? rb_gc_obj_ractor(val) : ractor_living_by_id(ractor_class_writer_id(klass));
             if (r == cr) {
                 st = HERE; // this Ractor absorbed it
             }

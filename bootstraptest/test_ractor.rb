@@ -1658,6 +1658,113 @@ assert_equal 'mine', %q{
   end.value
 }
 
+# Taking a terminated Ractor's value inherits the classes it created, their
+# metaclasses, and the singleton classes of the objects handed over
+assert_equal '[:m, :s, :ss, 1, 2, :o, :e]', %q{
+  k, o = Ractor.new do
+    k1 = Class.new
+    def k1.s = :s
+    o1 = Object.new
+    def o1.o = :o
+    [k1, o1]
+  end.value
+
+  k.define_method(:m) { :m }
+  def k.s = :s
+  class << k; class << self; def ss = :ss; end; end
+  k.instance_variable_set(:@iv, 1)
+  k.const_set(:C, 2)
+  def o.o = :o
+  o.extend(Module.new { def e = :e })
+  [k.new.m, k.s, k.singleton_class.ss, k.instance_variable_get(:@iv), k::C, o.o, o.e].inspect
+}
+
+# Ractor#join alone transfers nothing
+assert_equal 'can not modify myclass because it is created by another Ractor', %q{
+  port = Ractor::Port.new
+  r = Ractor.new(port) do |port|
+    port << Class.new.tap { _1.set_temporary_name('myclass') }
+    :done
+  end
+  k = port.receive
+  r.join
+  begin
+    k.define_method(:m) {}
+  rescue Ractor::IsolationError => e
+    e.message
+  end
+}
+
+# An aborted Ractor's join takes its value (the exception), so it inherits too
+assert_equal ':m', %q{
+  port = Ractor::Port.new
+  r = Ractor.new(port) do |port|
+    port << Class.new
+    raise 'boom'
+  end
+  k = port.receive
+  begin
+    r.join
+  rescue Ractor::RemoteError
+  end
+  k.define_method(:m) { :m }
+  k.new.m.inspect
+}
+
+# Inheritance is transitive, and a Ractor that absorbed nothing gains nothing
+assert_equal '[:r3, Ractor::IsolationError, :main]', %q{
+  r3 = Ractor.new do
+    k = Ractor.new { Class.new }.value
+    k.define_method(:r3) { :r3 }
+    k
+  end
+  k = r3.value
+  other = Ractor.new(k) do |k|
+    k.define_method(:x) {}
+  rescue Ractor::IsolationError => e
+    e.class
+  end.value
+  k.define_method(:main) { :main }
+  [k.new.r3, other, k.new.main].inspect
+}
+
+# A define_method body is callable by whoever inherited its unshareable proc, and
+# still by nobody else
+assert_equal '[:r2, "defined with an un-shareable Proc in a different Ractor"]', %q{
+  k = Ractor.new do
+    k0 = Class.new
+    k0.define_method(:r2) { :r2 }
+    k0
+  end.value
+  other = Ractor.new(k) do |k|
+    k.new.r2
+  rescue => e
+    e.message
+  end.value
+  [k.new.r2, other].inspect
+}
+
+# Inheritance survives the heir table's prune: the GC after an absorb is a global one,
+# whose mark rewrites the recorded owner ids before the table is dropped
+assert_equal '[:m, :b, :s, :m2, :b2]', %q{
+  k = Ractor.new do
+    k0 = Class.new
+    k0.define_method(:b) { :b }
+    k0
+  end.value
+  GC.start
+  k.define_method(:m) { :m }
+  k.singleton_class.define_method(:s) { :s }
+  k2 = Ractor.new do
+    k0 = Class.new
+    k0.define_method(:b2) { :b2 }
+    k0
+  end.value
+  GC.start
+  k2.define_method(:m2) { :m2 }
+  [k.new.m, k.new.b, k.s, k2.new.m2, k2.new.b2].inspect
+}
+
 # Getting non-shareable objects via constants by other Ractors is not allowed
 assert_equal 'can not access non-shareable objects in constant C::CONST of a class/module created by another Ractor.', <<~'RUBY', frozen_string_literal: false
   class C

@@ -42,6 +42,7 @@ unsafe extern "C" {
     fn rb_mmtk_update_global_tables(tbl_idx: c_int, moving: bool);
     fn rb_mmtk_global_tables_count() -> c_int;
     fn rb_mmtk_update_finalizer_table();
+    fn rb_mmtk_full_heap_marked();
     fn rb_mmtk_mutator_thread_panic_handler() -> !;
     fn rb_mmtk_gc_thread_panic_handler() -> !;
 }
@@ -157,6 +158,11 @@ pub fn global_tables_count() -> c_int {
 #[inline]
 pub fn update_finalizer_table() {
     unsafe { rb_mmtk_update_finalizer_table() }
+}
+
+#[inline]
+pub fn full_heap_marked() {
+    unsafe { rb_mmtk_full_heap_marked() }
 }
 
 #[inline]
